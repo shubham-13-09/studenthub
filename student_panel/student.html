@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StudentHub — Student Panel</title>
+<link rel="stylesheet" href="student.css">
+</head>
+<body>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="brand-card">
+      <div class="brand-card-ic"><img src="studenthub.png" alt=""></div>
+      <div>
+        <div class="brand-card-top">StudentHub</div>
+        <div class="brand-card-bottom">Student panel</div>
+      </div>
+    </div>
+
+    <ul class="nav">
+      <li class="nav-item active" data-view="Home"><span class="ic">🏠</span> Home</li>
+      <li class="nav-item" data-view="chat"><span class="ic">🤖</span> AI Chat</li>
+      <li class="nav-item" data-view="timetable"><span class="ic">📆</span> Timetable</li>
+      <li class="nav-item" data-view="notes"><span class="ic">📖</span> Notes</li>
+      <li class="nav-item" data-view="assignments"><span class="ic">📋</span> Assignments</li>
+      <li class="nav-item" data-view="attendance"><span class="ic">✓</span> Attendance</li>
+      <li class="nav-item" data-view="results"><span class="ic">📊</span> Results</li>
+      <li class="nav-item" data-view="notices"><span class="ic">📢</span> Notices <span class="nav-badge" id="noticesBadge" style="display:none;">0</span></li>
+      <li class="nav-item" data-view="faculty"><span class="ic">👨‍🏫</span> Faculty</li>
+      <li class="nav-item" data-view="fees"><span class="ic">💳</span> Fees</li>
+      <li class="nav-item" data-view="settings"><span class="ic">⚙</span> Settings</li>
+    </ul>
+
+    <div class="sidebar-foot">
+      <div class="profile-mini">
+        <div class="avatar" id="sidebarAvatarInitial">S</div>
+        <div>
+          <div class="name" id="sidebarProfileName">Student</div>
+          <div class="role" id="sidebarProfileRole">–</div>
+        </div>
+      </div>
+      <div class="logout-link" onclick="logout()">⎋ Log out</div>
+    </div>
+  </aside>
+
+  <!-- Overlay for mobile sidebar -->
+  <div class="overlay" id="overlay" onclick="closeSidebar()"></div>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="topbar">
+      <div class="icon-btn menu-btn" id="menuBtn" onclick="openSidebar()">☰</div>
+      <div class="search" style="position:relative;">
+        🔍 <input type="text" id="topbarSearchInput" placeholder="Search subject, notes, faculty…"
+          oninput="onTopbarSearch()" onfocus="onTopbarSearch()">
+        <div class="topbar-search-results" id="topbarSearchResults"></div>
+      </div>
+      <div class="topbar-right" style="position:relative;">
+        <div class="icon-btn" onclick="toggleDark()" id="darkBtn">🌙</div>
+        <div class="icon-btn" onclick="switchView('notices')" title="Notices">🔔<span class="dot-badge" id="topbarNoticeDot"></span></div>
+        <div style="position:relative;">
+          <div class="avatar" id="topbarAvatarInitial" style="width:38px;height:38px; cursor:pointer;" onclick="toggleProfileMenu(event)">S</div>
+          <div id="profileMenu" class="dropdown-menu hidden" style="top:calc(100% + 10px); right:0; width:200px;">
+            <div style="padding:12px 14px; border-bottom:1px solid var(--line);">
+              <div id="profileMenuName" style="font-weight:600;">Student</div>
+              <div id="profileMenuRole" style="font-size:12px; color:var(--muted);">–</div>
+            </div>
+            <div class="dropdown-item" onclick="switchView('settings'); closeAllMenus();">⚙ Settings</div>
+            <div class="dropdown-item" onclick="logout()">⏻ Log out</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <!-- ===== DASHBOARD ===== -->
+      <div class="view active" id="view-Home">
+        <div class="banner">
+          <div class="banner-text">
+            <div class="banner-eyebrow" id="stuBannerEyebrow">Welcome</div>
+            <h1 id="stuBannerName">Welcome back</h1>
+            <div class="banner-meta" id="stuBannerEnrollment"></div>
+          </div>
+          <button class="banner-btn" onclick="switchView('chat')">Ask StudentHub →</button>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-top">
+              <svg class="mini-ring" viewBox="0 0 36 36">
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--line)" stroke-width="4"/>
+                <path id="attendanceRingFill" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--teal-600)" stroke-width="4" stroke-dasharray="0,100" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <div class="stat-value" id="statAttendance">–</div>
+            <div class="stat-label">Overall attendance</div>
+          </div>
+          <div class="stat-card" style="cursor:pointer;" onclick="openStudentExamTimetable('Mid-Sem')">
+            <div class="stat-top"><div class="stat-ic mint">📆</div></div>
+            <div class="stat-value" id="statMidExam">–</div>
+            <div class="stat-label">Mid exam Timetable</div>
+          </div>
+          <div class="stat-card" style="cursor:pointer;" onclick="switchView('assignments')">
+            <div class="stat-top"><div class="stat-ic amber">📌</div></div>
+            <div class="stat-value" id="statPendingAssignments">–</div>
+            <div class="stat-label">Pending assignments</div>
+          </div>
+          <div class="stat-card" style="cursor:pointer;" onclick="switchView('fees')">
+            <div class="stat-top"><div class="stat-ic amber">💰</div></div>
+            <div class="stat-value" id="statPendingFee" style="font-size:17px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">–</div>
+            <div class="stat-label">Fee status <span class="pill" id="statPendingFeeStatus" style="margin-left:4px;"></span></div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Today's timetable <span class="tt-chip hidden" id="homeTTChip"></span></div>
+                <div class="card-link" onclick="switchView('timetable')">View all</div>
+              </div>
+              <div id="homeTodayTT"><div class="tt-msg">Loading…</div></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div class="card-title">Latest notices</div>
+                <div class="card-link" onclick="switchView('notices')">View all notices</div>
+              </div>
+              <div class="notice-grid" id="homeNoticesGrid">
+                <div class="tt-msg">Loading…</div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div class="card askai-card">
+              <div class="askai-head"><span class="askai-ic">✨🤖</span> <b>Ask StudentHub</b><span class="askai-dot"></span></div>
+              <h3>How can I help you today?</h3>
+              <p>Ask anything about your college life — timetable, notes, results, or leave.</p>
+              <div class="askai-tags">
+                <span class="askai-tag" onclick="askAITag('Today\'s timetable')">Today's timetable</span>
+                <span class="askai-tag" onclick="askAITag('Pending assignments')">Pending assignments</span>
+              </div>
+              <div class="askai-input-row">
+                <input type="text" id="askaiInput" placeholder="Ask StudentHub Chatbot anything…" onkeydown="if(event.key==='Enter') askAIFromDashboard()">
+                <button class="askai-send" onclick="askAIFromDashboard()">➤</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head"><div class="card-title">Quick access</div></div>
+              <div class="quick-grid">
+                <div class="quick-item" onclick="switchView('timetable')"><span class="quick-ic mint">📆</span>Timetable</div>
+                <div class="quick-item" onclick="switchView('notes')"><span class="quick-ic mint">📖</span>Notes</div>
+                <div class="quick-item" onclick="switchView('results')"><span class="quick-ic mint">📊</span>Results</div>
+                <div class="quick-item" onclick="switchView('attendance')"><span class="quick-ic amber">✓</span>Attendance</div>
+                <div class="quick-item" onclick="switchView('faculty')"><span class="quick-ic amber">👨‍🏫</span>Faculty</div>
+                <div class="quick-item" onclick="switchView('fees')"><span class="quick-ic amber">💳</span>Fees</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== AI CHAT ===== -->
+      <div class="view" id="view-chat">
+        <div class="card-head" style="margin-bottom:16px;">
+          <div class="card-title" style="font-size:20px;">Ask StudentHub Chatbot</div>
+        </div>
+        <div class="chat-shell">
+          <div class="chat-log" id="chatLog">
+            <div class="msg bot">Hi Shubham 👋 I'm StudentHub Chatbot. Ask me about your timetable, attendance, results, or campus notices.</div>
+            <div class="msg user">What's my attendance percentage?</div>
+            <div class="msg bot">You're at 87% overall attendance — comfortably above the 75% minimum. Data Structures is your lowest subject at 79%.</div>
+          </div>
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" placeholder="Type your question…" onkeydown="if(event.key==='Enter') sendChat('chatInput','chatLog')">
+            <button class="chat-send" onclick="sendChat('chatInput','chatLog')">Send</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== NOTES ===== -->
+      <div class="view" id="view-notes">
+        <div class="card-head" style="margin-bottom:16px;">
+          <div class="card-title" style="font-size:20px;">Notes</div>
+          <select id="notesSubjectFilter" onchange="renderStudentNotes()">
+            <option value="">All subjects</option>
+          </select>
+        </div>
+        <div id="notesGrid">
+          <div class="tt-msg">Loading…</div>
+        </div>
+      </div>
+
+      <!-- ===== ASSIGNMENTS ===== -->
+      <div class="view" id="view-assignments">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Assignments</div></div>
+        <div class="card">
+          <table>
+            <tr><th>Assignment</th><th>Subject</th><th>Due date</th><th>Download assignment</th><th>Status</th></tr>
+            <tbody id="assignmentsTableBody">
+              <tr><td colspan="5">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ===== TIMETABLE ===== -->
+      <div class="view" id="view-timetable">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Timetable</div></div>
+        <div class="card">
+          <div class="tt-seg" id="ttSeg">
+            <button class="active" data-mode="regular" onclick="stSetTTMode('regular')">Weekly</button>
+            <button data-mode="Mid-Sem" onclick="stSetTTMode('Mid-Sem')">Mid-Sem exam</button>
+            <button data-mode="Remedial" onclick="stSetTTMode('Remedial')">Remedial exam</button>
+          </div>
+
+          <div id="ttRegular">
+            <div class="tt-desktop table-scroll">
+              <table class="tt-week" id="ttWeekTable"><tr><td class="tt-msg">Loading…</td></tr></table>
+            </div>
+            <div class="tt-mobile">
+              <div class="tt-daytabs" id="ttDayTabs"></div>
+              <div id="ttDayList"></div>
+            </div>
+          </div>
+
+          <div id="ttExam" class="hidden"></div>
+        </div>
+      </div>
+
+      <!-- ===== ATTENDANCE ===== -->
+      <div class="view" id="view-attendance">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Subject-wise attendance</div></div>
+        <div class="card" style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px;">
+          <div><b>Overall semester attendance</b></div>
+          <span class="pill" id="attendanceOverallPill">–</span>
+        </div>
+        <div class="card">
+          <table>
+            <tr><th>Subject</th><th>Classes held</th><th>Attended</th><th>Percentage</th><th>Status</th></tr>
+            <tbody id="attendanceTableBody">
+              <tr><td colspan="5">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ===== RESULTS ===== -->
+      <div class="view" id="view-results">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Results</div></div>
+        <div class="card">
+          <table>
+            <tr><th>Subject</th><th>Mid-Sem</th><th>Remedial</th><th>Internal</th><th>Practical</th></tr>
+            <tbody id="resultsTableBody">
+              <tr><td colspan="5">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ===== NOTICES ===== -->
+      <div class="view" id="view-notices">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">All notices</div></div>
+        <div class="card" id="allNoticesContainer">
+          <div class="tt-msg">Loading…</div>
+        </div>
+      </div>
+
+      <!-- ===== FEES ===== -->
+      <div class="view" id="view-fees">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Fees</div></div>
+        <div class="card">
+          <table>
+            <tr><th>Fee item</th><th>Sem / Batch</th><th>Amount</th><th>Due date</th><th>Status</th><th></th></tr>
+            <tbody id="feesTableBody">
+              <tr><td colspan="6">Loading…</td></tr>
+            </tbody>
+            </table>
+        </div>
+        <div class="card" style="color:var(--muted); font-size:13px;">Fee status is updated by faculty/admin once payment is confirmed. For offline payments, please allow 24–48 hours for the status to reflect here.</div>
+      </div>
+
+      <!-- ===== FACULTY DIRECTORY ===== -->
+      <div class="view" id="view-faculty">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Faculty directory</div></div>
+        <div class="fac-grid" id="facultyGrid">
+          <div class="tt-msg">Loading…</div>
+        </div>
+      </div>
+
+      <!-- ===== SETTINGS ===== -->
+      <div class="view" id="view-settings">
+        <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">Settings</div></div>
+        <div class="card settings-form">
+          <div class="field"><label>Full name</label><input type="text" id="settingsFullName"></div>
+          <div class="field"><label>Enrollment number</label><input type="text" id="settingsEnrollment" disabled></div>
+          <div class="field"><label>Email</label><input type="email" id="settingsEmail" disabled></div>
+          <div class="field"><label>Mobile number</label><input type="text" id="settingsMobile" placeholder="10-digit mobile number"></div>
+          <div class="field"><label>Semester</label><input type="text" id="settingsSemester" disabled></div>
+          <div class="field"><label>Current password</label>
+            <div class="pwd-wrap">
+              <input type="password" id="settingsCurrentPassword" placeholder="Required only to change password">
+              <button type="button" class="pwd-toggle" onclick="toggleVis('settingsCurrentPassword', this)">Show</button>
+            </div>
+          </div>
+          <div class="field"><label>New password</label>
+            <div class="pwd-wrap">
+              <input type="password" id="settingsNewPassword" placeholder="Leave blank to keep current password">
+              <button type="button" class="pwd-toggle" onclick="toggleVis('settingsNewPassword', this)">Show</button>
+            </div>
+          </div>
+          <div class="field"><label>Confirm new password</label>
+            <div class="pwd-wrap">
+              <input type="password" id="settingsConfirmPassword" placeholder="Re-enter new password">
+              <button type="button" class="pwd-toggle" onclick="toggleVis('settingsConfirmPassword', this)">Show</button>
+            </div>
+          </div>
+          <button class="btn-save" onclick="saveStudentSettings()">Save changes</button>
+        </div>
+        <div class="card">
+          <div class="toggle-row"><div><b>Dark mode</b><span>Switch between light and dark theme</span></div>
+            <label class="switch"><input type="checkbox" id="settingsDarkToggle" onchange="toggleDark()"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row"><div><b>Notice notifications</b><span>Get notified about new campus notices</span></div>
+            <label class="switch"><input type="checkbox" id="settingsNoticeNotif" checked onchange="toggleNoticeNotif()"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row"><div><b>Attendance alerts</b><span>Alert when a subject drops below 75%</span></div>
+            <label class="switch"><input type="checkbox" id="settingsAttendanceAlert" checked onchange="toggleAttendanceAlert()"><span class="slider"></span></label>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- FLOATING CHAT -->
+  <button class="fab" id="fabBtn" onclick="togglePopup()">🤖</button>
+  <div class="popup hidden" id="popup">
+    <div class="popup-head">
+      <div><b>StudentHub Chatbot</b><span>Usually replies instantly</span></div>
+      <button class="popup-close" onclick="togglePopup()">✕</button>
+    </div>
+    <div class="popup-log" id="popupLog">
+      <div class="msg bot">Hi Shubham 👋 Ask me anything about your campus.</div>
+    </div>
+    <div class="popup-input-row">
+      <input type="text" id="popupInput" placeholder="Type a message…" onkeydown="if(event.key==='Enter') sendChat('popupInput','popupLog')">
+      <button class="popup-send" onclick="sendChat('popupInput','popupLog')">➤</button>
+    </div>
+  </div>
+
+<script src="student.js"></script>
+
+</body>
+</html>

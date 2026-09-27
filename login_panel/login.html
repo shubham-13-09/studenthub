@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StudentHub — Login</title>
+<link rel="stylesheet" href="login.css">
+</head>
+<body>
+
+  <!-- MOBILE / TABLET HERO — sirf chhoti screens pe dikhta hai (desktop split-panel se replace hota hai) -->
+  <div class="mobile-hero">
+    <div class="mobile-hero-mark"><img src="studenthub.png" alt="StudentHub"></div>
+    <div class="mobile-hero-name">StudentHub</div>
+    <div class="mobile-hero-sub">Sign in to your account</div>
+  </div>
+
+  <!-- LEFT BRAND PANEL -->
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-mark"><img src="studenthub.png" alt=""></div>
+      <div class="brand-name">StudentHub</div>
+    </div>
+
+    <div class="side-mid">
+      <div class="eyebrow">StudentHub</div>
+      <h1 class="headline">Everything a student needs, <span class="accent">in one place</span>.</h1>
+      <p class="sub">Access your timetable, attendance, notes, results and AI chatbot support from one secure platform.</p>
+      <ul class="points">
+        <li><span class="tick">✓</span> Timetable &amp; Attendance</li>
+        <li><span class="tick">✓</span> Notes &amp; Results</li>
+        <li><span class="tick">✓</span> Collage Notices</li>
+        <li><span class="tick">✓</span> AI Chatbot Support</li>
+        <li><span class="tick">✓</span> Secure Login</li>
+      </ul>
+    </div>
+
+    <div class="side-foot">© 2026 StudentHub</div>
+  </aside>
+
+  <!-- RIGHT PANEL -->
+  <main class="main">
+    <div class="panel">
+
+      <!-- ============ LOGIN VIEW ============ -->
+      <section id="viewLogin">
+        <div class="tabs">
+          <button class="tab active" id="tabSignin">Sign in</button>
+          <a class="tab" id="tabSignup" href="register.html">Create account</a>
+        </div>
+
+        <h2 class="heading">Welcome back</h2>
+        <p class="heading-sub">Sign in to continue to StudentHub.</p>
+
+        <form id="loginForm" onsubmit="return handleLogin(event)" novalidate>
+
+          <div class="field">
+            <label>Enrollment Number / Email</label>
+            <div class="input-wrap" id="wrap_id">
+              <span class="icon">#</span>
+              <input type="text" placeholder="Enrollment number or email ID" id="li_id">
+            </div>
+            <div class="hint error hidden" id="err_id">Enter your enrollment number or email ID.</div>
+            <div class="hint">Students can use enrollment number or registered email · Faculty can use their Faculty ID or registered email · Admin uses their assigned email ID.</div>
+          </div>
+
+          <div class="field">
+            <label>Password</label>
+            <div class="input-wrap" id="wrap_password">
+              <span class="icon">⚿</span>
+              <input type="password" placeholder="Enter your password" id="li_password">
+              <button type="button" class="toggle-visibility" onclick="toggleVis('li_password', this)">Show</button>
+            </div>
+            <div class="hint error hidden" id="err_password">Password cannot be empty.</div>
+          </div>
+
+          <div class="fwd-row" style="margin-bottom:22px;">
+            <label class="remember" style="margin-bottom:0;">
+              <input type="checkbox"> Remember me for 30 days
+            </label>
+            <a href="#" class="link-sm" onclick="showView('forgot'); return false;">Forgot password?</a>
+          </div>
+
+          <button type="submit" class="btn-primary">Login <span>→</span></button>
+        </form>
+
+        <p class="switch-line">New to StudentHub? <a href="register.html">Register now</a></p>
+      </section>
+
+      <!-- ============ FORGOT PASSWORD VIEW ============ -->
+      <section id="viewForgot" class="hidden">
+        <h2 class="heading">Reset your password</h2>
+        <p class="heading-sub" id="forgotStepSub">Enter your Enrollment Number / Faculty ID and email to receive an OTP.</p>
+
+        <!-- Step 1: enrollment/faculty ID + email -->
+        <div id="forgotStep1">
+          <div class="field">
+            <label>Enrollment Number / Faculty ID</label>
+            <div class="input-wrap">
+              <span class="icon">#</span>
+              <input type="text" placeholder="Enrollment number or Faculty ID" id="fg_enroll">
+            </div>
+          </div>
+          <div class="field">
+            <label>Email ID</label>
+            <div class="input-wrap">
+              <span class="icon">@</span>
+              <input type="email" placeholder="you@gmail.com" id="fg_email">
+            </div>
+          </div>
+          <button type="button" class="btn-primary" onclick="sendOtp()">Send OTP <span>→</span></button>
+        </div>
+
+        <!-- Step 2: OTP verification -->
+        <div id="forgotStep2" class="hidden">
+          <div class="id-note">An OTP has been sent to your registered email. It's valid for 2 minutes.</div>
+          <div class="field">
+            <label>Enter OTP</label>
+            <div class="input-wrap">
+              <span class="icon">✉</span>
+              <input type="text" maxlength="6" placeholder="6 digit OTP" id="fg_otp">
+            </div>
+          </div>
+          <div class="fwd-row" style="margin-bottom:22px;">
+            <span></span>
+            <a href="#" class="link-sm" onclick="sendOtp(); return false;">Resend OTP</a>
+          </div>
+          <button type="button" class="btn-primary" onclick="verifyOtp()">Verify OTP <span>→</span></button>
+        </div>
+
+        <!-- Step 3: new password (only after OTP verified) -->
+        <div id="forgotStep3" class="hidden">
+          <div class="field">
+            <label>New Password</label>
+            <div class="input-wrap" id="wrap_newpass">
+              <span class="icon">⚿</span>
+              <input type="password" placeholder="At least 8 characters" id="fg_newpass">
+              <button type="button" class="toggle-visibility" onclick="toggleVis('fg_newpass', this)">Show</button>
+            </div>
+            <div class="hint error hidden" id="err_newpass">Password must be at least 8 characters.</div>
+          </div>
+          <div class="field">
+            <label>Confirm Password</label>
+            <div class="input-wrap" id="wrap_newpass2">
+              <span class="icon">⚿</span>
+              <input type="password" placeholder="Re-enter new password" id="fg_newpass2">
+              <button type="button" class="toggle-visibility" onclick="toggleVis('fg_newpass2', this)">Show</button>
+            </div>
+            <div class="hint error hidden" id="err_newpass2">Passwords do not match.</div>
+          </div>
+          <button type="button" class="btn-primary" onclick="updatePassword()">Update Password <span>→</span></button>
+        </div>
+
+        <p class="switch-line">Remembered your password? <a href="#" onclick="showView('login'); return false;">Back to login</a></p>
+      </section>
+
+    </div>
+  </main>
+
+<script src="login.js"></script>
+<script src="register.js"></script>
+</body>
+</html>
