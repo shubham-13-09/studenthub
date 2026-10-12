@@ -49,6 +49,7 @@ body {
   color: var(--ink);
   display: flex;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   transition: background .2s ease, color .2s ease;
 }
@@ -65,6 +66,7 @@ body {
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh;
   transition: transform .25s ease;
   z-index: 40;
   overflow: auto;
@@ -132,6 +134,9 @@ body {
   flex-direction: column;
   gap: 3px;
   margin-top: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .nav-item {
@@ -185,7 +190,7 @@ body {
 
 
 .sidebar-foot {
-  margin-top: auto;
+  flex-shrink: 0;
   border-top: 1px solid rgba(255, 255, 255, 0.09);
   padding-top: 16px;
 }
@@ -250,6 +255,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow-y: auto;
 }
 
@@ -371,15 +377,22 @@ body {
 
 .nav-unread-dot {
   display: none;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
   background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  align-items: center;
+  justify-content: center;
   margin-left: auto;
 }
 
 .nav-unread-dot.show {
-  display: block;
+  display: flex;
 }
 
 .topbar-search-results {
@@ -773,7 +786,7 @@ body {
 }
 
 .tt-time {
-  width: 56px;
+  width: 78px;
   flex-shrink: 0;
 }
 
@@ -1334,6 +1347,7 @@ tr:last-child td {
   display: flex;
   flex-direction: column;
   height: calc(100vh - 200px);
+  height: calc(100dvh - 200px);
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -1679,6 +1693,14 @@ tr:last-child td {
   color: var(--muted);
   display: block;
   margin-bottom: 14px;
+}
+
+.subject-card-foot {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  font-size: 11.5px;
+  color: var(--teal-700);
+  font-weight: 700;
 }
 
 /* Timetable row action button (dashboard) */
@@ -2184,13 +2206,15 @@ tr:last-child td {
   font-weight: 600;
 }
 
-/* ---- Weekly timetable grid (read-only, mirrors admin panel styling) ---- */
+/* ---- Weekly timetable grid: compact, spreadsheet-style layout ---- */
 .tt-grid-table {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow: hidden;
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--paper);
 }
 
 .tt-grid-table th,
@@ -2198,20 +2222,31 @@ tr:last-child td {
   border: 1px solid var(--line);
   text-align: center;
   vertical-align: middle;
-  padding: 10px 8px;
+  padding: 7px 5px;
+  line-height: 1.15;
 }
 
 .tt-grid-table th {
   background: var(--mint-100);
-  font-size: 11.5px;
-  text-transform: uppercase;
-  letter-spacing: .5px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0;
   color: var(--muted);
+  height: 34px;
+}
+
+.tt-div-subhead {
+  background: var(--paper) !important;
+  font-size: 10.5px !important;
+  font-weight: 700 !important;
+  height: 24px !important;
 }
 
 .tt-time-col {
+  width: 132px;
   font-weight: 700;
-  font-size: 12.5px;
+  font-size: 11px;
   white-space: nowrap;
   background: var(--paper);
   position: sticky;
@@ -2221,23 +2256,36 @@ tr:last-child td {
 
 .tt-cell {
   background: var(--paper);
+  min-height: 54px;
+}
+
+.tt-cell-combined {
+  background: var(--mint-100);
 }
 
 .tt-subject {
-  font-size: 12.5px;
-  font-weight: 600;
+  font-size: 11.5px;
+  font-weight: 700;
   color: var(--ink);
   margin-bottom: 2px;
 }
 
+.tt-session {
+  font-size: 9.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: var(--teal-700);
+  margin-bottom: 2px;
+}
+
 .tt-meta {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--muted);
 }
 
 .tt-cell-empty {
   color: var(--line);
-  font-size: 12px;
+  font-size: 11px;
   background: var(--paper);
 }
 
@@ -2252,23 +2300,30 @@ tr:last-child td {
   background: var(--amber-bg);
   color: var(--amber);
   font-weight: 700;
-  font-size: 12.5px;
+  font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: .5px;
+  letter-spacing: .4px;
+  height: 30px;
 }
 
-.tt-div-subhead {
-  background: var(--paper) !important;
-  font-size: 11px !important;
-}
-
-.tt-cell-combined {
-  background: var(--mint-100);
-}
-
-.tt-cell-combined .tt-subject {
+/* Lecture/Lab label: admin jaisa plain text (pill/amber nahi) */
+.tt-grid-table .tt-session,
+.tt-grid-table .tt-session.is-lab,
+.tt-grid-table .tt-session.is-lecture {
+  display: block;
+  margin: 0 0 2px;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
   color: var(--teal-700);
 }
+/* Mid-Sem / Remedial list-table: admin jaisa compact text */
+.tt-grid-table td { font-size: 12px; }
+
 /* Change Password fields — Show/Hide toggle button (same as admin panel) */
 .pwd-wrap {
   position: relative;
@@ -2385,6 +2440,26 @@ button:disabled:hover {
   border-radius: 14px 4px 14px 14px;
 }
 
+/* Notice bhejne wale ka naam — received card ke upar, WhatsApp group sender jaisa */
+.nf-sender {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--teal-700);
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+body.dark .nf-sender {
+  color: #5fd3aa;   /* dark card par teal-700 kam dikhta hai */
+}
+
+.nf-sender small {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-left: 4px;
+}
+
 .nf-top {
   display: flex;
   align-items: center;
@@ -2433,6 +2508,16 @@ button:disabled:hover {
 }
 
 .nf-menu.open .nf-menu-list { display: block; }
+
+/* Menu khula ho to uska card baaki cards ke upar aaye (har card apna stacking context hai,
+   isliye menu ka apna z-index akela kaafi nahi tha) */
+.nf-card.menu-open { z-index: 40; }
+
+/* Neeche jagah na ho to menu upar ki taraf khule */
+.nf-menu.flip-up .nf-menu-list {
+  top: auto;
+  bottom: 100%;
+}
 
 .nf-menu-list button {
   display: flex;
@@ -2568,6 +2653,89 @@ button:disabled:hover {
   .nf-card { animation: none; }
 }
 
+/* ============================================================
+   NOTICE FEED SCROLL — chat jaisa (WhatsApp-style): purani notices upar, nayi neeche.
+   Sirf feed (.notice-feed-scroll) scroll hota hai, poora card nahi; ↓ arrow latest tak le jaata hai
+   ============================================================ */
+.notice-shell {
+  position: relative;
+  height: clamp(280px, 52vh, 520px);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.notice-feed-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 18px;
+  scrollbar-width: thin;                          /* Firefox */
+  scrollbar-color: var(--teal-500) transparent;
+}
+
+/* Slim, rounded scrollbar (Chrome/Edge/Safari) — theme vars se dark mode me bhi sahi */
+.notice-feed-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.notice-feed-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 10px 0;
+}
+
+.notice-feed-scroll::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 40px;
+}
+
+.notice-feed-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--teal-500);
+  background-clip: padding-box;
+}
+
+.notice-feed-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--teal-700);
+  background-clip: padding-box;
+}
+
+.scroll-bottom-btn {
+  position: absolute;
+  right: 18px;
+  bottom: 16px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--teal-700);
+  border: 1.5px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(15, 58, 48, 0.22);
+  z-index: 6;
+  transition: transform .15s ease, background .15s ease;
+}
+
+.scroll-bottom-btn:hover {
+  background: var(--mint-100);
+  transform: translateY(-2px);
+}
+
+.scroll-bottom-btn.hidden {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .notice-feed-scroll { padding: 12px; }
+}
+
 /* Post / Edit notice form — mint background, white input boxes */
 .notice-form-card {
   background: var(--mint-100);
@@ -2599,4 +2767,578 @@ body.dark .stat-ic.violet, body.dark .quick-ic.violet { color: #a78bfa; }
   font-weight: 500;
   color: #cfe6dd;
   margin-top: 8px;
+}
+
+/* ============================================================
+   DROPDOWNS (select) — poore faculty panel me ek jaisa look
+   Pehle: kuch 34px, kuch 40px, alag background, browser ka default arrow.
+   Ab: custom chevron, same height/radius/focus, ellipsis, dark-mode ke options bhi dark
+   ============================================================ */
+.selector-field select,
+.form-grid .field select,
+.settings-form select,
+.notice-form-card select,
+.status-select,
+.filter-select {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 34px 9px 12px;
+  border: 1.5px solid var(--line);
+  border-radius: 9px;
+  background-color: var(--paper);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 1.5 6 6l4.5-4.5' fill='none' stroke='%230f6b52' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px 8px;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+  outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+/* Class-selector bar me pehle se halka (bg) background tha, wahi rakhte hain */
+.selector-field select { background-color: var(--bg); }
+
+/* Filter-row wale chhote dropdowns: width content ke hisaab se, thoda compact */
+.filter-select {
+  width: auto;
+  min-width: 110px;
+  max-width: 260px;
+  min-height: 36px;
+  padding: 7px 32px 7px 12px;
+  font-size: 12.5px;
+  border-radius: 8px;
+}
+
+/* Fee table ke andar ka status dropdown */
+.status-select {
+  width: 130px;
+  min-height: 34px;
+  padding: 6px 30px 6px 10px;
+  border-radius: 7px;
+  background-color: var(--bg);
+}
+
+.selector-field select:hover,
+.form-grid .field select:hover,
+.settings-form select:hover,
+.notice-form-card select:hover,
+.status-select:hover,
+.filter-select:hover {
+  border-color: var(--teal-500);
+}
+
+.selector-field select:focus,
+.form-grid .field select:focus,
+.settings-form select:focus,
+.notice-form-card select:focus,
+.status-select:focus,
+.filter-select:focus {
+  border-color: var(--teal-500);
+  box-shadow: 0 0 0 3px rgba(24, 144, 110, .15);
+}
+
+.selector-field select:disabled,
+.form-grid .field select:disabled,
+.settings-form select:disabled,
+.notice-form-card select:disabled,
+.status-select:disabled,
+.filter-select:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+  background-color: var(--bg);
+}
+
+/* Khulne wali options list — dark mode me bhi readable (browser ke popup ko dark scheme do) */
+select option {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+body.dark select {
+  color-scheme: dark;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 1.5 6 6l4.5-4.5' fill='none' stroke='%239fe8cd' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+body.dark .selector-field select,
+body.dark .status-select {
+  background-color: var(--bg);
+}
+
+/* Notice form ka card mint hai, isliye dropdown paper (white) hi rahe */
+.notice-form-card select { background-color: var(--paper); }
+body.dark .notice-form-card select { background-color: var(--paper); }
+
+@media (max-width: 640px) {
+  .filter-select { max-width: 100%; flex: 1 1 140px; }
+}
+
+/* AI chat "typing…" loading dots */
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 1em;
+  padding: 2px 0;
+}
+
+.typing-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .3;
+  animation: typingDotBounce 1.1s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) { animation-delay: .18s; }
+.typing-dots i:nth-child(3) { animation-delay: .36s; }
+
+@keyframes typingDotBounce {
+  0%, 60%, 100% { opacity: .3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
+}
+/* Lecture / Lab label in timetable cells */
+.tt-session {
+  display: inline-block;
+  margin: 2px 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  background: var(--mint-100, #e6f6f1);
+  color: var(--teal-700, #0f766e);
+}
+.tt-session.is-lab {
+  background: var(--amber-bg, #fff4dc);
+  color: var(--amber, #b45309);
+}
+
+/* Lecture / Lab badge on dashboard rows and pending list */
+.tt-type {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-style: normal;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  vertical-align: middle;
+  background: var(--mint-100, #e6f6f1);
+  color: var(--teal-700, #0f766e);
+}
+.tt-type.is-lab {
+  background: var(--amber-bg, #fff4dc);
+  color: var(--amber, #b45309);
+}
+
+
+/* ============================================================
+   RESPONSIVE FIXES — mobile / tablet / laptop (student panel jaisa)
+   (kept last so these win over earlier base rules)
+   ============================================================ */
+
+/* Very wide monitors: keep content readable */
+@media (min-width: 1600px) {
+  .content { width: 100%; max-width: 1500px; margin: 0 auto; }
+}
+
+/* Tablet (sidebar still visible): tables scroll instead of crushing columns */
+@media (max-width: 1100px) {
+  .card:has(table) { overflow-x: auto; }
+  .card:has(table) table { min-width: 520px; }
+}
+
+/* Mobile + small tablet */
+@media (max-width: 860px) {
+  /* Search results: fit the screen instead of a fixed-width box that ran off the right edge */
+  .topbar-search-results {
+    position: fixed !important;
+    top: 66px !important;
+    left: 12px !important;
+    right: 12px !important;
+    width: auto !important;
+    max-height: 60vh;
+  }
+
+  /* Wider chat bubbles on narrow screens */
+  .msg { max-width: 88%; }
+
+  /* Popup height follows the visible viewport (URL bar aware) */
+  .popup { height: 60vh; height: 60dvh; }
+
+  /* 16px inputs stop iOS Safari from zooming in when a field is focused */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  select,
+  textarea { font-size: 16px !important; }
+}
+
+/* Small phones */
+@media (max-width: 480px) {
+  .toggle-row { gap: 12px; }
+}
+
+/* Landscape phones: chat popup must not be taller than the screen */
+@media (max-height: 560px) {
+  .popup { height: calc(100dvh - 110px); max-height: 440px; }
+}
+
+/* Touch devices: no "stuck" hover lift after a tap */
+@media (hover: none) {
+  button:hover,
+  .icon-btn:hover,
+  .banner-btn:hover,
+  .stat-card:hover,
+  .quick-item:hover,
+  .subject-card:hover {
+    transform: none;
+    box-shadow: none;
+  }
+}
+
+/* ============================================================
+   AI CHAT PAGE — ChatGPT-style layout (StudentHub colours)
+   Sirf #view-chat par lagta hai, floating popup chatbot par asar nahi.
+   ============================================================ */
+#view-chat > .card-head { display: none; }
+
+#view-chat .chat-shell {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  height: calc(100vh - 150px);
+  height: calc(100dvh - 150px);
+  min-height: 420px;
+  margin: 0;
+  padding: 0 0 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+#view-chat .chat-log {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  padding: 24px max(22px, calc((100% - 820px) / 2)) 24px;
+  background: transparent;
+  border: none;
+  scroll-behavior: smooth;
+}
+
+/* Bot reply: bubble nahi, seedha text + round avatar (ChatGPT jaisa) */
+#view-chat .msg {
+  max-width: 100%;
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--ink);
+  word-wrap: break-word;
+}
+
+#view-chat .msg.bot {
+  position: relative;
+  align-self: stretch;
+  padding: 6px 0 0 54px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+#view-chat .msg.bot::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: url("chat-logo.png") center / cover no-repeat;
+  box-shadow: 0 0 0 2px var(--paper), 0 0 0 3px var(--line);
+}
+
+/* User message: right side me rounded bubble */
+#view-chat .msg.user {
+  align-self: flex-end;
+  max-width: 75%;
+  padding: 10px 18px;
+  background: var(--mint-200);
+  color: var(--ink);
+  border: none;
+  border-radius: 22px;
+  border-bottom-right-radius: 8px;
+}
+
+/* Input: neeche floating pill composer */
+#view-chat .chat-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 44px);
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 8px 8px 8px 22px;
+  background: var(--paper);
+  border: 1.5px solid var(--line);
+  border-radius: 30px;
+  box-shadow: 0 6px 22px rgba(15, 107, 82, .10);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+#view-chat .chat-input-row:focus-within {
+  border-color: var(--teal-500);
+  box-shadow: 0 6px 24px rgba(24, 144, 110, .18);
+}
+
+#view-chat .chat-input-row input {
+  flex: 1;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 15px;
+  padding: 10px 0;
+}
+
+#view-chat .chat-input-row input:focus {
+  border: none;
+  box-shadow: none;
+}
+
+#view-chat .chat-send {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--teal-700);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s ease, transform .1s ease;
+}
+
+#view-chat .chat-send:hover { background: var(--teal-600); }
+#view-chat .chat-send:active { transform: scale(.94); }
+
+#view-chat .chat-note {
+  margin-top: 10px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+@media (max-width: 640px) {
+  #view-chat .chat-shell { height: calc(100vh - 130px); }
+  #view-chat .msg.user { max-width: 88%; }
+}
+
+/* ============================================================
+   STUDENT DAY-WISE ATTENDANCE (modal on the Students page)
+   ============================================================ */
+.att-cal-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.att-cal-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.att-cal-weekdays div {
+  text-align: center;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.att-cal-days {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+.att-cal-day {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.att-cal-day.empty { background: transparent; }
+.att-cal-day.present { background: var(--mint-100); color: var(--teal-700); }
+.att-cal-day.absent { background: var(--danger-bg); color: var(--danger); }
+/* Lecture aur Lab ka status alag ho (ek present, ek absent) — aadha hara, aadha laal */
+.att-cal-day.mixed {
+  background: linear-gradient(135deg, var(--mint-200) 50%, #f5b5ae 50%);
+  color: var(--ink);
+}
+.att-cal-day.has-rec { cursor: pointer; }
+.att-cal-day.has-rec:hover { filter: brightness(.96); }
+.att-cal-day.selected { outline: 2px solid var(--teal-600); outline-offset: 1px; }
+.att-cal-day.none { background: var(--bg); color: var(--muted); }
+.att-cal-legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.att-cal-legend-row span { display: inline-flex; align-items: center; gap: 6px; }
+.att-cal-swatch { width: 12px; height: 12px; border-radius: 4px; display: inline-block; }
+.att-cal-swatch.present { background: var(--mint-100); border: 1.5px solid var(--teal-700); }
+.att-cal-swatch.absent { background: var(--danger-bg); border: 1.5px solid var(--danger); }
+.att-cal-swatch.mixed { background: linear-gradient(135deg, var(--mint-200) 50%, #f5b5ae 50%); border: 1.5px solid var(--amber); }
+.att-cal-swatch.none { background: var(--bg); border: 1.5px solid var(--line); }
+
+.stu-att-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.stu-att-nav-btn {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.stu-att-nav-btn:hover { border-color: var(--teal-600); }
+.stu-att-section-title {
+  margin: 18px 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+}
+.stu-att-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.stu-att-row:last-child { border-bottom: none; }
+.stu-att-row small { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.stu-att-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.stu-att-chip {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.stu-att-empty { color: var(--muted); font-size: 13px; }
+
+/* Kisi din par click karne par us din ka Lecture / Lab wise status */
+.stu-att-day-detail:empty { display: none; }
+.stu-att-day-detail {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.stu-att-day-detail b { display: block; margin-bottom: 8px; font-size: 13px; }
+.stu-att-chip small { font-weight: 500; opacity: .85; margin-left: 2px; }
+
+/* Dashboard: Attendance pending & Cancelled lectures — 5 rows tak, phir scroll */
+.dash-scroll-list{
+  max-height: 340px; /* fallback jab tak JS exact 5-row height measure na kare */
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+}
+.dash-scroll-list:has(> .empty-state){ max-height: none; overflow-y: visible; }
+
+/* ===== Fees Entry — folder grouping (Sem + Division + Batch -> Fee title), same look as Admin's Fee Management ===== */
+.fee-folder-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 14px;
+}
+
+.fee-folder-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1.5px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  cursor: pointer;
+  transition: border-color .15s ease, transform .15s ease;
+  position: relative;
+}
+
+.fee-folder-card:hover {
+  border-color: var(--teal-700, #0f6b52);
+  transform: translateY(-2px);
+}
+
+.fee-folder-card .fee-folder-icon {
+  font-size: 26px;
+}
+
+.fee-folder-card .fee-folder-name {
+  font-weight: 700;
+  font-size: 14.5px;
+  color: var(--ink);
+}
+
+.fee-folder-card .fee-folder-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fee-folder-card .fee-folder-stats {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.fee-folder-card .fee-folder-stats .pill {
+  font-size: 11px;
+}
+
+.fee-nav-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
 }

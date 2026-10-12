@@ -24,6 +24,7 @@
 
     <ul class="nav">
       <li class="nav-item active" data-view="dashboard"><span class="ic">🏠</span> Dashboard</li>
+      <li class="nav-item" data-view="chat"><span class="ic">🤖</span> AI Chat</li>
 
       <li class="nav-group">
         <div class="nav-group-head" onclick="toggleGroup(this)"><span class="ic">👨‍🎓</span> Student Management <span
@@ -70,6 +71,7 @@
           <li class="nav-sub-item" data-view="timetable">View Timetable</li>
           <li class="nav-sub-item" data-view="timetable">Edit Timetable</li>
           <li class="nav-sub-item" data-view="timetable">Delete Timetable</li>
+          <li class="nav-sub-item" data-view="holidays">Holidays</li>
         </ul>
       </li>
 
@@ -153,9 +155,9 @@
         <div class="nav-group-head" onclick="toggleGroup(this)"><span class="ic">🤖</span> AI Chatbot <span
             class="chev">▾</span></div>
         <ul class="nav-sub">
-          <li class="nav-sub-item" data-view="chatbot">FAQ Management</li>
-          <li class="nav-sub-item" data-view="chatbot">AI Knowledge Base</li>
-          <li class="nav-sub-item" data-view="chatbot">Chat History</li>
+          <li class="nav-sub-item" data-view="chatbot" data-tab="faq">FAQ Management</li>
+          <li class="nav-sub-item" data-view="chatbot" data-tab="kb">AI Knowledge Base</li>
+          <li class="nav-sub-item" data-view="chatbot" data-tab="history">Chat History</li>
         </ul>
       </li>
 
@@ -208,7 +210,7 @@
     <div class="topbar">
       <div class="icon-btn menu-btn" id="menuBtn" onclick="openSidebar()">☰</div>
       <div class="search" style="position:relative;">
-        🔍 <input type="text" id="globalSearchInput" placeholder="Search students, faculty…" autocomplete="off"
+        🔍 <input type="text" id="globalSearchInput" placeholder="Search menu, students, faculty…" autocomplete="off"
           oninput="onGlobalSearchInput()" onfocus="onGlobalSearchInput()">
         <div id="globalSearchResults" class="dropdown-menu hidden" style="top:calc(100% + 6px); left:0; width:320px;"></div>
       </div>
@@ -302,6 +304,23 @@
                 <div class="notice-row" style="border-bottom:none;"><b>Loading…</b></div>
               </div>
             </div>
+            <div class="card" style="margin-top:16px;">
+              <div class="card-head">
+                <div class="card-title">Quick access</div>
+              </div>
+              <div class="quick-grid">
+                <div class="quick-item" onclick="switchView('students')"><span
+                    class="quick-ic mint">👨‍🎓</span>Students</div>
+                <div class="quick-item" onclick="switchView('faculty')"><span class="quick-ic blue">👨‍🏫</span>Faculty
+                </div>
+                <div class="quick-item" onclick="switchView('marks')"><span class="quick-ic amber">📊</span>Marks</div>
+                <div class="quick-item" onclick="switchView('fees')"><span class="quick-ic violet">💳</span>Fees</div>
+                <div class="quick-item" onclick="switchView('notices')"><span class="quick-ic rose">📢</span>Notices
+                </div>
+                <div class="quick-item" onclick="switchView('reports')"><span class="quick-ic mint">📈</span>Reports
+                </div>
+              </div>
+            </div>
           </div>
           <div>
             <div class="card askai-card">
@@ -319,23 +338,6 @@
                 <button class="askai-send" onclick="adminAskFromDashboard()">➤</button>
               </div>
               <div class="askai-reply hidden" id="adminAskaiReply"></div>
-            </div>
-            <div class="card">
-              <div class="card-head">
-                <div class="card-title">Quick access</div>
-              </div>
-              <div class="quick-grid">
-                <div class="quick-item" onclick="switchView('students')"><span
-                    class="quick-ic mint">👨‍🎓</span>Students</div>
-                <div class="quick-item" onclick="switchView('faculty')"><span class="quick-ic blue">👨‍🏫</span>Faculty
-                </div>
-                <div class="quick-item" onclick="switchView('marks')"><span class="quick-ic amber">📊</span>Marks</div>
-                <div class="quick-item" onclick="switchView('fees')"><span class="quick-ic violet">💳</span>Fees</div>
-                <div class="quick-item" onclick="switchView('notices')"><span class="quick-ic rose">📢</span>Notices
-                </div>
-                <div class="quick-item" onclick="switchView('reports')"><span class="quick-ic mint">📈</span>Reports
-                </div>
-              </div>
             </div>
             <div class="card">
               <div class="card-head">
@@ -362,10 +364,12 @@
             <div class="field"><label>Enrollment number</label><input type="text" id="studentEnrollment" placeholder="12 digit number"></div>
             <div class="field"><label>Email ID</label><input type="email" id="studentEmail" placeholder="you@gmail.com"></div>
             <div class="field"><label>Mobile number</label><input type="text" id="studentMobile" placeholder="10 digit number"></div>
+            <div class="field"><label>WhatsApp number <span style="font-weight:400; color:var(--muted);">(optional)</span></label><input type="text" id="studentWhatsapp" placeholder="e.g. 91XXXXXXXXXX"></div>
             <div class="field"><label>Department</label><select id="studentDept">
                 <option value="Computer Engineering">Computer Engineering</option>
               </select></div>
             <div class="field"><label>Semester</label><select id="studentSem">
+                <option value="" selected disabled>Select semester</option>
                 <option>1</option>
                 <option>2</option>
                 <option>3</option>
@@ -374,11 +378,12 @@
                 <option>6</option>
               </select></div>
             <div class="field"><label>Division</label><select id="studentDiv">
-                <option>A</option>
-                <option>B</option>
-                <option>C</option>
+                <option value="" selected disabled>Select division</option>
+                <option value="A">A</option>
+                <option value="B">B</option>
               </select></div>
             <div class="field"><label>Batch (Academic Year)</label><select id="studentBatch">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
@@ -391,8 +396,8 @@
 
           <div class="card-title" style="margin:20px 0 16px;font-size:14px;">Parent / Guardian details</div>
           <div class="form-grid">
-            <div class="field"><label>Father's name</label><input type="text" id="studentFatherName" placeholder="Enter father's name"></div>
-            <div class="field"><label>Father's mobile number</label><input type="text" id="studentFatherMobile" maxlength="10" placeholder="10 digit number"></div>
+            <div class="field"><label>Father's name <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="studentFatherName" placeholder="Enter father's name"></div>
+            <div class="field"><label>Father's mobile number <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="studentFatherMobile" maxlength="10" placeholder="10 digit number"></div>
             <div class="field"><label>Mother's name <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="studentMotherName" placeholder="Enter mother's name"></div>
             <div class="field"><label>Mother's mobile number <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="studentMotherMobile" maxlength="10" placeholder="10 digit number"></div>
             <div class="field"><label>Parent's email ID <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="email" id="studentParentEmail" placeholder="parent@gmail.com"></div>
@@ -428,6 +433,11 @@
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
               </select>
+              <select id="studentFilterStatus" onchange="loadStudents()">
+                <option value="">All status</option>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
             </div>
           </div>
           <table>
@@ -443,7 +453,7 @@
               <th>Actions</th>
             </tr>
             <tbody id="studentsTableBody">
-              <tr><td colspan="9">Loading…</td></tr>
+              <tr><td colspan="10">Loading…</td></tr>
             </tbody>
           </table>
         </div>
@@ -466,6 +476,7 @@
               <div><span style="color:var(--muted); font-size:11.5px; display:block;">Email</span><b id="studentDetailEmail">-</b></div>
               <div><span style="color:var(--muted); font-size:11.5px; display:block;">Mobile</span><b id="studentDetailMobile">-</b></div>
             </div>
+            <div><span style="color:var(--muted); font-size:11.5px; display:block;">WhatsApp number</span><b id="studentDetailWhatsapp">-</b></div>
             <div><span style="color:var(--muted); font-size:11.5px; display:block;">Dept · Sem · Div · Batch</span><b id="studentDetailAcademic">-</b></div>
 
             <div class="card-title" style="font-size:13px;margin:6px 0 -4px;">Parent / Guardian info</div>
@@ -551,10 +562,12 @@
             <div class="field"><label>Short name <span style="font-weight:400; color:var(--muted);">(optional)</span></label><input type="text" id="facultyShortName" placeholder="e.g. J. V. Shapariya" maxlength="50"></div>
             <div class="field"><label>Faculty ID</label><input type="text" id="facultyLoginId" placeholder="faculty004@123"></div>
             <div class="field"><label>Email ID</label><input type="email" id="facultyEmail" placeholder="you@gmail.com"></div>
+            <div class="field"><label>WhatsApp number <span style="font-weight:400; color:var(--muted);">(optional)</span></label><input type="text" id="facultyWhatsapp" placeholder="e.g. 91XXXXXXXXXX"></div>
             <div class="field"><label>Department</label><select id="facultyDept">
                 <option>Computer Engineering</option>
               </select></div>
             <div class="field"><label>Assign semester</label><select id="facultySemester" onchange="onFacultySemesterChange()">
+                <option value="" selected disabled>Select semester</option>
                 <option value="1">1</option>
                 <option value="2">2</option>
                 <option value="3">3</option>
@@ -566,9 +579,9 @@
                 <option value="">All divisions</option>
                 <option value="A">A</option>
                 <option value="B">B</option>
-                <option value="C">C</option>
               </select></div>
             <div class="field"><label>Batch (Academic Year)</label><select id="facultyBatch" onchange="onFacultySemesterChange()">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
@@ -631,6 +644,7 @@
                 <option>Computer Engineering</option>
               </select></div>
             <div class="field"><label>Semester</label><select id="subjectSem">
+                <option value="" selected disabled>Select semester</option>
                 <option>1</option>
                 <option>2</option>
                 <option>3</option>
@@ -638,7 +652,13 @@
                 <option>5</option>
                 <option>6</option>
               </select></div>
+            <div class="field"><label>Subject type</label><select id="subjectType">
+                <option value="Theory">Theory</option>
+                <option value="Lab">Lab</option>
+                <option value="Theory + Lab">Theory + Lab</option>
+              </select></div>
             <div class="field"><label>Batch (Academic Year)</label><select id="subjectBatch">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
@@ -668,13 +688,60 @@
               <th>Subject</th>
               <th>Department</th>
               <th>Semester</th>
+              <th>Type</th>
               <th>Batch</th>
               <th>Actions</th>
             </tr>
             <tbody id="subjectsTableBody">
-              <tr><td colspan="6">Loading…</td></tr>
+              <tr><td colspan="7">Loading…</td></tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <!-- ===== HOLIDAYS ===== -->
+      <div class="view" id="view-holidays">
+        <div class="card-head" style="margin-bottom:16px;">
+          <div class="card-title" style="font-size:20px;">Holidays</div>
+        </div>
+
+        <div class="card form-card" style="margin-bottom:16px;">
+          <div class="card-title" style="margin-bottom:6px;">Add holiday</div>
+          <div style="font-size:12.5px; color:var(--muted); margin-bottom:14px;">
+            Lectures on a holiday are not counted as held classes, and faculty are not asked for attendance.
+            Leave Semester empty for the whole college.
+          </div>
+          <div class="filter-row holiday-form">
+            <input type="date" id="holDate">
+            <input type="text" id="holName" placeholder="Holiday name (e.g. Diwali)" maxlength="100">
+            <select id="holSemester">
+              <option value="">Whole college</option>
+              <option value="1">Sem 1</option><option value="2">Sem 2</option><option value="3">Sem 3</option>
+              <option value="4">Sem 4</option><option value="5">Sem 5</option><option value="6">Sem 6</option>
+            </select>
+            <input type="text" id="holDivision" placeholder="Division (optional)" maxlength="5">
+            <button class="btn-primary" onclick="addHoliday()">Add holiday</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><div class="card-title">All holidays</div></div>
+          <div class="table-scroll">
+            <table class="data-table holiday-table">
+              <thead><tr><th>Date</th><th>Name</th><th>Applies to</th><th>Action</th></tr></thead>
+              <tbody id="holidaysTableBody"><tr><td colspan="4">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="card-head"><div class="card-title">Cancelled lectures / labs</div></div>
+          <div class="table-scroll">
+            <table class="data-table holiday-table">
+              <thead><tr><th>Date</th><th>Subject</th><th>Type</th><th>Class</th><th>Faculty</th><th>Reason</th><th>Action</th></tr></thead>
+              <tbody id="cancelledSessionsBody"><tr><td colspan="7">Loading…</td></tr></tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -705,7 +772,6 @@
                 <option value="ALL">All divisions</option>
                 <option value="A">Division A only</option>
                 <option value="B">Division B only</option>
-                <option value="C">Division C only</option>
               </select>
               <select id="gridBatch" onchange="renderTimetableGrid()">
                 <option value="2024-25">2024 - 2025</option>
@@ -734,6 +800,7 @@
           <input type="hidden" id="ttEditId" value="">
           <div class="form-grid">
             <div class="field"><label>Semester</label><select id="ttSemester" onchange="onTimetableSemesterChange()">
+                <option value="" selected disabled>Select semester</option>
                 <option value="1">1</option>
                 <option value="2">2</option>
                 <option value="3">3</option>
@@ -741,7 +808,8 @@
                 <option value="5">5</option>
                 <option value="6">6</option>
               </select></div>
-            <div class="field"><label>Batch (Academic Year)</label><select id="ttBatch">
+            <div class="field"><label>Batch (Academic Year)</label><select id="ttBatch" onchange="onTimetableBatchChange()">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
@@ -750,11 +818,14 @@
               <div id="ttDivisionsContainer" class="checkbox-list">
                 <label class="checkbox-item"><input type="checkbox" value="A" checked> A</label>
                 <label class="checkbox-item"><input type="checkbox" value="B"> B</label>
-                <label class="checkbox-item"><input type="checkbox" value="C"> C</label>
               </div>
             </div>
             <div class="field"><label>Subject</label><select id="ttSubject" onchange="onTimetableSubjectChange()">
-                <option value="">— Select semester first —</option>
+                <option value="">— Select batch first —</option>
+              </select></div>
+            <div class="field"><label>Session type</label><select id="ttSessionType" onchange="onTimetableSessionTypeChange()">
+                <option value="Lecture">Lecture</option>
+                <option value="Lab">Lab</option>
               </select></div>
             <div class="field"><label>Faculty</label><select id="ttFaculty">
                 <option value="">— Select subject first —</option>
@@ -767,8 +838,11 @@
                 <option value="Fri">Friday</option>
                 <option value="Sat">Saturday</option>
               </select></div>
-            <div class="field field-full"><label>Period</label>
-              <select id="ttPeriod"></select>
+            <div class="field"><label>Start Time</label>
+              <input type="time" id="ttStartTime" step="60">
+            </div>
+            <div class="field"><label>End Time</label>
+              <input type="time" id="ttEndTime" step="60">
             </div>
             <div class="field"><label>Room no.</label><input type="text" id="ttRoom" placeholder="e.g. 204"></div>
           </div>
@@ -787,6 +861,7 @@
                 <option value="Remedial">Remedial</option>
               </select></div>
             <div class="field"><label>Semester</label><select id="examTtSemester" onchange="populateExamTtSubjects(this.value)">
+                <option value="" selected disabled>Select semester</option>
                 <option value="1">1</option>
                 <option value="2">2</option>
                 <option value="3">3</option>
@@ -798,46 +873,20 @@
                 <option value="">All divisions</option>
                 <option value="A">A</option>
                 <option value="B">B</option>
-                <option value="C">C</option>
               </select></div>
-            <div class="field"><label>Batch (Academic Year)</label><select id="examTtBatch">
+            <div class="field"><label>Batch (Academic Year)</label><select id="examTtBatch" onchange="populateExamTtSubjects(document.getElementById('examTtSemester').value)">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
               </select></div>
-            <div class="field"><label>Subject</label><select id="examTtSubject"></select></div>
+            <div class="field"><label>Subject</label><select id="examTtSubject"><option value="">— Select batch first —</option></select></div>
             <div class="field"><label>Exam date</label><input type="date" id="examTtDate"></div>
-            <div class="field"><label>Start time</label>
-              <div class="time-picker">
-                <select id="examTtStartHour">
-                  <option value="01">01</option><option value="02">02</option><option value="03">03</option>
-                  <option value="04">04</option><option value="05">05</option><option value="06">06</option>
-                  <option value="07">07</option><option value="08">08</option><option value="09" selected>09</option>
-                  <option value="10">10</option><option value="11">11</option><option value="12">12</option>
-                </select>
-                <select id="examTtStartMin">
-                  <option value="00">00</option><option value="15">15</option><option value="30">30</option><option value="45">45</option>
-                </select>
-                <select id="examTtStartPeriod">
-                  <option value="AM" selected>AM</option><option value="PM">PM</option>
-                </select>
-              </div>
+            <div class="field"><label>Start Time</label>
+              <input type="time" id="examTtStartTime" step="60">
             </div>
-            <div class="field"><label>End time</label>
-              <div class="time-picker">
-                <select id="examTtEndHour">
-                  <option value="01">01</option><option value="02">02</option><option value="03">03</option>
-                  <option value="04">04</option><option value="05">05</option><option value="06">06</option>
-                  <option value="07">07</option><option value="08">08</option><option value="09">09</option>
-                  <option value="10">10</option><option value="11" selected>11</option><option value="12">12</option>
-                </select>
-                <select id="examTtEndMin">
-                  <option value="00">00</option><option value="15">15</option><option value="30">30</option><option value="45">45</option>
-                </select>
-                <select id="examTtEndPeriod">
-                  <option value="AM" selected>AM</option><option value="PM">PM</option>
-                </select>
-              </div>
+            <div class="field"><label>End Time</label>
+              <input type="time" id="examTtEndTime" step="60">
             </div>
             <div class="field"><label>Room no.</label><input type="text" id="examTtRoom" placeholder="e.g. 204"></div>
           </div>
@@ -850,13 +899,42 @@
         <div class="card">
           <div class="card-head">
             <div class="card-title">All timetable slots (Regular)</div>
-            <div class="filter-row">
+            <div class="filter-row filter-row-wrap">
+              <select id="ttListFilterDay" onchange="renderTimetableList()">
+                <option value="">All days</option>
+                <option value="Mon">Monday</option>
+                <option value="Tue">Tuesday</option>
+                <option value="Wed">Wednesday</option>
+                <option value="Thu">Thursday</option>
+                <option value="Fri">Friday</option>
+                <option value="Sat">Saturday</option>
+              </select>
+              <select id="ttListFilterSem" onchange="renderTimetableList()">
+                <option value="">All sem</option>
+                <option value="1">Sem 1</option>
+                <option value="2">Sem 2</option>
+                <option value="3">Sem 3</option>
+                <option value="4">Sem 4</option>
+                <option value="5">Sem 5</option>
+                <option value="6">Sem 6</option>
+              </select>
+              <select id="ttListFilterDiv" onchange="renderTimetableList()">
+                <option value="">All div</option>
+                <option value="A">Division A</option>
+                <option value="B">Division B</option>
+              </select>
+              <select id="ttListFilterSession" onchange="renderTimetableList()">
+                <option value="">All session types</option>
+                <option value="Lecture">Lecture</option>
+                <option value="Lab">Lab</option>
+              </select>
               <select id="ttListFilterYear" onchange="renderTimetableList()">
                 <option value="">All batches</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
               </select>
+              <button class="btn-ghost" type="button" onclick="resetTimetableListFilters()">Reset</button>
             </div>
           </div>
           <div class="table-scroll">
@@ -868,12 +946,13 @@
                 <th>Day</th>
                 <th>Time</th>
                 <th>Subject</th>
+                <th>Session</th>
                 <th>Faculty</th>
                 <th>Room</th>
                 <th>Actions</th>
               </tr>
               <tbody id="timetableTableBody">
-                <tr><td colspan="9">Loading…</td></tr>
+                <tr><td colspan="10">Loading…</td></tr>
               </tbody>
             </table>
           </div>
@@ -882,6 +961,29 @@
         <div class="card">
           <div class="card-head" style="margin-bottom:16px;">
             <div class="card-title">All exam slots (Mid-Sem / Remedial)</div>
+            <div class="filter-row filter-row-wrap">
+              <select id="examListFilterSem" onchange="renderExamTimetableList()">
+                <option value="">All sem</option>
+                <option value="1">Sem 1</option>
+                <option value="2">Sem 2</option>
+                <option value="3">Sem 3</option>
+                <option value="4">Sem 4</option>
+                <option value="5">Sem 5</option>
+                <option value="6">Sem 6</option>
+              </select>
+              <select id="examListFilterDiv" onchange="renderExamTimetableList()">
+                <option value="">All div</option>
+                <option value="A">Division A</option>
+                <option value="B">Division B</option>
+              </select>
+              <select id="examListFilterBatch" onchange="renderExamTimetableList()">
+                <option value="">All batches</option>
+                <option value="2024-25">2024 - 2025</option>
+                <option value="2025-26">2025 - 2026</option>
+                <option value="2026-27">2026 - 2027</option>
+              </select>
+              <button class="btn-ghost" type="button" onclick="resetExamListFilters()">Reset</button>
+            </div>
           </div>
           <div class="table-scroll">
             <table>
@@ -912,6 +1014,7 @@
 
         <div class="class-selector">
           <div class="selector-field"><label>Semester</label><select id="attSemester" onchange="onAttendanceFilterChange()">
+                <option value="" selected disabled>Select semester</option>
               <option value="1">1</option>
               <option value="2">2</option>
               <option value="3">3</option>
@@ -920,11 +1023,17 @@
               <option value="6">6</option>
             </select></div>
           <div class="selector-field"><label>Batch (Academic Year)</label><select id="attBatch" onchange="onAttendanceFilterChange()">
+              <option value="" selected disabled>Select batch</option>
               <option value="2024-25">2024 - 2025</option>
               <option value="2025-26">2025 - 2026</option>
+              <option value="2026-27">2026 - 2027</option>
             </select></div>
           <div class="selector-field"><label>Subject</label><select id="attSubject" onchange="onAttendanceSubjectChange()">
               <option value="">— Select semester first —</option>
+            </select></div>
+          <div class="selector-field"><label>Session type</label><select id="attSessionType" onchange="loadAttendanceList()">
+              <option value="Lecture">Lecture</option>
+              <option value="Lab">Lab</option>
             </select></div>
           <div class="selector-field"><label>Date</label><input type="date" id="attDate" onchange="loadAttendanceList()"></div>
         </div>
@@ -934,7 +1043,6 @@
           <div id="attDivisionsContainer" class="checkbox-list">
             <label class="checkbox-item"><input type="checkbox" value="A" checked onchange="onAttendanceFilterChange()"> A</label>
             <label class="checkbox-item"><input type="checkbox" value="B" onchange="onAttendanceFilterChange()"> B</label>
-            <label class="checkbox-item"><input type="checkbox" value="C" onchange="onAttendanceFilterChange()"> C</label>
           </div>
         </div>
 
@@ -1024,6 +1132,7 @@
           <div class="form-grid">
             <div class="field"><label>Title</label><input type="text" id="noteTitle" placeholder="e.g. Unit 3 — Trees & Graphs"></div>
             <div class="field"><label>Semester</label><select id="noteSemester" onchange="populateNoteSubjects(this.value)">
+                <option value="" selected disabled>Select semester</option>
                 <option value="1">1</option>
                 <option value="2">2</option>
                 <option value="3">3</option>
@@ -1031,14 +1140,14 @@
                 <option value="5">5</option>
                 <option value="6">6</option>
               </select></div>
-            <div class="field"><label>Subject</label><select id="noteSubject"></select></div>
+            <div class="field"><label>Subject</label><select id="noteSubject"><option value="">— Select batch first —</option></select></div>
             <div class="field"><label>Division (optional)</label><select id="noteDivision">
                 <option value="">All divisions</option>
                 <option value="A">A</option>
                 <option value="B">B</option>
-                <option value="C">C</option>
               </select></div>
-            <div class="field"><label>Batch (Academic Year)</label><select id="noteBatch">
+            <div class="field"><label>Batch (Academic Year)</label><select id="noteBatch" onchange="populateNoteSubjects(document.getElementById('noteSemester').value)">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
@@ -1112,6 +1221,7 @@
           <div class="form-grid">
             <div class="field"><label>Title</label><input type="text" id="assignTitle" placeholder="e.g. OOP practical file"></div>
             <div class="field"><label>Semester</label><select id="assignSemester" onchange="populateAssignmentSubjects(this.value)">
+                <option value="" selected disabled>Select semester</option>
                 <option value="1">1</option>
                 <option value="2">2</option>
                 <option value="3">3</option>
@@ -1119,14 +1229,14 @@
                 <option value="5">5</option>
                 <option value="6">6</option>
               </select></div>
-            <div class="field"><label>Subject</label><select id="assignSubject"></select></div>
+            <div class="field"><label>Subject</label><select id="assignSubject"><option value="">— Select batch first —</option></select></div>
             <div class="field"><label>Division (optional)</label><select id="assignDivision">
                 <option value="">All divisions</option>
                 <option value="A">A</option>
                 <option value="B">B</option>
-                <option value="C">C</option>
               </select></div>
-            <div class="field"><label>Batch (Academic Year)</label><select id="assignBatch">
+            <div class="field"><label>Batch (Academic Year)</label><select id="assignBatch" onchange="populateAssignmentSubjects(document.getElementById('assignSemester').value)">
+                <option value="" selected disabled>Select batch</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
                 <option value="2026-27">2026 - 2027</option>
@@ -1161,7 +1271,6 @@
                 <option value="">All divisions</option>
                 <option value="A">Division A</option>
                 <option value="B">Division B</option>
-                <option value="C">Division C</option>
               </select>
               <select id="assignFilterYear" onchange="loadAssignments()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
                 <option value="">All batches</option>
@@ -1319,7 +1428,6 @@
                 <option value="">All divisions</option>
                 <option value="A">Division A</option>
                 <option value="B">Division B</option>
-                <option value="C">Division C</option>
               </select></div>
             <div class="field"><label>Batch (Academic Year)</label><select id="noticeBatch">
                 <option value="">All batches</option>
@@ -1361,7 +1469,6 @@
                 <option value="">All divisions</option>
                 <option value="A">Division A</option>
                 <option value="B">Division B</option>
-                <option value="C">Division C</option>
               </select>
               <select id="noticeFilterBatch" onchange="loadNotices()">
                 <option value="">All batches</option>
@@ -1371,8 +1478,11 @@
               </select>
             </div>
           </div>
-          <div id="noticesListBody">
-            <div class="notice-row"><span>Loading…</span></div>
+          <div class="notice-shell">
+            <div class="notice-feed-scroll" id="noticesListBody">
+              <div class="notice-row"><span>Loading…</span></div>
+            </div>
+            <button class="scroll-bottom-btn hidden" id="noticesScrollBtn" onclick="nfScrollToBottom('noticesListBody')" title="Go to latest notices">↓</button>
           </div>
         </div>
       </div>
@@ -1385,6 +1495,7 @@
 
         <div class="class-selector">
           <div class="selector-field"><label>Semester</label><select id="marksSemester" onchange="onMarksFilterChange()">
+                <option value="" selected disabled>Select semester</option>
               <option value="1">1</option>
               <option value="2">2</option>
               <option value="3">3</option>
@@ -1393,6 +1504,7 @@
               <option value="6">6</option>
             </select></div>
           <div class="selector-field"><label>Batch (Academic Year)</label><select id="marksBatch" onchange="onMarksFilterChange()">
+              <option value="" selected disabled>Select batch</option>
               <option value="2024-25">2024 - 2025</option>
               <option value="2025-26">2025 - 2026</option>
               <option value="2026-27">2026 - 2027</option>
@@ -1400,7 +1512,6 @@
           <div class="selector-field"><label>Division</label><select id="marksDivision" onchange="onMarksFilterChange()">
               <option value="A">Division A</option>
               <option value="B">Division B</option>
-              <option value="C">Division C</option>
             </select></div>
           <div class="selector-field"><label>Subject</label><select id="marksSubject" onchange="onMarksFilterChange()">
               <option value="">— Select semester first —</option>
@@ -1519,6 +1630,7 @@
             <div class="field"><label>Amount (₹)</label><input type="number" id="feeAmount" placeholder="e.g. 18500"></div>
             <div class="field"><label>Due date</label><input type="date" id="feeDueDate"></div>
             <div class="field"><label>Semester</label><select id="feeSemester" onchange="populateFeeStudents()">
+                <option value="" selected disabled>Select semester</option>
                 <option>1</option>
                 <option>2</option>
                 <option>3</option>
@@ -1530,8 +1642,7 @@
                 <option value="">All divisions</option>
                 <option>A</option>
                 <option>B</option>
-                <option>C</option>
-              </select></div>
+                              </select></div>
             <div class="field"><label>Batch (Academic Year)</label><select id="feeBatch" onchange="populateFeeStudents()">
                 <option value="">Any</option>
                 <option value="2024-25">2024 - 2025</option>
@@ -1578,7 +1689,6 @@
                 <option value="">All divisions</option>
                 <option value="A">Division A</option>
                 <option value="B">Division B</option>
-                <option value="C">Division C</option>
               </select>
               <select id="feeFilterYear" onchange="loadFees()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
                 <option value="">All batches</option>
@@ -1644,8 +1754,10 @@
             <div id="academicYearsList">
               <div class="notice-row" style="border-bottom:none;">Loading…</div>
             </div>
-            <button class="btn-ghost" style="margin-top:14px;" onclick="toggleForm('academicYearForm')">+ Add / edit academic year</button>
+            <button class="btn-ghost" style="margin-top:14px;" onclick="openAddAcademicYearForm()">+ Add academic year</button>
             <div class="form-card hidden" id="academicYearForm" style="margin-top:14px; box-shadow:none;">
+              <input type="hidden" id="academicYearEditId" value="">
+              <div class="card-title" id="academicYearFormTitle" style="font-size:14px; margin-bottom:10px;">Add academic year</div>
               <div class="field"><label>Academic year (e.g. 2027-28)</label><input type="text" id="newAcademicYear" placeholder="2027-28"></div>
               <div class="card-title" style="font-size:13px; margin:14px 0 8px;">Semester 1</div>
               <div class="form-grid">
@@ -1678,7 +1790,7 @@
                 <div class="field"><label>End date</label><input type="date" id="newSem6End"></div>
               </div>
               <div class="form-actions">
-                <button class="btn-ghost" onclick="toggleForm('academicYearForm')">Cancel</button>
+                <button class="btn-ghost" onclick="closeAcademicYearForm()">Cancel</button>
                 <button class="btn-save" onclick="addAcademicYear()">Save</button>
               </div>
             </div>
@@ -1704,6 +1816,23 @@
         </div>
       </div>
 
+      <!-- ===== AI CHAT (talk to the System Assistant) ===== -->
+      <div class="view" id="view-chat">
+        <div class="card-head" style="margin-bottom:16px;">
+          <div class="card-title" style="font-size:20px;">Ask StudentHub Assistant</div>
+        </div>
+        <div class="chat-shell">
+          <div class="chat-log" id="chatLog">
+            <div class="msg bot">Hi Admin 👋 I'm StudentHub Assistant. Ask me for a student or faculty lookup, a system summary, pending marks requests or reports.</div>
+          </div>
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" placeholder="Type your question…" onkeydown="if(event.key==='Enter') sendChat('chatInput','chatLog')">
+            <button class="chat-send" onclick="sendChat('chatInput','chatLog')" title="Send">➤</button>
+          </div>
+          <div class="chat-note">StudentHub AI can make mistakes. Please verify important information.</div>
+        </div>
+      </div>
+
       <!-- ===== AI CHATBOT ===== -->
       <div class="view" id="view-chatbot">
         <div class="card-head" style="margin-bottom:16px;">
@@ -1717,46 +1846,100 @@
         </div>
 
         <div id="chatbotFaq">
+          <div class="card form-card hidden" id="faqForm">
+            <div class="card-title" style="margin-bottom:16px;" id="faqFormTitle">Add FAQ</div>
+            <input type="hidden" id="faqEditId" value="">
+            <div class="form-grid">
+              <div class="field" style="grid-column:1/-1;"><label>Question</label><input type="text" id="faqQuestion" maxlength="255" placeholder="e.g. How do I apply for leave?"></div>
+              <div class="field" style="grid-column:1/-1;"><label>Answer</label><textarea id="faqAnswer" rows="4" placeholder="Answer the chatbot will give"></textarea></div>
+              <div class="field"><label>Category (optional)</label><input type="text" id="faqCategory" maxlength="50" placeholder="e.g. Attendance"></div>
+            </div>
+            <div class="form-actions">
+              <button class="btn-ghost" onclick="closeFaqForm()">Cancel</button>
+              <button class="btn-save" onclick="saveFaq()">Save FAQ</button>
+            </div>
+          </div>
+
           <div class="card">
             <div class="card-head">
-              <div class="card-title">Frequently asked questions</div><button class="btn-save">+ Add FAQ</button>
+              <div class="card-title">Frequently asked questions</div>
+              <div class="filter-row">
+                <input type="text" id="faqSearch" placeholder="Search FAQs…" oninput="renderFaqs()">
+                <button class="btn-save" onclick="openFaqForm()">+ Add FAQ</button>
+              </div>
             </div>
-            <div class="notice-row"><b>Q: How do I apply for leave?</b><span>Answer: Submit a leave request via the
-                Attendance section...</span></div>
-            <div class="notice-row" style="border-bottom:none;"><b>Q: When is the fee payment due?</b><span>Answer:
-                Check the Notices section for current deadlines.</span></div>
+            <table>
+              <tr>
+                <th>Question</th>
+                <th>Answer</th>
+                <th>Category</th>
+                <th>Actions</th>
+              </tr>
+              <tbody id="faqTableBody">
+                <tr><td colspan="4">Loading…</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
         <div id="chatbotKb" class="hidden">
+          <div class="card form-card hidden" id="kbForm">
+            <div class="card-title" style="margin-bottom:16px;" id="kbFormTitle">Add knowledge entry</div>
+            <input type="hidden" id="kbEditId" value="">
+            <div class="form-grid">
+              <div class="field" style="grid-column:1/-1;"><label>Title</label><input type="text" id="kbTitle" maxlength="150" placeholder="e.g. Examination rules"></div>
+              <div class="field" style="grid-column:1/-1;"><label>Content</label><textarea id="kbContent" rows="6" placeholder="Reference text the chatbot can use to answer. Do not put passwords or personal data here."></textarea></div>
+            </div>
+            <div class="form-actions">
+              <button class="btn-ghost" onclick="closeKbForm()">Cancel</button>
+              <button class="btn-save" onclick="saveKb()">Save entry</button>
+            </div>
+          </div>
+
           <div class="card">
             <div class="card-head">
-              <div class="card-title">Knowledge base documents</div><button class="btn-save">+ Add document</button>
+              <div class="card-title">Knowledge base</div>
+              <div class="filter-row">
+                <input type="text" id="kbSearch" placeholder="Search…" oninput="renderKb()">
+                <button class="btn-save" onclick="openKbForm()">+ Add entry</button>
+              </div>
             </div>
-            <div class="notice-row"><b>📘 College handbook.pdf</b><span>Uploaded 2 weeks ago</span></div>
-            <div class="notice-row" style="border-bottom:none;"><b>📘 Examination rules.pdf</b><span>Uploaded 1 month
-                ago</span></div>
+            <table>
+              <tr>
+                <th>Title</th>
+                <th>Content</th>
+                <th>Added</th>
+                <th>Actions</th>
+              </tr>
+              <tbody id="kbTableBody">
+                <tr><td colspan="4">Loading…</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
         <div id="chatbotHistory" class="hidden">
           <div class="card">
+            <div class="card-head">
+              <div class="card-title">Chat history</div>
+              <div class="filter-row">
+                <input type="text" id="historySearch" placeholder="Search chats…" oninput="debounceChatHistory()">
+                <button class="btn-ghost" onclick="loadChatHistory()">Refresh</button>
+                <button class="btn-ghost" onclick="clearChatHistory()">Clear all</button>
+              </div>
+            </div>
             <table>
               <tr>
-                <th>Student</th>
+                <th>User</th>
+                <th>Role</th>
                 <th>Query</th>
+                <th>Reply</th>
                 <th>Date</th>
+                <th></th>
               </tr>
-              <tr>
-                <td>Sujal Kumar</td>
-                <td>"What is today's timetable?"</td>
-                <td>Today, 10:12 AM</td>
-              </tr>
-              <tr>
-                <td>Diya Patel</td>
-                <td>"How do I apply for leave?"</td>
-                <td>Yesterday</td>
-              </tr>
+              <tbody id="chatHistoryBody">
+                <tr><td colspan="6">Loading…</td></tr>
+              </tbody>
             </table>
           </div>
         </div>
@@ -1800,12 +1983,12 @@
           <div class="form-grid">
             <div class="field"><label>Batch (Academic Year)</label><select id="repStudentBatch" onchange="onReportBatchOrSemChange('Student')"></select></div>
             <div class="field"><label>Semester</label><select id="repStudentSem" onchange="onReportBatchOrSemChange('Student')">
-                <option value="">Select</option>
+                <option value="">Select semester</option>
                 <option value="1">Sem 1</option><option value="2">Sem 2</option><option value="3">Sem 3</option>
                 <option value="4">Sem 4</option><option value="5">Sem 5</option><option value="6">Sem 6</option>
               </select></div>
             <div class="field"><label>Division</label><select id="repStudentDiv">
-                <option value="">All</option><option value="A">A</option><option value="B">B</option><option value="C">C</option>
+                <option value="">All</option><option value="A">A</option><option value="B">B</option>
               </select></div>
             <div class="field"><label>Subject (required)</label><select id="repStudentSubject"><option value="">Select semester first</option></select></div>
           </div>
@@ -1820,12 +2003,12 @@
           <div class="form-grid">
             <div class="field"><label>Batch (Academic Year)</label><select id="repAttendanceBatch" onchange="onReportBatchOrSemChange('Attendance')"></select></div>
             <div class="field"><label>Semester</label><select id="repAttendanceSem" onchange="onReportBatchOrSemChange('Attendance')">
-                <option value="">Select</option>
+                <option value="">Select semester</option>
                 <option value="1">Sem 1</option><option value="2">Sem 2</option><option value="3">Sem 3</option>
                 <option value="4">Sem 4</option><option value="5">Sem 5</option><option value="6">Sem 6</option>
               </select></div>
             <div class="field"><label>Division</label><select id="repAttendanceDiv">
-                <option value="">All</option><option value="A">A</option><option value="B">B</option><option value="C">C</option>
+                <option value="">All</option><option value="A">A</option><option value="B">B</option>
               </select></div>
             <div class="field"><label>Subject</label><select id="repAttendanceSubject"><option value="">All subjects (overall %)</option></select></div>
           </div>
@@ -1840,12 +2023,12 @@
           <div class="form-grid">
             <div class="field"><label>Batch (Academic Year)</label><select id="repAssignmentBatch" onchange="onReportBatchOrSemChange('Assignment')"></select></div>
             <div class="field"><label>Semester</label><select id="repAssignmentSem" onchange="onReportBatchOrSemChange('Assignment')">
-                <option value="">Select</option>
+                <option value="">Select semester</option>
                 <option value="1">Sem 1</option><option value="2">Sem 2</option><option value="3">Sem 3</option>
                 <option value="4">Sem 4</option><option value="5">Sem 5</option><option value="6">Sem 6</option>
               </select></div>
             <div class="field"><label>Division</label><select id="repAssignmentDiv">
-                <option value="">All</option><option value="A">A</option><option value="B">B</option><option value="C">C</option>
+                <option value="">All</option><option value="A">A</option><option value="B">B</option>
               </select></div>
             <div class="field"><label>Subject</label><select id="repAssignmentSubject"><option value="">All subjects</option></select></div>
           </div>
@@ -1991,6 +2174,23 @@
     </div>
   </div>
 
+  <!-- FLOATING AI CHAT -->
+  <button class="fab" id="fabBtn" onclick="togglePopup()">🤖</button>
+  <div class="popup hidden" id="popup">
+    <div class="popup-head">
+      <div><b>StudentHub Assistant</b><span>Usually replies instantly</span></div>
+      <button class="popup-close" onclick="togglePopup()">✕</button>
+    </div>
+    <div class="popup-log" id="popupLog">
+      <div class="msg bot">Hi Admin 👋 Ask me for a student lookup, system summary or pending marks requests.</div>
+    </div>
+    <div class="popup-input-row">
+      <input type="text" id="popupInput" placeholder="Type a message…" onkeydown="if(event.key==='Enter') sendChat('popupInput','popupLog')">
+      <button class="popup-send" onclick="sendChat('popupInput','popupLog')">➤</button>
+    </div>
+  </div>
+
+  <script src="../shared/force_password.js"></script>
   <script src="admin.js"></script>
 </body>
 

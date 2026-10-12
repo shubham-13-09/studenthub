@@ -28,6 +28,9 @@ async function handleRegister(e){
   const email = document.getElementById('rg_email').value.trim();
   if(!/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(email)){ setErr('wrap_email','err_email',true); valid=false; } else { setErr('wrap_email','err_email',false); }
 
+  const whatsapp = document.getElementById('rg_whatsapp').value.trim();
+  if(whatsapp && !/^\d{10,15}$/.test(whatsapp)){ setErr('wrap_whatsapp','err_whatsapp',true); valid=false; } else { setErr('wrap_whatsapp','err_whatsapp',false); }
+
   const genderEl = document.querySelector('input[name="gender"]:checked');
   document.getElementById('err_gender').classList.toggle('hidden', !!genderEl);
   if(!genderEl) valid = false;
@@ -81,6 +84,7 @@ async function handleRegister(e){
     enrollment: enroll,
     email: email,
     mobile: mobile,
+    whatsapp_number: whatsapp,
     gender: genderEl.value,
     department: dept,
     semester: sem,
@@ -114,7 +118,7 @@ async function handleRegister(e){
       alert(data.message || 'Registration failed. Please try again.');
     }
   } catch(err){
-    alert('Server se connect nahi ho paya. Backend chal raha hai check karo.');
+    alert('Unable to connect to the server. Please check that the backend is running.');
   } finally {
     submitBtn.disabled = false;
     submitBtn.innerHTML = 'Register <span>→</span>';
@@ -122,3 +126,32 @@ async function handleRegister(e){
 
   return false;
 }
+
+
+// ---- Academic year dropdown: Academic Management ke active batches se bharo ----
+// (register.html me hardcoded options sirf fallback hain, agar server na mile)
+async function loadRegisterYears(){
+  const sel = document.getElementById('rg_year');
+  if(!sel) return;
+  try{
+    const res = await fetch('http://localhost:5000/api/academic-years');
+    if(!res.ok) return;
+    const labels = await res.json();
+    if(!Array.isArray(labels) || labels.length === 0) return;
+    const placeholder = sel.options[0];   // "Select year"
+    sel.innerHTML = '';
+    sel.appendChild(placeholder);
+    labels.forEach(label => {
+      const parts = String(label).split('-');
+      const text = parts.length === 2 ? `${parts[0]} - ${parts[0].slice(0, 2)}${parts[1]}` : label;
+      const opt = document.createElement('option');
+      opt.value = label;
+      opt.textContent = text;
+      sel.appendChild(opt);
+    });
+    placeholder.selected = true;
+  }catch(err){
+    // server off hai to hardcoded fallback options hi rahenge
+  }
+}
+document.addEventListener('DOMContentLoaded', loadRegisterYears);

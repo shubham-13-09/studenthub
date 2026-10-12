@@ -1,4 +1,25 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
+
+# User uploads and DB backups (generated at runtime)
+Backend/uploads/
+Backend/backups/
+
+# Student personal data / import dumps - never push these
+Backend/*students*.csv
+Backend/import_*.sql
+Backend/import_*.py
+
+# Logs / editor / OS
+*.log
+.vscode/
+.DS_Store
+Thumbs.db

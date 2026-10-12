@@ -8,7 +8,7 @@
 </head>
 <body>
 
-  <!-- MOBILE / TABLET HERO — sirf chhoti screens pe dikhta hai (desktop split-panel se replace hota hai) -->
+  <!-- MOBILE / TABLET HERO — shown only on small screens (replaces the desktop split panel) -->
   <div class="mobile-hero">
     <div class="mobile-hero-mark"><img src="studenthub.png" alt="StudentHub"></div>
     <div class="mobile-hero-name">StudentHub</div>
@@ -93,6 +93,15 @@
         </div>
 
         <div class="field">
+          <label>WhatsApp number <span style="font-weight:normal;color:#888;">(optional)</span></label>
+          <div class="input-wrap" id="wrap_whatsapp">
+            <span class="icon">💬</span>
+            <input type="text" maxlength="15" placeholder="e.g. 91XXXXXXXXXX" id="rg_whatsapp">
+          </div>
+          <div class="hint error hidden" id="err_whatsapp">Must be 10-15 digits (with country code if needed).</div>
+        </div>
+
+        <div class="field">
           <label>Gender</label>
           <div class="radio-row" id="wrap_gender">
             <label class="radio-opt"><input type="radio" name="gender" value="male"> Male</label>
@@ -144,7 +153,6 @@
                 <option value="" selected disabled>Select division</option>
                 <option value="A">Division A</option>
                 <option value="B">Division B</option>
-                <option value="C">Division C</option>
               </select>
               <span class="select-arrow">▾</span>
             </div>

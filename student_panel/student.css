@@ -49,6 +49,7 @@ body {
   color: var(--ink);
   display: flex;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   transition: background .2s ease, color .2s ease;
 }
@@ -65,6 +66,7 @@ body {
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh;
   transition: transform .25s ease;
   z-index: 40;
 }
@@ -77,8 +79,9 @@ body {
   z-index: 30;
 }
 
-.menu-btn {
-  display: none;
+/* ☰ button: faculty / admin panel jaisa — desktop par bhi header me dikhta hai (search beech me aata hai) */
+.icon-btn.menu-btn {
+  display: flex;
 }
 
 .brand-card {
@@ -130,6 +133,9 @@ body {
   flex-direction: column;
   gap: 3px;
   margin-top: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .nav-item {
@@ -183,7 +189,7 @@ body {
 
 
 .sidebar-foot {
-  margin-top: auto;
+  flex-shrink: 0;
   border-top: 1px solid rgba(255, 255, 255, 0.09);
   padding-top: 16px;
 }
@@ -248,6 +254,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow-y: auto;
 }
 
@@ -588,6 +595,8 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   margin-bottom: 16px;
 }
 
@@ -741,7 +750,7 @@ body {
 /* Notice grid cards (below timetable) */
 .notice-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 14px;
 }
 
@@ -1293,9 +1302,11 @@ button:disabled:hover {
 
 /* AI chat view */
 .chat-shell {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: calc(100vh - 200px);
+  height: calc(100dvh - 200px);
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -1364,6 +1375,133 @@ button:disabled:hover {
   padding: 0 20px;
   font-weight: 700;
   cursor: pointer;
+}
+
+/* WhatsApp-style "scroll to newest message" jump button — jab user purane messages
+   dekhne ke liye upar scroll kare to yeh chat-log/popup-log ke corner me float hoke
+   dikhta hai; naye (unread) messages ka count badge ke roop me dikhta hai */
+.scroll-bottom-btn {
+  position: absolute;
+  right: 18px;
+  bottom: 78px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--teal-700);
+  border: 1.5px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(15, 58, 48, 0.22);
+  z-index: 6;
+  transition: transform .15s ease, background .15s ease;
+}
+
+.scroll-bottom-btn:hover {
+  background: var(--mint-100);
+  transform: translateY(-2px);
+}
+
+.scroll-bottom-btn.hidden {
+  display: none;
+}
+
+.scroll-bottom-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.scroll-bottom-badge.hidden {
+  display: none;
+}
+
+.popup .scroll-bottom-btn {
+  bottom: 66px;
+  right: 14px;
+  width: 34px;
+  height: 34px;
+  font-size: 13px;
+}
+
+/* Notices feed — chat jaisa hi (WhatsApp-style): purani notices upar, nayi neeche.
+   Sirf feed (.notice-feed-scroll) scroll hota hai, poora card nahi — isliye shell ki
+   height fixed hai (chat-shell jaisi) aur andar wala feed overflow-y: auto hai.
+   Neeche-wala ↓ arrow latest notice tak le jaata hai */
+.notice-shell {
+  position: relative;
+  height: calc(100vh - 200px);
+  height: calc(100dvh - 200px);
+  min-height: 320px;
+  margin-bottom: 20px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.notice-feed-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 22px;
+  scrollbar-width: thin;                          /* Firefox */
+  scrollbar-color: var(--teal-500) transparent;
+}
+
+/* Slim, rounded scrollbar (Chrome/Edge/Safari) — theme vars use karta hai,
+   isliye dark mode me apne aap sahi dikhta hai */
+.notice-feed-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.notice-feed-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 10px 0;                                 /* card ke rounded corners se door */
+}
+
+.notice-feed-scroll::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 40px;
+}
+
+.notice-feed-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--teal-500);
+  background-clip: padding-box;
+}
+
+.notice-feed-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--teal-700);
+  background-clip: padding-box;
+}
+
+.notice-shell .scroll-bottom-btn {
+  bottom: 18px;
+  right: 18px;
+}
+
+@media (max-width: 860px) {
+  .notice-feed-scroll {
+    padding: 14px;
+  }
 }
 
 /* Floating chat popup */
@@ -1523,7 +1661,7 @@ button:disabled:hover {
     display: block;
   }
 
-  .menu-btn {
+  .icon-btn.menu-btn {
     display: flex;
   }
 
@@ -1981,6 +2119,26 @@ button:disabled:hover {
 .nf-card.nf-cat-event { border-left-color: var(--amber); }
 .nf-card.nf-cat-urgent { border-left-color: var(--danger); }
 
+/* Notice bhejne wale ka naam — card ke sabse upar, WhatsApp group sender jaisa */
+.nf-sender {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--teal-700);
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+body.dark .nf-sender {
+  color: #5fd3aa;   /* dark card par teal-700 kam dikhta hai */
+}
+
+.nf-sender small {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-left: 4px;
+}
+
 .nf-top {
   display: flex;
   align-items: center;
@@ -2085,4 +2243,417 @@ button:disabled:hover {
 
 @media (prefers-reduced-motion: reduce) {
   .nf-card { animation: none; }
+}
+
+/* ============================================================
+   RESPONSIVE FIXES — mobile / tablet / laptop
+   (kept last so these win over earlier base rules)
+   ============================================================ */
+
+/* Weekly timetable: scroll sideways instead of clipping/squeezing 7 columns */
+.tt-desktop.table-scroll { overflow-x: auto; overflow-y: hidden; }
+.tt-week { min-width: 720px; }
+
+/* Very wide monitors: keep content readable */
+@media (min-width: 1600px) {
+  .content { width: 100%; max-width: 1500px; margin: 0 auto; }
+}
+
+/* Tablet (sidebar still visible): tables scroll instead of crushing columns */
+@media (max-width: 1100px) {
+  .card { overflow-x: auto; }
+  table { min-width: 520px; }
+}
+
+/* Mobile + small tablet */
+@media (max-width: 860px) {
+  /* Search results: fit the screen instead of a fixed 340px box that ran off the right edge */
+  .topbar-search-results {
+    position: fixed;
+    top: 66px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    max-height: 60vh;
+  }
+
+  /* Wider chat bubbles on narrow screens */
+  .msg { max-width: 88%; }
+
+  /* Popup height follows the visible viewport (URL bar aware) */
+  .popup { height: 60vh; height: 60dvh; }
+
+  /* 16px inputs stop iOS Safari from zooming in when a field is focused */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  select,
+  textarea { font-size: 16px !important; }
+}
+
+/* Small phones */
+@media (max-width: 480px) {
+  .tt-seg { display: flex; width: 100%; }
+  .tt-seg button { flex: 1; padding: 8px 6px; font-size: 12px; }
+
+  .ex-card { flex-wrap: wrap; }
+  .ex-info { flex-basis: calc(100% - 62px); }
+  .ex-count { margin-left: 62px; }
+
+  .toggle-row { gap: 12px; }
+}
+
+/* Landscape phones: chat popup must not be taller than the screen */
+@media (max-height: 560px) {
+  .popup { height: calc(100dvh - 110px); max-height: 440px; }
+}
+
+/* Touch devices: no "stuck" hover lift after a tap */
+@media (hover: none) {
+  button:hover,
+  .icon-btn:hover,
+  .banner-btn:hover,
+  .askai-send:hover,
+  .stat-card:hover,
+  .quick-item:hover,
+  .fac-msg:hover {
+    transform: none;
+    box-shadow: none;
+  }
+}
+
+/* AI chat "typing…" loading dots */
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 1em;
+  padding: 2px 0;
+}
+
+.typing-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .3;
+  animation: typingDotBounce 1.1s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) { animation-delay: .18s; }
+.typing-dots i:nth-child(3) { animation-delay: .36s; }
+
+@keyframes typingDotBounce {
+  0%, 60%, 100% { opacity: .3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
+}
+/* Lecture / Lab badge (weekly grid + day list + home) */
+.tt-type {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-style: normal;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  vertical-align: middle;
+  background: var(--mint-100, #e6f6f1);
+  color: var(--teal-700, #0f766e);
+}
+.tt-type.is-lab {
+  background: var(--amber-bg, #fff4dc);
+  color: var(--amber, #b45309);
+}
+.tt-cell .tt-type {
+  display: inline-block;
+  margin: 3px 0 0;
+}
+
+/* ============================================================
+   Weekly timetable grid — admin panel jaisa (compact, spreadsheet-style)
+   ============================================================ */
+/* ---- Weekly timetable grid: compact, spreadsheet-style layout ---- */
+.tt-grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--paper);
+}
+
+.tt-grid-table th,
+.tt-grid-table td {
+  border: 1px solid var(--line);
+  text-align: center;
+  vertical-align: middle;
+  padding: 7px 5px;
+  line-height: 1.15;
+}
+
+.tt-grid-table th {
+  background: var(--mint-100);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--muted);
+  height: 34px;
+}
+
+.tt-div-subhead {
+  background: var(--paper) !important;
+  font-size: 10.5px !important;
+  font-weight: 700 !important;
+  height: 24px !important;
+}
+
+.tt-time-col {
+  width: 132px;
+  font-weight: 700;
+  font-size: 11px;
+  white-space: nowrap;
+  background: var(--paper);
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+
+.tt-cell {
+  background: var(--paper);
+  min-height: 54px;
+}
+
+.tt-cell-combined {
+  background: var(--mint-100);
+}
+
+.tt-subject {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 2px;
+}
+
+.tt-session {
+  font-size: 9.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: var(--teal-700);
+  margin-bottom: 2px;
+}
+
+.tt-meta {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tt-cell-empty {
+  color: var(--line);
+  font-size: 11px;
+  background: var(--paper);
+}
+
+.tt-empty-msg {
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.tt-break-cell {
+  background: var(--amber-bg);
+  color: var(--amber);
+  font-weight: 700;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  height: 30px;
+}
+
+/* Lecture/Lab label: admin jaisa plain text (pill/amber nahi) */
+.tt-grid-table .tt-session,
+.tt-grid-table .tt-session.is-lab,
+.tt-grid-table .tt-session.is-lecture {
+  display: block;
+  margin: 0 0 2px;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  color: var(--teal-700);
+}
+/* Mid-Sem / Remedial list-table: admin jaisa compact text */
+.tt-grid-table td { font-size: 12px; }
+
+/* Student-only: admin ke grid ke upar "aaj" ka din header me halka highlight */
+.tt-grid-table th.tt-today { background: var(--mint-200); color: var(--teal-700); }
+/* Student cells admin ke .tt-cell jaise hi dikhte hain (student me .tt-cell chip style alag kaam ke liye hai, isliye .tt-gcell) */
+.tt-grid-table .tt-gcell { background: var(--paper); min-height: 54px; }
+.tt-grid-table .tt-gcell .tt-subject ~ .tt-subject { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+/* Phone/tablet par admin jaisa side-scroll */
+.tt-grid-table { min-width: 720px; }
+
+/* Cancelled / holiday lectures (this week) */
+.tt-off { text-decoration: line-through; opacity: .65; }
+.tt-status-pill {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  font-style: normal;
+}
+.tt-status-pill.is-cancelled { background: #fdecea; color: #b3261e; }
+.tt-status-pill.is-holiday { background: #e8f5e9; color: #1b6e3c; }
+
+/* ============================================================
+   AI CHAT PAGE — ChatGPT-style layout (StudentHub colours)
+   Sirf #view-chat par lagta hai, floating popup chatbot par asar nahi.
+   ============================================================ */
+#view-chat > .card-head { display: none; }
+
+#view-chat .chat-shell {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  height: calc(100vh - 150px);
+  height: calc(100dvh - 150px);
+  min-height: 420px;
+  margin: 0;
+  padding: 0 0 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+#view-chat .chat-log {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  padding: 24px max(22px, calc((100% - 820px) / 2)) 24px;
+  background: transparent;
+  border: none;
+  scroll-behavior: smooth;
+}
+
+/* Bot reply: bubble nahi, seedha text + round avatar (ChatGPT jaisa) */
+#view-chat .msg {
+  max-width: 100%;
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--ink);
+  word-wrap: break-word;
+}
+
+#view-chat .msg.bot {
+  position: relative;
+  align-self: stretch;
+  padding: 6px 0 0 54px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+#view-chat .msg.bot::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: url("chat-logo.png") center / cover no-repeat;
+  box-shadow: 0 0 0 2px var(--paper), 0 0 0 3px var(--line);
+}
+
+/* User message: right side me rounded bubble */
+#view-chat .msg.user {
+  align-self: flex-end;
+  max-width: 75%;
+  padding: 10px 18px;
+  background: var(--mint-200);
+  color: var(--ink);
+  border: none;
+  border-radius: 22px;
+  border-bottom-right-radius: 8px;
+}
+
+/* Input: neeche floating pill composer */
+#view-chat .chat-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 44px);
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 8px 8px 8px 22px;
+  background: var(--paper);
+  border: 1.5px solid var(--line);
+  border-radius: 30px;
+  box-shadow: 0 6px 22px rgba(15, 107, 82, .10);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+#view-chat .chat-input-row:focus-within {
+  border-color: var(--teal-500);
+  box-shadow: 0 6px 24px rgba(24, 144, 110, .18);
+}
+
+#view-chat .chat-input-row input {
+  flex: 1;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 15px;
+  padding: 10px 0;
+}
+
+#view-chat .chat-input-row input:focus {
+  border: none;
+  box-shadow: none;
+}
+
+#view-chat .chat-send {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--teal-700);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s ease, transform .1s ease;
+}
+
+#view-chat .chat-send:hover { background: var(--teal-600); }
+#view-chat .chat-send:active { transform: scale(.94); }
+
+#view-chat .chat-note {
+  margin-top: 10px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+@media (max-width: 640px) {
+  #view-chat .chat-shell { height: calc(100vh - 130px); }
+  #view-chat .msg.user { max-width: 88%; }
 }

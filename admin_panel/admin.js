@@ -1,11 +1,18 @@
-if(!localStorage.getItem('token_admin')){
+if(!sessionStorage.getItem('token_admin')){
   window.location.href = '../login_panel/login.html';
 }
+
+// Global HTML escaper to protect all DOM injections against Stored/Reflected XSS
+function escapeHtml(str){
+  return String(str ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+window.escapeHtml = escapeHtml;
+window.escapeHtmlMR = escapeHtml;
 
 // ---- API helpers ----
 const API_BASE = 'http://localhost:5000/api';
 
-// Department short-code -> full name (yaha naya department add karo to wahi list me bhi add karna)
+// Department short-code -> full name (if you add a new department here, add it to this list as well)
 const DEPT_NAMES = {
   'computer engineering': 'Computer Engineering'
 };
@@ -29,7 +36,7 @@ function yearOfStudy(semester){
 function authHeaders(){
   return {
     'Content-Type': 'application/json',
-    'Authorization': 'Bearer ' + localStorage.getItem('token_admin')
+    'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin')
   };
 }
 
@@ -37,30 +44,30 @@ async function apiRequest(path, options = {}){
   const res = await fetch(API_BASE + path, { ...options, headers: authHeaders() });
   const data = await res.json().catch(() => ({}));
   if(res.status === 401 || res.status === 403){
-    // token invalid/expired ya admin nahi hai — wapas login bhej do
-    localStorage.removeItem('token_admin');
+    // token invalid/expired or not an admin — send back to login
+    sessionStorage.removeItem('token_admin');
     window.location.href = '../login_panel/login.html';
     throw new Error(data.message || 'Unauthorized');
   }
   if(!res.ok){
     const err = new Error(data.message || 'Request failed');
-    err.detail = data.error;   // backend ka detailed error (jaise mysqldump ka stderr) yahan carry hota hai
+    err.detail = data.error;   // the backend's detailed error (like mysqldump's stderr) is carried here
     throw err;
   }
   return data;
 }
 
-// File upload ke liye — yahan Content-Type header manually set NAHI karte,
-// browser khud multipart boundary ke saath set karta hai (FormData body)
+// For file uploads — we do NOT set the Content-Type header manually here,
+// the browser sets it itself with the multipart boundary (FormData body)
 async function apiUpload(path, formData){
   const res = await fetch(API_BASE + path, {
     method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_admin') },
+    headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin') },
     body: formData
   });
   const data = await res.json().catch(() => ({}));
   if(res.status === 401 || res.status === 403){
-    localStorage.removeItem('token_admin');
+    sessionStorage.removeItem('token_admin');
     window.location.href = '../login_panel/login.html';
     throw new Error(data.message || 'Unauthorized');
   }
@@ -86,6 +93,9 @@ function resetStudentForm(){
   document.getElementById('studentEnrollment').disabled = false;
   document.getElementById('studentEmail').value = '';
   document.getElementById('studentMobile').value = '';
+  document.getElementById('studentWhatsapp').value = '';
+  document.getElementById('studentDiv').value = '';       // it will stay on the "Select division" placeholder
+  document.getElementById('studentBatch').value = '';     // it will stay on the "Select batch" placeholder
   document.getElementById('studentStatus').value = 'active';
   document.getElementById('studentFatherName').value = '';
   document.getElementById('studentFatherMobile').value = '';
@@ -102,37 +112,53 @@ async function loadStudents(){
   const dept = document.getElementById('studentFilterDept').value;
   const sem = document.getElementById('studentFilterSem').value;
   const year = document.getElementById('studentFilterYear').value;
+  const statusFilter = document.getElementById('studentFilterStatus').value;
   const params = new URLSearchParams();
   if(dept) params.set('department', dept);
   if(sem) params.set('semester', sem);
   if(year) params.set('academic_year', year);
 
   try{
-    const students = await apiRequest('/admin/students?' + params.toString());
+    let students = await apiRequest('/admin/students?' + params.toString());
+    if(statusFilter) students = students.filter(s => s.status === statusFilter);
     if(!students.length){
       tbody.innerHTML = '<tr><td colspan="9">No students found.</td></tr>';
       return;
     }
+    window._studentsCache = new Map(students.map(s => [String(s.id), s]));
     tbody.innerHTML = students.map(s => `
-      <tr style="cursor:pointer" onclick='showStudentDetails(${JSON.stringify(s)})'>
-        <td>${s.enrollment}</td>
-        <td>${s.name}</td>
-        <td>${s.semester || '-'}</td>
-        <td>${s.division || '-'}</td>
-        <td>${s.academic_year || '-'}</td>
-        <td>${deptName(s.department)}</td>
-        <td>${yearOfStudy(s.semester)}</td>
+      <tr style="cursor:pointer" onclick="handleStudentRowClick(event, '${s.id}')">
+        <td>${escapeHtml(s.enrollment)}</td>
+        <td>${escapeHtml(s.name)}</td>
+        <td>${escapeHtml(s.semester || '-')}</td>
+        <td>${escapeHtml(s.division || '-')}</td>
+        <td>${escapeHtml(s.academic_year || '-')}</td>
+        <td>${escapeHtml(deptName(s.department))}</td>
+        <td>${escapeHtml(yearOfStudy(s.semester))}</td>
         <td><span class="pill ${s.status === 'active' ? 'good' : 'warn'}" style="cursor:pointer"
-              onclick="event.stopPropagation(); toggleStudentStatus(${s.id}, '${s.status}')">${s.status === 'active' ? 'Active' : 'Inactive'}</span></td>
+              onclick="event.stopPropagation(); toggleStudentStatus(${s.id}, '${escapeHtml(s.status)}')">${s.status === 'active' ? 'Active' : 'Inactive'}</span></td>
         <td class="row-actions">
-          <button class="icon-action" onclick='event.stopPropagation(); editStudent(${JSON.stringify(s)})'>✎</button>
-          <button class="icon-action danger" onclick="event.stopPropagation(); deleteStudent(${s.id}, '${s.name}')">🗑</button>
+          <button class="icon-action" onclick="event.stopPropagation(); editStudentById('${s.id}')">✎</button>
+          <button class="icon-action danger" onclick="event.stopPropagation(); deleteStudentById('${s.id}')">🗑</button>
         </td>
       </tr>
     `).join('');
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="9">Failed to load students: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9">Failed to load students: ${escapeHtml(err.message)}</td></tr>`;
   }
+}
+
+function handleStudentRowClick(e, id){
+  const s = window._studentsCache ? window._studentsCache.get(String(id)) : null;
+  if(s) showStudentDetails(s);
+}
+function editStudentById(id){
+  const s = window._studentsCache ? window._studentsCache.get(String(id)) : null;
+  if(s) editStudent(s);
+}
+function deleteStudentById(id){
+  const s = window._studentsCache ? window._studentsCache.get(String(id)) : null;
+  if(s) deleteStudent(s.id, s.name);
 }
 
 async function saveStudent(){
@@ -142,6 +168,7 @@ async function saveStudent(){
     enrollment: document.getElementById('studentEnrollment').value.trim(),
     email: document.getElementById('studentEmail').value.trim(),
     mobile: document.getElementById('studentMobile').value.trim(),
+    whatsapp_number: document.getElementById('studentWhatsapp').value.trim(),
     department: document.getElementById('studentDept').value,
     semester: document.getElementById('studentSem').value,
     division: document.getElementById('studentDiv').value,
@@ -159,8 +186,12 @@ async function saveStudent(){
     alert('Full name and enrollment number are required');
     return;
   }
-  if(!payload.father_name || !payload.father_mobile){
-    alert("Father's name and mobile number are required");
+  if(payload.father_mobile && !/^\d{10}$/.test(payload.father_mobile)){
+    alert("Father's mobile number must be 10 digits");
+    return;
+  }
+  if(payload.whatsapp_number && !/^\d{10,15}$/.test(payload.whatsapp_number)){
+    alert('WhatsApp number must be 10-15 digits (with country code if needed)');
     return;
   }
 
@@ -184,12 +215,13 @@ function editStudent(student){
   document.getElementById('studentEditId').value = student.id;
   document.getElementById('studentName').value = student.name;
   document.getElementById('studentEnrollment').value = student.enrollment;
-  document.getElementById('studentEnrollment').disabled = true;   // enrollment login_id hai, edit nahi hota
+  document.getElementById('studentEnrollment').disabled = true;   // enrollment is the login_id, it can't be edited
   document.getElementById('studentEmail').value = student.email || '';
   document.getElementById('studentMobile').value = student.mobile || '';
-  // Abhi sirf ek hi department (Computer Engineering) supported hai, isliye
-  // hamesha usi ko select karo — agar naye departments future me add karo
-  // to yahan proper matching logic wapas lagana.
+  document.getElementById('studentWhatsapp').value = student.whatsapp_number || '';
+  // Only one department (Computer Engineering) is supported for now, so
+  // always select that one — if new departments are added in the future,
+  // put the proper matching logic back here.
   document.getElementById('studentDept').value = 'Computer Engineering';
   document.getElementById('studentSem').value = student.semester || '1';
   document.getElementById('studentDiv').value = student.division || 'A';
@@ -201,7 +233,14 @@ function editStudent(student){
   document.getElementById('studentMotherMobile').value = student.mother_mobile || '';
   document.getElementById('studentParentEmail').value = student.parent_email || '';
   document.getElementById('studentParentAddress').value = student.parent_address || '';
-  document.getElementById('studentForm').classList.remove('hidden');
+  const studentFormEl = document.getElementById('studentForm');
+  studentFormEl.classList.remove('hidden');
+  // Edit form is at the top of the page: scroll up to it automatically
+  requestAnimationFrame(() => {
+    studentFormEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const nameInput = document.getElementById('studentName');
+    if(nameInput) nameInput.focus({ preventScroll: true });
+  });
 }
 
 // ---- Student Details modal (parent details view) ----
@@ -211,6 +250,7 @@ function showStudentDetails(student){
   document.getElementById('studentDetailStatus').textContent = student.status === 'active' ? 'Active' : 'Inactive';
   document.getElementById('studentDetailEmail').textContent = student.email || '-';
   document.getElementById('studentDetailMobile').textContent = student.mobile || '-';
+  document.getElementById('studentDetailWhatsapp').textContent = student.whatsapp_number || '-';
   document.getElementById('studentDetailAcademic').textContent =
     `${deptName(student.department)} · Sem ${student.semester || '-'} · ${student.division || '-'} · ${student.academic_year || '-'}`;
 
@@ -262,7 +302,7 @@ function timeAgo(isoString){
   return days + ' days ago';
 }
 
-// Recent activity ke liye actual date + time (e.g. "23 Aug 2026, 6:45 PM")
+// Actual date + time for recent activity (e.g. "23 Aug 2026, 6:45 PM")
 function formatDateTime(isoString){
   if(!isoString) return '';
   const d = new Date(isoString);
@@ -285,7 +325,7 @@ async function loadDashboardStats(){
   }
 }
 
-// Dashboard par "Students by semester" bar chart (Sem 1-6, jis sem me student nahi wahan 0)
+// The "Students by semester" bar chart on the Dashboard (Sem 1-6, 0 for a semester with no students)
 function renderSemesterChart(rows){
   const el = document.getElementById('semesterChart');
   if(!el) return;
@@ -304,18 +344,93 @@ function renderSemesterChart(rows){
   }).join('');
 }
 
-// ---- System Assistant (dashboard card) — backend /admin/assistant se real data ----
+// The reply can come back instantly (FAQ answers) - keep the loading dots visible for a moment so the chat feels natural
+function chatMinDelay(startedAt, ms = 800){
+  const left = ms - (Date.now() - startedAt);
+  return left > 0 ? new Promise(r => setTimeout(r, left)) : Promise.resolve();
+}
+
+// ---- System Assistant (dashboard card) — real data from the backend /admin/assistant ----
+// ---- Chat history: this user's own previous questions & replies are shown in the chat page and the popup ----
+const CHAT_GREETINGS = {};
+
+function renderChatHistory(logId, items){
+  const log = document.getElementById(logId);
+  if(!log) return;
+  if(log.querySelector('[id^="typing-"]')) return;   // a reply is loading right now - do not wipe it
+  if(CHAT_GREETINGS[logId] === undefined){
+    const first = log.querySelector('.msg.bot');
+    CHAT_GREETINGS[logId] = first ? first.outerHTML : '';
+  }
+  log.innerHTML = CHAT_GREETINGS[logId] + items.map(m => {
+    const when = m.created_at ? new Date(m.created_at).toLocaleString() : '';
+    return `<div class="msg user" title="${when}">${nfEsc(m.message || '')}</div>` +
+           `<div class="msg bot" title="${when}">${nfEsc(m.response || '').replace(/\n/g, '<br>')}</div>`;
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+async function loadMyChatHistory(){
+  try{
+    const items = await apiRequest('/admin/chat-history');
+    ['chatLog', 'popupLog'].forEach(id => renderChatHistory(id, items));
+  }catch(err){
+    /* history is optional - the chat still works without it */
+  }
+}
+
+document.addEventListener('DOMContentLoaded', loadMyChatHistory);
+
 async function adminAsk(text){
   const box = document.getElementById('adminAskaiReply');
   if(!box) return;
   box.classList.remove('hidden');
-  box.textContent = 'Thinking…';
+  box.innerHTML = '<span class="typing-dots"><i></i><i></i><i></i></span>';
+  const startedAt = Date.now();
   try{
     const data = await apiRequest('/admin/assistant', { method: 'POST', body: JSON.stringify({ message: text }) });
+    await chatMinDelay(startedAt);
     box.innerHTML = nfEsc(data.reply || '...').replace(/\n/g, '<br>');
   }catch(err){
     box.textContent = 'Response could not be loaded, try again.';
   }
+}
+
+// ---- Floating chat popup + full "AI Chat" page (same assistant as the dashboard card: /admin/assistant) ----
+function togglePopup(){
+  const popup = document.getElementById('popup');
+  popup.classList.toggle('hidden');
+  if(!popup.classList.contains('hidden')){
+    loadMyChatHistory();
+    const log = document.getElementById('popupLog');
+    if(log) log.scrollTop = log.scrollHeight;
+    const input = document.getElementById('popupInput');
+    if(input) input.focus();
+  }
+}
+
+async function sendChat(inputId, logId){
+  const input = document.getElementById(inputId);
+  const text = input.value.trim();
+  if(!text) return;
+  const log = document.getElementById(logId);
+  log.insertAdjacentHTML('beforeend', `<div class="msg user">${nfEsc(text)}</div>`);
+  input.value = '';
+  log.scrollTop = log.scrollHeight;
+  const typingId = 'typing-' + Date.now();
+  log.insertAdjacentHTML('beforeend', `<div class="msg bot" id="${typingId}"><span class="typing-dots"><i></i><i></i><i></i></span></div>`);
+  log.scrollTop = log.scrollHeight;
+  const startedAt = Date.now();
+  try{
+    const data = await apiRequest('/admin/assistant', { method: 'POST', body: JSON.stringify({ message: text }) });
+    await chatMinDelay(startedAt);
+    const el = document.getElementById(typingId);
+    if(el) el.innerHTML = nfEsc(data.reply || '...').replace(/\n/g, '<br>');
+  }catch(err){
+    const el = document.getElementById(typingId);
+    if(el) el.textContent = 'Response could not be loaded, try again.';
+  }
+  log.scrollTop = log.scrollHeight;
 }
 
 function adminAskFromDashboard(){
@@ -334,7 +449,7 @@ function adminAskPrefill(text){
   input.focus();
 }
 
-// Dashboard par pending marks requests ki chhoti preview list (Marks Requests screen jaisa hi data, top 5)
+// A small preview list of pending marks requests on the Dashboard (the same data as the Marks Requests screen, top 5)
 async function loadDashboardPendingMarks(){
   const container = document.getElementById('dashboardPendingMarksList');
   if(!container) return;
@@ -349,7 +464,7 @@ async function loadDashboardPendingMarks(){
       const isLast = i === rows.length - 1;
       return `<div class="notice-row"${isLast ? ' style="border-bottom:none;"' : ''}>
         <b>${escapeHtmlMR(r.faculty_name)} — ${escapeHtmlMR(r.subject_name)} (${escapeHtmlMR(r.exam_type)})</b>
-        <span>Sem ${r.semester} / ${r.division || 'All'} · ${r.student_count} students · ${formatDateTime(r.submitted_at)}</span>
+        <span>Sem ${escapeHtml(r.semester)} / ${escapeHtml(r.division || 'All')} · ${escapeHtml(r.student_count)} students · ${escapeHtml(formatDateTime(r.submitted_at))}</span>
       </div>`;
     }).join('');
   }catch(err){
@@ -367,14 +482,45 @@ async function loadRecentActivity(){
     }
     container.innerHTML = rows.map((r, i) => {
       let label;
-      if(r.type === 'student_registered') label = `New student registered — ${r.title}`;
-      else if(r.type === 'faculty_added') label = `New faculty account created — ${r.title}`;
-      else label = `Notice posted — ${r.title}`;
+      if(r.type === 'student_registered') label = `New student registered — ${escapeHtml(r.title)}`;
+      else if(r.type === 'faculty_added') label = `New faculty account created — ${escapeHtml(r.title)}`;
+      else label = `Notice posted — ${escapeHtml(r.title)}`;
       const isLast = i === rows.length - 1;
-      return `<div class="notice-row"${isLast ? ' style="border-bottom:none;"' : ''}><b>${label}</b><span>${r.detail || ''} · ${formatDateTime(r.created_at)}</span></div>`;
+      return `<div class="notice-row"${isLast ? ' style="border-bottom:none;"' : ''}><b>${label}</b><span>${escapeHtml(r.detail || '')} · ${escapeHtml(formatDateTime(r.created_at))}</span></div>`;
     }).join('');
   }catch(err){
     container.innerHTML = '<div class="notice-row" style="border-bottom:none;"><b>Failed to load</b></div>';
+  }
+}
+
+// ---- Live auto-refresh (page refresh kiye bina faculty/students ke updates dikhne ke liye) ----
+// Dashboard, bell badge, notices aur pending marks-requests badge. Tables/forms (students, faculty, fees, marks...)
+// jaan-boojh kar nahi chhedi jaati, taaki edit karte waqt user ka kaam na ud jaaye.
+let adminLastBg = 0;
+async function refreshMarksRequestBadge(){
+  const badge = document.getElementById('marksRequestBadge');
+  if(!badge) return;
+  try{
+    const data = await apiRequest('/admin/marks/requests?status=pending');
+    const n = (data.requests || []).length;
+    if(n > 0){ badge.textContent = n; badge.style.display = ''; } else { badge.style.display = 'none'; }
+  }catch(err){ /* silent */ }
+}
+function adminBackgroundRefresh(){
+  if(document.hidden) return;
+  if(Date.now() - adminLastBg < 5000) return;
+  adminLastBg = Date.now();
+  refreshNotifBadge();
+  loadDashboard();
+  loadNotices(true);
+  refreshMarksRequestBadge();
+  // Attendance: faculty ne attendance mark ki to admin ki "summary" table (read-only) aur khula hua calendar apne aap update hote hain.
+  // Mark karne wali list (attendanceTableBody) nahi chhedi jaati — usme admin ke unsaved Present/Absent clicks hote hain.
+  const attView = document.getElementById('view-attendance');
+  if(attView && attView.classList.contains('active')){
+    if(document.getElementById('attSemester') && document.getElementById('attSemester').value) loadAttendanceSummary(true);
+    const calOv = document.getElementById('attCalendarOverlay');
+    if(calOv && calOv.classList.contains('open')) loadAttendanceCalendar(true);
   }
 }
 
@@ -384,21 +530,24 @@ function loadDashboard(){
   loadDashboardPendingMarks();
 }
 
-// Student Management view khulte hi list load karo
+// Load the list as soon as the Student Management view opens
 document.addEventListener('DOMContentLoaded', () => {
   applyStoredDarkMode();
   applyProfileNameToUI();
   refreshNotifBadge();
-  setInterval(refreshNotifBadge, 60000);   // har 1 min me naye notification check karo
+  setInterval(refreshNotifBadge, 60000);   // check for new notifications every 1 min
+  setInterval(adminBackgroundRefresh, 20000);
+  document.addEventListener('visibilitychange', () => { if(!document.hidden) adminBackgroundRefresh(); });
+  window.addEventListener('focus', adminBackgroundRefresh);
   loadDashboard();
   loadStudents();
-  loadSubjects();     // subjects pehle load karo taaki faculty ka dropdown bhi bhar jaye
+  loadSubjects();     // load subjects first so the faculty dropdown gets filled too
   loadFaculty();
   loadTimetable();
   loadExamTimetables();
 
   if(document.getElementById('attDate')){
-    document.getElementById('attDate').value = new Date().toISOString().split('T')[0];   // default: aaj ki date
+    document.getElementById('attDate').value = new Date().toISOString().split('T')[0];   // default: today's date
     loadAttendanceSummary();
   }
 
@@ -447,13 +596,17 @@ document.addEventListener('DOMContentLoaded', () => {
   if(document.getElementById('divisionsSummaryBody')){
     loadDivisionsSummary();
   }
+
+  if(document.getElementById('faqTableBody')){
+    loadFaqs();
+  }
 });
 
 // ============================================================
 // SUBJECT MANAGEMENT
 // ============================================================
 let cachedSubjects = [];
-let currentFacultySelectedSubjectIds = [];   // checkboxes jo abhi form me checked hain (semester badalne par bhi yaad rakhne ke liye nahi — sirf render ke liye)
+let currentFacultySelectedSubjectIds = [];   // checkboxes that are currently checked in the form (not to remember them when the semester changes — only for rendering)
 
 function openAddSubjectForm(){
   resetSubjectForm();
@@ -466,13 +619,14 @@ function resetSubjectForm(){
   document.getElementById('subjectCode').value = '';
   document.getElementById('subjectCode').disabled = false;
   document.getElementById('subjectDept').value = 'Computer Engineering';
-  document.getElementById('subjectSem').value = '1';
-  document.getElementById('subjectBatch').value = '2024-25';
+  document.getElementById('subjectSem').value = '';
+  document.getElementById('subjectType').value = 'Theory';
+  document.getElementById('subjectBatch').value = '';   // it will stay on the "Select batch" placeholder
 }
 
 async function loadSubjects(){
   const tbody = document.getElementById('subjectsTableBody');
-  if(tbody) tbody.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
+  if(tbody) tbody.innerHTML = '<tr><td colspan="7">Loading…</td></tr>';
 
   const filterYearEl = document.getElementById('subjectFilterYear');
   const params = new URLSearchParams();
@@ -485,30 +639,31 @@ async function loadSubjects(){
     if(tbody){
       tbody.innerHTML = subjects.length ? subjects.map(s => `
         <tr>
-          <td>${s.subject_code}</td>
-          <td>${s.subject_name}</td>
-          <td>${deptName(s.department)}</td>
-          <td>${s.semester || '-'}</td>
-          <td>${s.academic_year || '-'}</td>
+          <td>${escapeHtml(s.subject_code)}</td>
+          <td>${escapeHtml(s.subject_name)}</td>
+          <td>${escapeHtml(deptName(s.department))}</td>
+          <td>${escapeHtml(s.semester || '-')}</td>
+          <td>${escapeHtml(s.subject_type || 'Theory')}</td>
+          <td>${escapeHtml(s.academic_year || '-')}</td>
           <td class="row-actions">
-            <button class="icon-action" onclick='editSubject(${JSON.stringify(s)})'>✎</button>
-            <button class="icon-action danger" onclick="deleteSubject(${s.id}, '${s.subject_name}')">🗑</button>
+            <button class="icon-action" onclick="editSubjectById('${s.id}')">✎</button>
+            <button class="icon-action danger" onclick="deleteSubjectById('${s.id}')">🗑</button>
           </td>
         </tr>
-      `).join('') : '<tr><td colspan="6">No subjects found.</td></tr>';
+      `).join('') : '<tr><td colspan="7">No subjects found.</td></tr>';
     }
 
-    // Faculty form ka semester already selected ho to uske subjects checkbox refresh kar do
+    // If a semester is already selected in the Faculty form, refresh its subjects checkboxes
     if(document.getElementById('facultySubjectsContainer')){
       renderFacultySubjectCheckboxes(document.getElementById('facultySemester').value, currentFacultySelectedSubjectIds);
     }
 
-    // Attendance ka subject dropdown bhi refresh kar do (semester-wise filtered)
+    // Refresh the Attendance subject dropdown too (filtered semester-wise)
     if(document.getElementById('attSubject')){
       populateAttendanceSubjects(document.getElementById('attSemester').value);
     }
 
-    // Notes ke dono dropdowns (upload form + filter) bhi refresh kar do
+    // Refresh both Notes dropdowns (upload form + filter) too
     if(document.getElementById('noteSubject')){
       populateNoteSubjects(document.getElementById('noteSemester').value);
     }
@@ -516,7 +671,7 @@ async function loadSubjects(){
       populateNoteFilterSubjects(document.getElementById('noteFilterSemester').value);
     }
 
-    // Assignment ke dono dropdowns (upload form + filter) bhi refresh kar do
+    // Refresh both Assignment dropdowns (upload form + filter) too
     if(document.getElementById('assignSubject')){
       populateAssignmentSubjects(document.getElementById('assignSemester').value);
     }
@@ -524,12 +679,12 @@ async function loadSubjects(){
       populateAssignmentFilterSubjects(document.getElementById('assignFilterSemester').value);
     }
 
-    // Marks ka Subject dropdown bhi refresh kar do
+    // Refresh the Marks Subject dropdown too
     if(document.getElementById('marksSubject')){
       populateMarksSubjects(document.getElementById('marksSemester').value);
     }
   }catch(err){
-    if(tbody) tbody.innerHTML = `<tr><td colspan="6">Failed to load subjects: ${err.message}</td></tr>`;
+    if(tbody) tbody.innerHTML = `<tr><td colspan="7">Failed to load subjects: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -540,12 +695,17 @@ async function saveSubject(){
     subject_code: document.getElementById('subjectCode').value.trim(),
     department: document.getElementById('subjectDept').value,
     semester: document.getElementById('subjectSem').value,
+    subject_type: document.getElementById('subjectType').value,
     academic_year: document.getElementById('subjectBatch').value,
     credits: 0
   };
 
   if(!payload.subject_name || !payload.subject_code){
     alert('Subject name and code are required');
+    return;
+  }
+  if(!payload.semester || !payload.academic_year){
+    alert('Select semester and batch');
     return;
   }
 
@@ -569,9 +729,10 @@ function editSubject(subject){
   document.getElementById('subjectEditId').value = subject.id;
   document.getElementById('subjectName').value = subject.subject_name;
   document.getElementById('subjectCode').value = subject.subject_code;
-  document.getElementById('subjectCode').disabled = true;   // code unique key hai, edit nahi hota
+  document.getElementById('subjectCode').disabled = true;   // code is a unique key, it can't be edited
   document.getElementById('subjectDept').value = subject.department || 'Computer Engineering';
   document.getElementById('subjectSem').value = subject.semester || '1';
+  document.getElementById('subjectType').value = subject.subject_type || 'Theory';
   document.getElementById('subjectBatch').value = subject.academic_year || '2024-25';
   document.getElementById('subjectForm').classList.remove('hidden');
 }
@@ -584,6 +745,16 @@ async function deleteSubject(id, name){
   }catch(err){
     alert('Error: ' + err.message);
   }
+}
+
+function editSubjectById(id){
+  const s = (cachedSubjects || []).find(x => String(x.id) === String(id));
+  if(s) editSubject(s);
+}
+
+function deleteSubjectById(id){
+  const s = (cachedSubjects || []).find(x => String(x.id) === String(id));
+  if(s) deleteSubject(s.id, s.subject_name);
 }
 
 // ============================================================
@@ -601,35 +772,46 @@ function resetFacultyForm(){
   document.getElementById('facultyLoginId').value = '';
   document.getElementById('facultyLoginId').disabled = false;
   document.getElementById('facultyEmail').value = '';
-  document.getElementById('facultySemester').value = '1';
+  document.getElementById('facultyWhatsapp').value = '';
+  document.getElementById('facultySemester').value = '';
   document.getElementById('facultyDivision').value = '';
-  document.getElementById('facultyBatch').value = '2024-25';
+  document.getElementById('facultyBatch').value = '';   // it will stay on the "Select batch" placeholder
   currentFacultySelectedSubjectIds = [];
-  renderFacultySubjectCheckboxes('1', []);
+  renderFacultySubjectCheckboxes('', []);
 }
 
-// Semester selected subjects ke checkboxes bharta hai — sirf usi semester ke subjects dikhte hain
+// Fills the checkboxes of the selected semester's subjects — only that semester's subjects are shown
 function renderFacultySubjectCheckboxes(semester, selectedIds){
   const container = document.getElementById('facultySubjectsContainer');
   if(!container) return;
+  const batchEl = document.getElementById('facultyBatch');
+  const batch = batchEl ? batchEl.value : '';
+  if(!semester){
+    container.innerHTML = '<span class="muted">Select a semester to see its subjects…</span>';
+    return;
+  }
+  if(!batch){
+    container.innerHTML = '<span class="muted">Select a batch to see its subjects…</span>';
+    return;
+  }
   const sem = parseInt(semester);
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
 
   if(!subjectsForSem.length){
-    container.innerHTML = '<span class="muted">No subject was found for this semester.</span>';
+    container.innerHTML = '<span class="muted">No subject was found for this batch/semester.</span>';
     return;
   }
 
   container.innerHTML = subjectsForSem.map(s => `
     <label class="checkbox-item">
       <input type="checkbox" value="${s.id}" ${selectedIds.includes(s.id) ? 'checked' : ''}>
-      ${s.subject_name} (${s.subject_code})
+      ${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})
     </label>
   `).join('');
 }
 
-// Semester dropdown change hote hi us semester ke subjects dikhao.
-// Edit mode me ho to is faculty ke us semester me pehle se assigned subjects backend se le kar pre-check karo.
+// As soon as the Semester dropdown changes, show that semester's subjects.
+// In edit mode, fetch this faculty's already-assigned subjects for that semester from the backend and pre-check them.
 async function onFacultySemesterChange(){
   const semester = document.getElementById('facultySemester').value;
   const academicYear = document.getElementById('facultyBatch').value;
@@ -650,13 +832,13 @@ async function onFacultySemesterChange(){
   renderFacultySubjectCheckboxes(semester, currentFacultySelectedSubjectIds);
 }
 
-// "Subjects assigned" column ko horizontal pills me render karta hai, code ke saath
+// Renders the "Subjects assigned" column as horizontal pills, along with the code
 function renderSubjectPills(subjectsAssignedStr){
   if(!subjectsAssignedStr) return '-';
   return `<div class="subject-pills">` + subjectsAssignedStr.split('||').map(entry => {
     const [code, name, sem, division] = entry.split('::');
     const divLabel = division && division !== 'All' ? ` · Division ${division}` : '';
-    return `<span class="subject-pill">${name} <b>(${code})</b> · Sem ${sem}${divLabel}</span>`;
+    return `<span class="subject-pill">${escapeHtml(name)} <b>(${escapeHtml(code)})</b> · Sem ${escapeHtml(sem)}${escapeHtml(divLabel)}</span>`;
   }).join('') + `</div>`;
 }
 
@@ -674,21 +856,22 @@ async function loadFaculty(){
       tbody.innerHTML = '<tr><td colspan="6">No faculty found.</td></tr>';
       return;
     }
+    window._facultyCache = new Map(faculty.map(f => [String(f.id), f]));
     tbody.innerHTML = faculty.map(f => `
       <tr>
-        <td>${f.faculty_id}</td>
-        <td>${f.name}</td>
-        <td>${f.short_name || '-'}</td>
-        <td>${deptName(f.department)}</td>
+        <td>${escapeHtml(f.faculty_id)}</td>
+        <td>${escapeHtml(f.name)}</td>
+        <td>${escapeHtml(f.short_name || '-')}</td>
+        <td>${escapeHtml(deptName(f.department))}</td>
         <td class="subjects-col">${renderSubjectPills(f.subjects_assigned)}</td>
         <td class="row-actions">
-          <button class="icon-action" onclick='editFaculty(${JSON.stringify(f)})'>✎</button>
-          <button class="icon-action danger" onclick="deleteFaculty(${f.id}, '${f.name}')">🗑</button>
+          <button class="icon-action" onclick="editFacultyById('${f.id}')">✎</button>
+          <button class="icon-action danger" onclick="deleteFacultyById('${f.id}')">🗑</button>
         </td>
       </tr>
     `).join('');
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="6">Failed to load faculty: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6">Failed to load faculty: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -703,8 +886,9 @@ async function saveFaculty(){
     short_name: document.getElementById('facultyShortName').value.trim(),   // optional
     faculty_id: document.getElementById('facultyLoginId').value.trim(),
     email: document.getElementById('facultyEmail').value.trim(),
+    whatsapp_number: document.getElementById('facultyWhatsapp').value.trim(),
     department: document.getElementById('facultyDept').value,
-    subject_ids: checkedSubjectIds,          // ek se zyada subjects ek saath
+    subject_ids: checkedSubjectIds,          // more than one subject at once
     semester: document.getElementById('facultySemester').value,
     division: document.getElementById('facultyDivision').value,
     academic_year: document.getElementById('facultyBatch').value
@@ -712,6 +896,10 @@ async function saveFaculty(){
 
   if(!payload.name || !payload.faculty_id){
     alert('Full name and Faculty ID are required');
+    return;
+  }
+  if(payload.whatsapp_number && !/^\d{10,15}$/.test(payload.whatsapp_number)){
+    alert('WhatsApp number must be 10-15 digits (with country code if needed)');
     return;
   }
 
@@ -736,18 +924,19 @@ async function editFaculty(faculty){
   document.getElementById('facultyName').value = faculty.name;
   document.getElementById('facultyShortName').value = faculty.short_name || '';
   document.getElementById('facultyLoginId').value = faculty.faculty_id;
-  document.getElementById('facultyLoginId').disabled = true;   // login_id hai, edit nahi hota
+  document.getElementById('facultyLoginId').disabled = true;   // login_id, it can't be edited
   document.getElementById('facultyEmail').value = faculty.email || '';
+  document.getElementById('facultyWhatsapp').value = faculty.whatsapp_number || '';
   document.getElementById('facultyDept').value = faculty.department || 'Computer Engineering';
 
-  // Faculty ka default semester + batch + division wahi rakho jo pehle se assign hai (nahi to semester 1 / 2024-25 / All se start karo)
-  const defaultSem = faculty.default_semester || '1';
+  // Keep the faculty's default semester + batch + division as already assigned (otherwise start from semester 1 / 2024-25 / All)
+  const defaultSem = faculty.default_semester || '';
   document.getElementById('facultySemester').value = defaultSem;
-  document.getElementById('facultyBatch').value = faculty.default_academic_year || '2024-25';
+  document.getElementById('facultyBatch').value = faculty.default_academic_year || '';
   document.getElementById('facultyDivision').value = faculty.default_division || '';
 
   document.getElementById('facultyForm').classList.remove('hidden');
-  await onFacultySemesterChange();   // is semester ke already-assigned subjects checkbox me pre-check ho jayenge
+  await onFacultySemesterChange();   // this semester's already-assigned subjects will be pre-checked in the checkboxes
 }
 
 async function deleteFaculty(id, name){
@@ -760,6 +949,16 @@ async function deleteFaculty(id, name){
   }
 }
 
+function editFacultyById(id){
+  const f = window._facultyCache ? window._facultyCache.get(String(id)) : null;
+  if(f) editFaculty(f);
+}
+
+function deleteFacultyById(id){
+  const f = window._facultyCache ? window._facultyCache.get(String(id)) : null;
+  if(f) deleteFaculty(f.id, f.name);
+}
+
 
 // ============================================================
 // TIMETABLE MANAGEMENT
@@ -767,45 +966,28 @@ async function deleteFaculty(id, name){
 let cachedTimetable = [];
 const DAY_LABELS = { Mon:'Monday', Tue:'Tuesday', Wed:'Wednesday', Thu:'Thursday', Fri:'Friday', Sat:'Saturday' };
 const DAY_ORDER = ['Mon','Tue','Wed','Thu','Fri','Sat'];
+// Mon–Fri always; Saturday column only if some slot actually falls on Saturday
+function gridDays(slots){
+  return DAY_ORDER.filter(d => d !== 'Sat' || slots.some(s => s.day_of_week === 'Sat'));
+}
 const LUNCH_BREAK_START = '13:30';
 const LUNCH_BREAK_END = '14:00';
 const LUNCH_BREAK_RANGE = `${LUNCH_BREAK_START}-${LUNCH_BREAK_END}`;
 
-// FIXED PERIODS — admin ab custom/free-text time range nahi bana sakta, sirf in me se ek period choose karega.
-// Isse har din ke slots hamesha same boundaries follow karenge, grid me overlapping/mismatched time range kabhi nahi banega.
-// Naya period add/change karna ho to bas yahi list edit karo — form aur validation dono automatically isi se chalte hain.
-const TIMETABLE_PERIODS = [
-  { start: '10:30', end: '11:30' },
-  { start: '11:30', end: '12:30' },
-  { start: '12:30', end: '13:30' },
-  { start: '14:00', end: '15:00' },
-  { start: '15:00', end: '16:00' },
-  { start: '16:00', end: '17:00' },
-  { start: '17:00', end: '18:00' }
-];
-
-function periodRangeValue(p){ return `${p.start}-${p.end}`; }
-function periodLabel(p){ return `${formatTime12(p.start)} - ${formatTime12(p.end)}`; }
-
-// Period dropdown ko TIMETABLE_PERIODS se bharta hai. Agar selectedRange list me exact match nahi karta
-// (purana/legacy data jo fixed-period system se pehle bana tha), to ek extra "Existing" option daal deta hai
-// taaki admin ko silently kisi aur period par switch na ho jaaye — usse dikh jaaye aur woh khud sahi period chun sake.
-function populateTimetablePeriodOptions(selectedRange){
-  const select = document.getElementById('ttPeriod');
-  let optionsHtml = TIMETABLE_PERIODS.map(p => {
-    const range = periodRangeValue(p);
-    return `<option value="${range}" ${range === selectedRange ? 'selected' : ''}>${periodLabel(p)}</option>`;
-  }).join('');
-
-  const isKnownRange = TIMETABLE_PERIODS.some(p => periodRangeValue(p) === selectedRange);
-  if(selectedRange && !isKnownRange){
-    optionsHtml += `<option value="${selectedRange}" selected>${formatRangeLabel(selectedRange)} (existing — please re-select a period)</option>`;
-  }
-
-  select.innerHTML = optionsHtml;
+// Timetable time inputs use manual 24-hour HH:MM format.
+function populateTimetableTimeOptions(selectedStart = '', selectedEnd = ''){
+  const start = document.getElementById('ttStartTime');
+  const end = document.getElementById('ttEndTime');
+  if(!start || !end) return;
+  start.value = selectedStart || '';
+  end.value = selectedEnd || '';
 }
 
-// 12-hour dropdown (hour/minute/AM-PM) ko backend ke liye 24-hour "HH:MM" string me convert karta hai
+function onTimetableStartTimeChange(){}
+
+function onTimetableSessionTypeChange(){}
+
+// Converts the 12-hour dropdowns (hour/minute/AM-PM) into a 24-hour "HH:MM" string for the backend
 function to24Hour(hour12, minute, period){
   let h = parseInt(hour12, 10);
   if(period === 'AM'){ if(h === 12) h = 0; }
@@ -813,7 +995,7 @@ function to24Hour(hour12, minute, period){
   return String(h).padStart(2, '0') + ':' + minute;
 }
 
-// Backend ka 24-hour "HH:MM" string 12-hour dropdown values (hour/minute/period) me todhta hai — edit form pre-fill ke liye
+// Splits the backend's 24-hour "HH:MM" string into 12-hour dropdown values (hour/minute/period) — to pre-fill the edit form
 function to12Hour(time24){
   if(!time24) return { hour: '09', minute: '00', period: 'AM' };
   const [h, m] = time24.split(':').map(Number);
@@ -823,7 +1005,7 @@ function to12Hour(time24){
   return { hour: String(hour12).padStart(2, '0'), minute: String(m).padStart(2, '0'), period };
 }
 
-// Table/grid me dikhane ke liye 24-hour "HH:MM" ko "9:00 AM" jaisa banata hai
+// Turns a 24-hour "HH:MM" into something like "9:00 AM" for display in the table/grid
 function formatTime12(time24){
   if(!time24) return '';
   const { hour, minute, period } = to12Hour(time24);
@@ -842,39 +1024,58 @@ function openAddTimetableForm(){
 
 function resetTimetableForm(){
   document.getElementById('ttEditId').value = '';
-  document.getElementById('ttSemester').value = '1';
-  document.getElementById('ttBatch').value = '2024-25';
-  document.querySelectorAll('#ttDivisionsContainer input').forEach((cb, i) => cb.checked = (i === 0));  // default: sirf A checked
+  document.getElementById('ttSemester').value = '';
+  document.getElementById('ttBatch').value = '';   // it stays on the "Select batch" placeholder, no data shows directly
+  document.querySelectorAll('#ttDivisionsContainer input').forEach((cb, i) => cb.checked = (i === 0));  // default: only A checked
   document.getElementById('ttDay').value = 'Mon';
-  populateTimetablePeriodOptions(periodRangeValue(TIMETABLE_PERIODS[0]));
   document.getElementById('ttRoom').value = '';
-  populateTimetableSubjects('1', '');
+  document.getElementById('ttSessionType').value = 'Lecture';
+  populateTimetableTimeOptions('', '');
+  populateTimetableSubjects('', '', '');
   populateTimetableFacultyOptions([]);
 }
 
-// Semester ke hisaab se sirf usi semester ke subjects dropdown me dikhao
-function populateTimetableSubjects(semester, selectedSubjectId){
-  const sem = parseInt(semester);
+// Show only the subjects of that batch/semester in the dropdown, according to both Batch + Semester.
+// Until a Batch is selected, only "Select batch first" shows — no subject is auto/directly selected.
+function populateTimetableSubjects(semester, batch, selectedSubjectId){
   const select = document.getElementById('ttSubject');
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
+  if(!semester){
+    select.innerHTML = '<option value="">— Select semester first —</option>';
+    populateTimetableFacultyOptions([]);
+    return;
+  }
+  if(!batch){
+    select.innerHTML = '<option value="">— Select batch first —</option>';
+    populateTimetableFacultyOptions([]);
+    return;
+  }
+  const sem = parseInt(semester);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
+  const placeholder = `<option value="" ${selectedSubjectId ? '' : 'selected disabled'}>Select subject</option>`;
   select.innerHTML = subjectsForSem.length
-    ? subjectsForSem.map(s => `<option value="${s.id}" ${String(s.id)===String(selectedSubjectId)?'selected':''}>${s.subject_name} (${s.subject_code})</option>`).join('')
-    : '<option value="">There are no subjects for this semester</option>';
+    ? placeholder + subjectsForSem.map(s => `<option value="${s.id}" ${String(s.id)===String(selectedSubjectId)?'selected':''}>${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('')
+    : '<option value="" selected disabled>There are no subjects for this batch/semester</option>';
 }
 
 function populateTimetableFacultyOptions(facultyList, selectedFacultyId){
   const select = document.getElementById('ttFaculty');
-  select.innerHTML = facultyList.length
-    ? facultyList.map(f => `<option value="${f.faculty_id}" ${String(f.faculty_id)===String(selectedFacultyId)?'selected':''}>${f.name}</option>`).join('')
-    : '<option value="">Assign this subject to a faculty member first</option>';
+  if(!facultyList.length){
+    select.innerHTML = '<option value="">— Select subject first —</option>';
+    return;
+  }
+  const placeholder = `<option value="" ${selectedFacultyId ? '' : 'selected disabled'}>Select faculty</option>`;
+  select.innerHTML = placeholder + facultyList.map(f => `<option value="${escapeHtml(f.faculty_id)}" ${String(f.faculty_id)===String(selectedFacultyId)?'selected':''}>${escapeHtml(f.name)}</option>`).join('');
+}
+
+function onTimetableBatchChange(){
+  populateTimetableSubjects(document.getElementById('ttSemester').value, document.getElementById('ttBatch').value, '');
 }
 
 function onTimetableSemesterChange(){
-  populateTimetableSubjects(document.getElementById('ttSemester').value, '');
-  populateTimetableFacultyOptions([]);
+  populateTimetableSubjects(document.getElementById('ttSemester').value, document.getElementById('ttBatch').value, '');
 }
 
-// Subject select hote hi sirf wahi faculty dikhao jo woh subject us semester me padhate hain
+// As soon as a subject is selected, show only the faculty who teach that subject in that semester
 async function onTimetableSubjectChange(){
   const subjectId = document.getElementById('ttSubject').value;
   const semester = document.getElementById('ttSemester').value;
@@ -895,48 +1096,80 @@ async function loadTimetable(){
     renderTimetableList();
     renderTimetableGrid();
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="9">Failed to load timetable: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10">Failed to load timetable: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-// "All timetable slots" list ko batch filter ke hisaab se client-side filter karke render karta hai
-// (dobara fetch nahi karta, cachedTimetable already poora data rakhta hai — grid isi pattern ko follow karta hai)
+// Renders the "All timetable slots" list, filtered client-side by the batch filter
+// (it doesn't fetch again, cachedTimetable already holds all the data — the grid follows the same pattern)
 function renderTimetableList(){
   const tbody = document.getElementById('timetableTableBody');
-  const filterYearEl = document.getElementById('ttListFilterYear');
-  const filterYear = filterYearEl ? filterYearEl.value : '';
+  const val = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const filterDay = val('ttListFilterDay');
+  const filterSem = val('ttListFilterSem');
+  const filterDiv = val('ttListFilterDiv');
+  const filterSession = val('ttListFilterSession');
+  const filterYear = val('ttListFilterYear');
 
-  const rows = filterYear ? cachedTimetable.filter(t => t.academic_year === filterYear) : cachedTimetable;
+  const rows = cachedTimetable.filter(t =>
+    (!filterDay || t.day_of_week === filterDay) &&
+    (!filterSem || String(t.semester) === filterSem) &&
+    (!filterDiv || (t.division || '').split(',').map(x => x.trim()).includes(filterDiv)) &&
+    (!filterSession || (t.session_type || 'Lecture') === filterSession) &&
+    (!filterYear || t.academic_year === filterYear)
+  );
 
   tbody.innerHTML = rows.length ? rows.map(t => `
     <tr>
-      <td>${t.semester}</td>
-      <td>${(t.division || '').split(',').join(', ')}</td>
-      <td>${t.academic_year || '-'}</td>
-      <td>${DAY_LABELS[t.day_of_week] || t.day_of_week}</td>
-      <td>${formatTime12(t.start_time)} - ${formatTime12(t.end_time)}</td>
-      <td>${t.subject_name || '-'} ${t.subject_code ? '('+t.subject_code+')' : ''}</td>
-      <td>${t.faculty_name || '-'}</td>
-      <td>${t.room_no || '-'}</td>
+      <td>${escapeHtml(t.semester)}</td>
+      <td>${escapeHtml((t.division || '').split(',').join(', '))}</td>
+      <td>${escapeHtml(t.academic_year || '-')}</td>
+      <td>${escapeHtml(DAY_LABELS[t.day_of_week] || t.day_of_week)}</td>
+      <td>${escapeHtml(formatTime12(t.start_time))} - ${escapeHtml(formatTime12(t.end_time))}</td>
+      <td>${escapeHtml(t.subject_name || '-')} ${t.subject_code ? '(' + escapeHtml(t.subject_code) + ')' : ''}</td>
+      <td>${escapeHtml(t.session_type || 'Lecture')}</td>
+      <td>${escapeHtml(t.faculty_name || '-')}</td>
+      <td>${escapeHtml(t.room_no || '-')}</td>
       <td class="row-actions">
-        <button class="icon-action" onclick='editTimetableSlot(${JSON.stringify(t)})'>✎</button>
+        <button class="icon-action" onclick="editTimetableSlotById('${t.id}')">✎</button>
         <button class="icon-action danger" onclick="deleteTimetableSlot(${t.id})">🗑</button>
       </td>
     </tr>
-  `).join('') : '<tr><td colspan="9">No timetable slot was found.</td></tr>';
+  `).join('') : '<tr><td colspan="10">No timetable slot was found.</td></tr>';
+}
+
+function editTimetableSlotById(id){
+  const t = (cachedTimetable || []).find(x => String(x.id) === String(id));
+  if(t) editTimetableSlot(t);
+}
+
+function resetTimetableListFilters(){
+  ['ttListFilterDay','ttListFilterSem','ttListFilterDiv','ttListFilterSession','ttListFilterYear']
+    .forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });
+  renderTimetableList();
+}
+
+function normalizeTimetableTime(value){
+  const v = String(value || '').trim();
+  const m = v.match(/^(\d{1,2}):(\d{2})$/);
+  if(!m) return null;
+  const hh = Number(m[1]), mm = Number(m[2]);
+  if(hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
 }
 
 async function saveTimetableSlot(){
   const editId = document.getElementById('ttEditId').value;
   const divisions = Array.from(document.querySelectorAll('#ttDivisionsContainer input:checked')).map(cb => cb.value);
 
-  const periodValue = document.getElementById('ttPeriod').value;
-  const [startTime, endTime] = periodValue.split('-');
+  const startTime = normalizeTimetableTime(document.getElementById('ttStartTime').value);
+  const endTime = normalizeTimetableTime(document.getElementById('ttEndTime').value);
 
   const payload = {
     semester: document.getElementById('ttSemester').value,
     divisions: divisions,
     subject_id: document.getElementById('ttSubject').value,
+    session_type: document.getElementById('ttSessionType').value,
     faculty_id: document.getElementById('ttFaculty').value,
     day_of_week: document.getElementById('ttDay').value,
     start_time: startTime,
@@ -951,6 +1184,14 @@ async function saveTimetableSlot(){
   }
   if(!payload.subject_id || !payload.faculty_id){
     alert('Subject and faculty must be selected');
+    return;
+  }
+  if(!startTime || !endTime){
+    alert('Enter valid Start Time and End Time in 24-hour HH:MM format (e.g. 14:00 and 16:00)');
+    return;
+  }
+  if(timeToMinutes(endTime) <= timeToMinutes(startTime)){
+    alert('End time must be after start time');
     return;
   }
   if(startTime < LUNCH_BREAK_END && endTime > LUNCH_BREAK_START){
@@ -970,14 +1211,14 @@ async function saveTimetableSlot(){
     resetTimetableForm();
     loadTimetable();
   }catch(err){
-    alert('Error: ' + err.message);   // clash hone par backend ka wahi message dikhega
+    alert('Error: ' + err.message);   // on a clash, the backend's own message will be shown
   }
 }
 
 async function editTimetableSlot(slot){
   document.getElementById('ttEditId').value = slot.id;
   document.getElementById('ttSemester').value = slot.semester;
-  document.getElementById('ttBatch').value = slot.academic_year || '2024-25';
+  document.getElementById('ttBatch').value = slot.academic_year || '';
 
   const selectedDivisions = (slot.division || '').split(',');
   document.querySelectorAll('#ttDivisionsContainer input').forEach(cb => {
@@ -986,11 +1227,11 @@ async function editTimetableSlot(slot){
 
   document.getElementById('ttDay').value = slot.day_of_week;
 
-  populateTimetablePeriodOptions(`${slot.start_time}-${slot.end_time}`);
-
   document.getElementById('ttRoom').value = slot.room_no || '';
+  document.getElementById('ttSessionType').value = slot.session_type || 'Lecture';
+  populateTimetableTimeOptions(slot.start_time, slot.end_time);
 
-  populateTimetableSubjects(slot.semester, slot.subject_id);
+  populateTimetableSubjects(slot.semester, slot.academic_year, slot.subject_id);
   try{
     const faculty = await apiRequest(`/admin/timetable/faculty-options?subject_id=${slot.subject_id}&semester=${slot.semester}`);
     populateTimetableFacultyOptions(faculty, slot.faculty_id);
@@ -1011,32 +1252,39 @@ async function deleteTimetableSlot(id){
   }
 }
 
-// ---- Exam Timetable (Mid-Sem / Remedial — structured, regular timetable ki tarah) ----
+// ---- Exam Timetable (Mid-Sem / Remedial — structured, like the regular timetable) ----
 let cachedExamTimetable = [];
 
-function populateExamTtSubjects(semester){
-  const sem = parseInt(semester);
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
+function populateExamTtSubjects(semester, selectedSubjectId){
   const select = document.getElementById('examTtSubject');
   if(!select) return;
-  select.innerHTML = subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('')
-    || '<option value="">There are no subjects for this semester</option>';
+  const batch = document.getElementById('examTtBatch') ? document.getElementById('examTtBatch').value : '';
+  if(!semester){
+    select.innerHTML = '<option value="">— Select semester first —</option>';
+    return;
+  }
+  if(!batch){
+    select.innerHTML = '<option value="">— Select batch first —</option>';
+    return;
+  }
+  const sem = parseInt(semester);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
+  const placeholder = `<option value="" ${selectedSubjectId ? '' : 'selected disabled'}>Select subject</option>`;
+  select.innerHTML = subjectsForSem.length
+    ? placeholder + subjectsForSem.map(s => `<option value="${s.id}" ${String(s.id)===String(selectedSubjectId)?'selected':''}>${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('')
+    : '<option value="" selected disabled>There are no subjects for this batch/semester</option>';
 }
 
 function resetExamTtForm(){
   document.getElementById('examTtEditId').value = '';
   document.getElementById('examTtType').value = 'Mid-Sem';
-  document.getElementById('examTtSemester').value = '1';
-  populateExamTtSubjects('1');
+  document.getElementById('examTtSemester').value = '';
   document.getElementById('examTtDivision').value = '';
-  document.getElementById('examTtBatch').value = '2024-25';
+  document.getElementById('examTtBatch').value = '';   // it will stay on the "Select batch" placeholder
+  populateExamTtSubjects('');
   document.getElementById('examTtDate').value = '';
-  document.getElementById('examTtStartHour').value = '09';
-  document.getElementById('examTtStartMin').value = '00';
-  document.getElementById('examTtStartPeriod').value = 'AM';
-  document.getElementById('examTtEndHour').value = '11';
-  document.getElementById('examTtEndMin').value = '00';
-  document.getElementById('examTtEndPeriod').value = 'AM';
+  document.getElementById('examTtStartTime').value = '';
+  document.getElementById('examTtEndTime').value = '';
   document.getElementById('examTtRoom').value = '';
 }
 
@@ -1054,66 +1302,73 @@ async function loadExamTimetables(){
     renderExamTimetableList();
     if(document.getElementById('ttGridTable')) renderTimetableGrid();
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="9">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
 function renderExamTimetableList(){
   const tbody = document.getElementById('examTtTableBody');
-  tbody.innerHTML = cachedExamTimetable.length ? cachedExamTimetable.map(r => `
+  const val = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const filterSem = val('examListFilterSem');
+  const filterDiv = val('examListFilterDiv');
+  const filterBatch = val('examListFilterBatch');
+
+  // A slot with no division applies to all divisions, so it also shows up under Division A / B
+  const rows = cachedExamTimetable.filter(r =>
+    (!filterSem || String(r.semester) === filterSem) &&
+    (!filterDiv || !r.division || r.division === filterDiv) &&
+    (!filterBatch || r.academic_year === filterBatch)
+  );
+
+  tbody.innerHTML = rows.length ? rows.map(r => `
     <tr>
-      <td>${r.exam_type}</td>
-      <td>${r.exam_date}</td>
-      <td>${r.start_time} - ${r.end_time}</td>
-      <td>${r.semester}</td>
-      <td>${r.division || 'All'}</td>
-      <td>${r.academic_year || '-'}</td>
-      <td>${r.subject_name ? `${r.subject_name} (${r.subject_code})` : '-'}</td>
-      <td>${r.room_no || '-'}</td>
+      <td>${escapeHtml(r.exam_type)}</td>
+      <td>${escapeHtml(r.exam_date)}</td>
+      <td>${escapeHtml(formatTime12(r.start_time))} - ${escapeHtml(formatTime12(r.end_time))}</td>
+      <td>${escapeHtml(r.semester)}</td>
+      <td>${escapeHtml(r.division || 'All')}</td>
+      <td>${escapeHtml(r.academic_year || '-')}</td>
+      <td>${r.subject_name ? `${escapeHtml(r.subject_name)} (${escapeHtml(r.subject_code)})` : '-'}</td>
+      <td>${escapeHtml(r.room_no || '-')}</td>
       <td class="row-actions">
-        <button class="icon-action" onclick='editExamTimetableSlot(${JSON.stringify(r)})'>✎</button>
+        <button class="icon-action" onclick="editExamTimetableSlotById('${r.id}')">✎</button>
         <button class="icon-action danger" onclick="deleteExamTimetableSlot(${r.id})">🗑</button>
       </td>
     </tr>
   `).join('') : '<tr><td colspan="9">There is no exam timetable slot.</td></tr>';
 }
 
+function editExamTimetableSlotById(id){
+  const r = (cachedExamTimetable || []).find(x => String(x.id) === String(id));
+  if(r) editExamTimetableSlot(r);
+}
+
+function resetExamListFilters(){
+  ['examListFilterSem','examListFilterDiv','examListFilterBatch']
+    .forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });
+  renderExamTimetableList();
+}
+
 function editExamTimetableSlot(slot){
   document.getElementById('examTtEditId').value = slot.id;
   document.getElementById('examTtType').value = slot.exam_type;
   document.getElementById('examTtSemester').value = slot.semester;
-  populateExamTtSubjects(slot.semester);
-  document.getElementById('examTtSubject').value = slot.subject_id || '';
   document.getElementById('examTtDivision').value = slot.division || '';
-  document.getElementById('examTtBatch').value = slot.academic_year || '2024-25';
+  document.getElementById('examTtBatch').value = slot.academic_year || '';
+  populateExamTtSubjects(slot.semester, slot.subject_id);
   document.getElementById('examTtDate').value = slot.exam_date;
   document.getElementById('examTtRoom').value = slot.room_no || '';
 
-  const [startH24, startM] = slot.start_time.split(':');
-  const [endH24, endM] = slot.end_time.split(':');
-  const startH = parseInt(startH24), endH = parseInt(endH24);
-  document.getElementById('examTtStartHour').value = String(startH % 12 || 12).padStart(2, '0');
-  document.getElementById('examTtStartMin').value = startM;
-  document.getElementById('examTtStartPeriod').value = startH >= 12 ? 'PM' : 'AM';
-  document.getElementById('examTtEndHour').value = String(endH % 12 || 12).padStart(2, '0');
-  document.getElementById('examTtEndMin').value = endM;
-  document.getElementById('examTtEndPeriod').value = endH >= 12 ? 'PM' : 'AM';
+  document.getElementById('examTtStartTime').value = String(slot.start_time || '').slice(0, 5);
+  document.getElementById('examTtEndTime').value = String(slot.end_time || '').slice(0, 5);
 
   document.getElementById('examTtForm').classList.remove('hidden');
 }
 
 async function saveExamTimetableSlot(){
   const editId = document.getElementById('examTtEditId').value;
-  const startTime = to24Hour(
-    document.getElementById('examTtStartHour').value,
-    document.getElementById('examTtStartMin').value,
-    document.getElementById('examTtStartPeriod').value
-  );
-  const endTime = to24Hour(
-    document.getElementById('examTtEndHour').value,
-    document.getElementById('examTtEndMin').value,
-    document.getElementById('examTtEndPeriod').value
-  );
+  const startTime = normalizeTimetableTime(document.getElementById('examTtStartTime').value);
+  const endTime = normalizeTimetableTime(document.getElementById('examTtEndTime').value);
 
   const payload = {
     exam_type: document.getElementById('examTtType').value,
@@ -1131,7 +1386,11 @@ async function saveExamTimetableSlot(){
     alert('Select the exam date');
     return;
   }
-  if(endTime <= startTime){
+  if(!startTime || !endTime){
+    alert('Select a valid Start Time and End Time');
+    return;
+  }
+  if(timeToMinutes(endTime) <= timeToMinutes(startTime)){
     alert('End time must be after the start time');
     return;
   }
@@ -1159,35 +1418,39 @@ async function deleteExamTimetableSlot(id){
   }
 }
 
-// Semester + Division-filter ke hisaab se grid banata hai.
-// "ALL" divisions selected ho to uploaded photo jaisa merged grid banta hai (Day ke andar A/B/C sub-columns,
-// combined lecture ho to ek cell dono divisions ke upar span ho jata hai).
-// Ek specific division select ho to seedha simple Day-wise grid banta hai.
+// Builds the grid according to the Semester + Division filter.
+// If "ALL" divisions is selected, it builds a merged grid like the uploaded photo (A/B/C sub-columns inside each Day,
+// and a combined lecture spans one cell across both divisions).
+// If one specific division is selected, it builds a simple Day-wise grid directly.
 function renderTimetableGrid(){
   const table = document.getElementById('ttGridTable');
   const gridType = document.getElementById('gridType').value;
   const semester = document.getElementById('gridSemester').value;
   const divisionFilter = document.getElementById('gridDivision').value;
+  const batchFilter = document.getElementById('gridBatch')?.value || '';
 
   if(gridType !== 'Regular'){
     renderExamGrid(table, gridType, semester, divisionFilter);
     return;
   }
 
-  const slotsInSem = cachedTimetable.filter(t => String(t.semester) === String(semester));
+  const slotsInSem = cachedTimetable.filter(t =>
+    String(t.semester) === String(semester) &&
+    (!batchFilter || String(t.academic_year || '') === String(batchFilter))
+  );
 
   if(divisionFilter === 'ALL'){
-    document.getElementById('ttGridTitle').textContent = `Sem ${semester} · All divisions`;
+    document.getElementById('ttGridTitle').textContent = `Sem ${semester} · All divisions${batchFilter ? ' · ' + batchFilter : ''}`;
     renderCombinedDivisionGrid(table, slotsInSem);
   } else {
-    document.getElementById('ttGridTitle').textContent = `Sem ${semester} · Division ${divisionFilter}`;
-    const slots = slotsInSem.filter(t => (t.division || '').split(',').includes(divisionFilter));
+    document.getElementById('ttGridTitle').textContent = `Sem ${semester} · Division ${divisionFilter}${batchFilter ? ' · ' + batchFilter : ''}`;
+    const slots = slotsInSem.filter(t => (t.division || '').split(',').map(x => x.trim()).includes(divisionFilter));
     renderSingleDivisionGrid(table, slots);
   }
 }
 
-// Mid-Sem / Remedial exams din-wise repeat nahi hote — date-wise ek baar hote hain,
-// isliye inke liye weekly grid ki jagah simple date-sorted list dikhate hain.
+// Mid-Sem / Remedial exams don't repeat day-wise — they happen once, date-wise,
+// so instead of a weekly grid we show a simple date-sorted list for them.
 function renderExamGrid(table, examType, semester, divisionFilter){
   document.getElementById('ttGridTitle').textContent = `${examType} · Sem ${semester}${divisionFilter === 'ALL' ? '' : ' · Division ' + divisionFilter}`;
 
@@ -1211,14 +1474,54 @@ function renderExamGrid(table, examType, semester, divisionFilter){
     </tr>
     ${slots.map(s => `
       <tr>
-        <td>${s.exam_date}</td>
-        <td>${s.start_time} - ${s.end_time}</td>
-        <td>${s.division || 'All'}</td>
-        <td>${s.subject_name ? `${s.subject_name} (${s.subject_code})` : '-'}</td>
-        <td>${s.room_no || '-'}</td>
+        <td>${escapeHtml(s.exam_date)}</td>
+        <td>${escapeHtml(s.start_time)} - ${escapeHtml(s.end_time)}</td>
+        <td>${escapeHtml(s.division || 'All')}</td>
+        <td>${s.subject_name ? `${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})` : '-'}</td>
+        <td>${escapeHtml(s.room_no || '-')}</td>
       </tr>
     `).join('')}
   `;
+}
+
+function timeToMinutes(value){
+  const [h,m] = String(value || '').split(':').map(Number);
+  return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+}
+
+function minutesToRange(start, end){
+  const hhmm = m => `${String(Math.floor(m / 60)).padStart(2,'0')}:${String(m % 60).padStart(2,'0')}`;
+  return `${hhmm(start)}-${hhmm(end)}`;
+}
+
+// Build a common set of small time rows from all slot boundaries. Long labs/lectures
+// are then rendered with rowspan, so an 11:30–1:30 lab occupies the 11:30–12:30
+// and 12:30–1:30 rows instead of creating a duplicate 11:30–1:30 row.
+function buildGridSegments(slots){
+  const boundaries = new Set();
+  slots.forEach(s => {
+    boundaries.add(timeToMinutes(s.start_time));
+    boundaries.add(timeToMinutes(s.end_time));
+  });
+  boundaries.add(timeToMinutes(LUNCH_BREAK_START));
+  boundaries.add(timeToMinutes(LUNCH_BREAK_END));
+
+  const sorted = [...boundaries].filter(Number.isFinite).sort((a,b) => a-b);
+  const segments = [];
+  for(let i=0;i<sorted.length-1;i++){
+    const start = sorted[i], end = sorted[i+1];
+    if(end > start) segments.push({start, end, range: minutesToRange(start,end)});
+  }
+  return segments;
+}
+
+function slotForSegment(slots, day, segment, division){
+  return slots.find(s =>
+    s.day_of_week === day &&
+    timeToMinutes(s.start_time) <= segment.start &&
+    timeToMinutes(s.end_time) >= segment.end &&
+    (!division || (s.division || '').split(',').map(x => x.trim()).includes(division))
+  ) || null;
 }
 
 function renderSingleDivisionGrid(table, slots){
@@ -1226,83 +1529,120 @@ function renderSingleDivisionGrid(table, slots){
     table.innerHTML = '<tr><td class="tt-empty-msg">No timetable slot has been created for this semester/division yet.</td></tr>';
     return;
   }
-  const timeSlots = [...new Set(slots.map(s => `${s.start_time}-${s.end_time}`))];
-  if(!timeSlots.includes(LUNCH_BREAK_RANGE)) timeSlots.push(LUNCH_BREAK_RANGE);   // lunch break hamesha grid me dikhega
-  timeSlots.sort();
 
-  let html = '<tr><th class="tt-time-col">Time</th>' + DAY_ORDER.map(d => `<th>${DAY_LABELS[d]}</th>`).join('') + '</tr>';
-  timeSlots.forEach(range => {
-    html += `<tr><td class="tt-time-col">${formatRangeLabel(range)}</td>`;
-    if(range === LUNCH_BREAK_RANGE){
-      html += `<td class="tt-break-cell" colspan="${DAY_ORDER.length}">Lunch Break</td>`;
-    } else {
-      DAY_ORDER.forEach(day => {
-        const match = slots.find(s => `${s.start_time}-${s.end_time}` === range && s.day_of_week === day);
-        html += match ? `<td class="tt-cell">${cellContent(match)}</td>` : `<td class="tt-cell-empty">—</td>`;
-      });
-    }
-    html += '</tr>';
-  });
-  table.innerHTML = html;
-}
+  const days = gridDays(slots);
+  const segments = buildGridSegments(slots);
+  let html = '<tr><th class="tt-time-col">Time</th>' + days.map(d => `<th>${DAY_LABELS[d]}</th>`).join('') + '</tr>';
 
-// Photo-style grid: har Day ke andar A/B/C sub-columns, combined lecture ek merged cell (colspan) me dikhta hai
-function renderCombinedDivisionGrid(table, slots){
-  if(!slots.length){
-    table.innerHTML = '<tr><td class="tt-empty-msg">No timetable slot has been created for this semester yet.</td></tr>';
-    return;
-  }
+  segments.forEach((segment, rowIndex) => {
+    const isLunch = segment.start === timeToMinutes(LUNCH_BREAK_START) && segment.end === timeToMinutes(LUNCH_BREAK_END);
+    html += `<tr><td class="tt-time-col">${formatRangeLabel(segment.range)}</td>`;
 
-  // Is semester me actually jitne divisions use ho rahe hain, sirf wahi columns dikhao (A,B,C me se)
-  const usedDivisions = new Set();
-  slots.forEach(s => (s.division || '').split(',').forEach(d => d && usedDivisions.add(d)));
-  const divisionCols = ['A', 'B', 'C'].filter(d => usedDivisions.has(d));
-  if(!divisionCols.length) divisionCols.push('A', 'B');
-
-  const timeSlots = [...new Set(slots.map(s => `${s.start_time}-${s.end_time}`))];
-  if(!timeSlots.includes(LUNCH_BREAK_RANGE)) timeSlots.push(LUNCH_BREAK_RANGE);   // lunch break hamesha grid me dikhega
-  timeSlots.sort();
-
-  // Header row 1: Time | Monday (colspan=divisionCols.length) | Tuesday ... 
-  let html = '<tr><th class="tt-time-col" rowspan="2">Time</th>' +
-    DAY_ORDER.map(d => `<th colspan="${divisionCols.length}">${DAY_LABELS[d]}</th>`).join('') + '</tr>';
-  // Header row 2: A | B | C  (repeated for har day)
-  html += '<tr>' + DAY_ORDER.map(() => divisionCols.map(d => `<th class="tt-div-subhead">${d}</th>`).join('')).join('') + '</tr>';
-
-  timeSlots.forEach(range => {
-    html += `<tr><td class="tt-time-col">${formatRangeLabel(range)}</td>`;
-
-    if(range === LUNCH_BREAK_RANGE){
-      html += `<td class="tt-break-cell" colspan="${DAY_ORDER.length * divisionCols.length}">Lunch Break</td>`;
-      html += '</tr>';
+    if(isLunch){
+      html += `<td class="tt-break-cell" colspan="${days.length}">Lunch Break</td></tr>`;
       return;
     }
 
-    DAY_ORDER.forEach(day => {
+    days.forEach(day => {
+      const match = slotForSegment(slots, day, segment, null);
+      if(!match){
+        html += '<td class="tt-cell-empty">—</td>';
+        return;
+      }
+
+      const previousSegment = rowIndex > 0 ? segments[rowIndex - 1] : null;
+      const previousMatch = previousSegment && !(previousSegment.start === timeToMinutes(LUNCH_BREAK_START) && previousSegment.end === timeToMinutes(LUNCH_BREAK_END))
+        ? slotForSegment(slots, day, previousSegment, null) : null;
+      if(previousMatch && String(previousMatch.id) === String(match.id)) return;
+
+      let span = 1;
+      for(let j=rowIndex+1;j<segments.length;j++){
+        const next = segments[j];
+        if(next.start === timeToMinutes(LUNCH_BREAK_START) && next.end === timeToMinutes(LUNCH_BREAK_END)) break;
+        const nextMatch = slotForSegment(slots, day, next, null);
+        if(nextMatch && String(nextMatch.id) === String(match.id)) span++;
+        else break;
+      }
+      html += `<td class="tt-cell" rowspan="${span}">${cellContent(match)}</td>`;
+    });
+    html += '</tr>';
+  });
+
+  table.innerHTML = html;
+}
+
+// All-divisions view: each day has A/B columns. A slot assigned to both A and B
+// is horizontally merged; a long slot is vertically merged with rowspan.
+function renderCombinedDivisionGrid(table, slots){
+  if(!slots.length){
+    table.innerHTML = '<tr><td class="tt-empty-msg">No timetable slot has been created for this semester/batch yet.</td></tr>';
+    return;
+  }
+
+  const usedDivisions = new Set();
+  slots.forEach(s => (s.division || '').split(',').map(x => x.trim()).forEach(d => d && usedDivisions.add(d)));
+  const divisionCols = ['A','B'].filter(d => usedDivisions.has(d));
+  if(!divisionCols.length) divisionCols.push('A','B');
+
+  const days = gridDays(slots);
+  const segments = buildGridSegments(slots);
+  let html = '<tr><th class="tt-time-col" rowspan="2">Time</th>' +
+    days.map(d => `<th colspan="${divisionCols.length}">${DAY_LABELS[d]}</th>`).join('') + '</tr>';
+  html += '<tr>' + days.map(() => divisionCols.map(d => `<th class="tt-div-subhead">${d}</th>`).join('')).join('') + '</tr>';
+
+  segments.forEach((segment, rowIndex) => {
+    const isLunch = segment.start === timeToMinutes(LUNCH_BREAK_START) && segment.end === timeToMinutes(LUNCH_BREAK_END);
+    html += `<tr><td class="tt-time-col">${formatRangeLabel(segment.range)}</td>`;
+    if(isLunch){
+      html += `<td class="tt-break-cell" colspan="${days.length * divisionCols.length}">Lunch Break</td></tr>`;
+      return;
+    }
+
+    days.forEach(day => {
       let i = 0;
       while(i < divisionCols.length){
         const div = divisionCols[i];
-        const match = slots.find(s =>
-          `${s.start_time}-${s.end_time}` === range &&
-          s.day_of_week === day &&
-          (s.division || '').split(',').includes(div)
-        );
-
+        const match = slotForSegment(slots, day, segment, div);
         if(!match){
-          html += `<td class="tt-cell-empty">—</td>`;
-          i += 1;
+          html += '<td class="tt-cell-empty">—</td>';
+          i++;
           continue;
         }
 
-        // Ye slot kitne consecutive division-columns cover karta hai, wahi colspan me merge karo
-        const matchDivisions = (match.division || '').split(',');
-        let span = 0;
-        while(i + span < divisionCols.length && matchDivisions.includes(divisionCols[i + span])){
-          span++;
+        // Skip a vertically continued cell; its original row already has the rowspan.
+        const previousSegment = rowIndex > 0 ? segments[rowIndex - 1] : null;
+        const previousMatch = previousSegment && !(previousSegment.start === timeToMinutes(LUNCH_BREAK_START) && previousSegment.end === timeToMinutes(LUNCH_BREAK_END))
+          ? slotForSegment(slots, day, previousSegment, div) : null;
+        if(previousMatch && String(previousMatch.id) === String(match.id)){
+          i++;
+          continue;
         }
-        const cellClass = span > 1 ? 'tt-cell tt-cell-combined' : 'tt-cell';
-        html += `<td class="${cellClass}" colspan="${span}">${cellContent(match)}</td>`;
-        i += span;
+
+        // Merge adjacent division columns when the same timetable record covers them.
+        let colspan = 1;
+        while(i + colspan < divisionCols.length){
+          const nextDiv = divisionCols[i + colspan];
+          const nextMatch = slotForSegment(slots, day, segment, nextDiv);
+          if(nextMatch && String(nextMatch.id) === String(match.id)) colspan++;
+          else break;
+        }
+
+        let rowspan = 1;
+        for(let j=rowIndex+1;j<segments.length;j++){
+          const next = segments[j];
+          if(next.start === timeToMinutes(LUNCH_BREAK_START) && next.end === timeToMinutes(LUNCH_BREAK_END)) break;
+          let same = true;
+          for(let k=0;k<colspan;k++){
+            const nextMatch = slotForSegment(slots, day, next, divisionCols[i+k]);
+            if(!nextMatch || String(nextMatch.id) !== String(match.id)){ same = false; break; }
+          }
+          if(same) rowspan++;
+          else break;
+        }
+
+        const combinedClass = colspan > 1 ? ' tt-cell-combined' : '';
+        html += `<td class="tt-cell${combinedClass}" colspan="${colspan}" rowspan="${rowspan}">${cellContent(match)}</td>`;
+        i += colspan;
       }
     });
     html += '</tr>';
@@ -1312,25 +1652,34 @@ function renderCombinedDivisionGrid(table, slots){
 }
 
 function cellContent(slot){
-  return `<div class="tt-subject">${slot.subject_name || ''}</div>` +
-    `<div class="tt-meta">${slot.faculty_name || ''}${slot.room_no ? ' · ' + slot.room_no : ''}</div>`;
+  return `<div class="tt-subject">${escapeHtml(slot.subject_name || '')}</div>` +
+    `<div class="tt-session">${escapeHtml(slot.session_type || 'Lecture')}</div>` +
+    `<div class="tt-meta">${escapeHtml(slot.faculty_name || '')}${slot.room_no ? ' · ' + escapeHtml(slot.room_no) : ''}</div>`;
 }
-
 
 // ============================================================
 // ATTENDANCE MANAGEMENT
 // ============================================================
 let cachedAttendanceStudents = [];   // marking-view state: [{student_id, enrollment, name, status}]
 
-// Semester ke hisaab se sirf usi semester ke subjects dropdown me dikhao, "All subjects" bhi top pe
-function populateAttendanceSubjects(semester){
-  const sem = parseInt(semester);
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
+// Show only the subjects of that batch/semester in the dropdown, according to both Batch + Semester.
+// "Select subject" always stays as the first (disabled) option — no subject is directly/auto selected.
+function populateAttendanceSubjects(semester, batch){
   const select = document.getElementById('attSubject');
-  const current = select.value;
-  select.innerHTML = '<option value="ALL">All subjects (summary only)</option>' +
-    subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('');
-  if(current && [...select.options].some(o => o.value === current)) select.value = current;
+  if(batch === undefined) batch = document.getElementById('attBatch').value;
+  if(!semester){
+    select.innerHTML = '<option value="" selected disabled>— Select semester first —</option>';
+    return;
+  }
+  if(!batch){
+    select.innerHTML = '<option value="" selected disabled>— Select batch first —</option>';
+    return;
+  }
+  const sem = parseInt(semester);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
+  select.innerHTML = '<option value="" selected disabled>Select subject</option>' +
+    '<option value="ALL">All subjects (summary only)</option>' +
+    subjectsForSem.map(s => `<option value="${s.id}">${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('');
 }
 
 function getSelectedAttendanceDivisions(){
@@ -1355,6 +1704,7 @@ async function loadAttendanceList(){
   const academicYear = document.getElementById('attBatch').value;
   const subjectId = document.getElementById('attSubject').value;
   const date = document.getElementById('attDate').value;
+  const sessionType = document.getElementById('attSessionType').value || 'Lecture';
 
   if(!divisions.length){
     tbody.innerHTML = '<tr><td colspan="6">Select at least one division.</td></tr>';
@@ -1370,15 +1720,15 @@ async function loadAttendanceList(){
   tbody.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
   try{
     cachedAttendanceStudents = await apiRequest(
-      `/admin/attendance?semester=${semester}&divisions=${divisions.join(',')}&academic_year=${academicYear}&subject_id=${subjectId}&date=${date}`
+      `/admin/attendance?semester=${semester}&divisions=${divisions.join(',')}&academic_year=${academicYear}&subject_id=${subjectId}&date=${date}&session_type=${sessionType}`
     );
     renderAttendanceRows();
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="6">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-// Search box ke hisaab se list filter karke dikhata hai (data reload nahi karta, sirf render)
+// Shows the list filtered by the search box (doesn't reload data, only re-renders)
 function renderAttendanceRows(){
   const tbody = document.getElementById('attendanceTableBody');
   const search = (document.getElementById('attSearch').value || '').trim().toLowerCase();
@@ -1397,11 +1747,11 @@ function renderAttendanceRows(){
     const isAbsent = s.status === 'absent';
     return `
       <tr>
-        <td>${s.enrollment}</td>
-        <td>${s.name}</td>
-        <td>${s.semester ?? '-'}</td>
-        <td>${s.division}</td>
-        <td>${s.academic_year || '-'}</td>
+        <td>${escapeHtml(s.enrollment)}</td>
+        <td>${escapeHtml(s.name)}</td>
+        <td>${escapeHtml(s.semester ?? '-')}</td>
+        <td>${escapeHtml(s.division)}</td>
+        <td>${escapeHtml(s.academic_year || '-')}</td>
         <td>
           <div class="att-toggle">
             <button class="att-btn present ${isPresent ? 'active' : ''}" onclick="setAttendanceStatus(${s.student_id}, 'present')">Present</button>
@@ -1413,7 +1763,7 @@ function renderAttendanceRows(){
   }).join('');
 }
 
-// Present/Absent button seedha status set karta hai (toggle nahi) — purani attendance edit karna aasan
+// The Present/Absent button sets the status directly (not a toggle) — it makes editing old attendance easy
 function setAttendanceStatus(studentId, status){
   const student = cachedAttendanceStudents.find(s => s.student_id === studentId);
   if(!student) return;
@@ -1433,6 +1783,7 @@ function markAllPresent(){
 async function saveAttendance(){
   const subjectId = document.getElementById('attSubject').value;
   const date = document.getElementById('attDate').value;
+  const sessionType = document.getElementById('attSessionType').value || 'Lecture';
 
   if(!subjectId || subjectId === 'ALL' || !date){
     alert('Subject and date must be selected');
@@ -1451,7 +1802,7 @@ async function saveAttendance(){
   try{
     await apiRequest('/admin/attendance', {
       method: 'POST',
-      body: JSON.stringify({ subject_id: subjectId, date, records })
+      body: JSON.stringify({ subject_id: subjectId, session_type: sessionType, date, records })
     });
     alert('Attendance saved');
     loadAttendanceSummary();
@@ -1460,40 +1811,51 @@ async function saveAttendance(){
   }
 }
 
-// Har student ka overall attendance % — 75% se kam ho to row red highlight hogi
-async function loadAttendanceSummary(){
+// Overall attendance % of each student — the row is highlighted red if it is below 75%
+let attSummarySnap = '';
+async function loadAttendanceSummary(silent){
+  silent = (silent === true);   // background refresh: na "Loading…" flash, na error se purani table hatani
   const tbody = document.getElementById('attendanceSummaryBody');
   const semester = document.getElementById('attSemester').value;
   const divisions = getSelectedAttendanceDivisions();
   const academicYear = document.getElementById('attBatch').value;
   const subjectId = document.getElementById('attSubject').value || 'ALL';
 
+  if(!semester){
+    tbody.innerHTML = '<tr><td colspan="9">Select a semester to view attendance summary.</td></tr>';
+    return;
+  }
   if(!divisions.length){
     tbody.innerHTML = '<tr><td colspan="9">Select at least one division.</td></tr>';
     return;
   }
 
-  tbody.innerHTML = '<tr><td colspan="9">Loading…</td></tr>';
+  if(!silent) tbody.innerHTML = '<tr><td colspan="9">Loading…</td></tr>';
   try{
+    const reqKey = `${semester}|${divisions.join(',')}|${academicYear}|${subjectId}`;
     const summary = await apiRequest(
       `/admin/attendance/summary?semester=${semester}&divisions=${divisions.join(',')}&academic_year=${academicYear}&subject_id=${subjectId}`
     );
+    const snap = reqKey + '|' + JSON.stringify(summary);
+    if(silent && snap === attSummarySnap) return;   // kuch badla nahi
+    attSummarySnap = snap;
 
+    window._attSummaryStudents = summary;
     tbody.innerHTML = summary.length ? summary.map(s => {
       const total = s.total_classes || 0;
       const present = s.present_classes || 0;
       const pct = total > 0 ? Math.round((present / total) * 100) : null;
       const isLow = pct !== null && pct < 75;
       const calendarCell = subjectId !== 'ALL'
-        ? `<button class="icon-action" onclick="openAttendanceCalendar(${s.student_id}, '${s.name.replace(/'/g, "\\'")}')" title="Calendar dekho">📅</button>`
+        ? `<button class="icon-action" onclick="openAttendanceCalendarById('${s.student_id}')" title="View calendar">📅</button>`
         : `<span style="color:var(--muted); font-size:12px;" title="Select a specific subject to view the calendar">—</span>`;
       return `
         <tr class="${isLow ? 'tt-low-attendance' : ''}">
-          <td>${s.enrollment}</td>
-          <td>${s.name}</td>
-          <td>${s.semester ?? '-'}</td>
-          <td>${s.division}</td>
-          <td>${s.academic_year || '-'}</td>
+          <td>${escapeHtml(s.enrollment)}</td>
+          <td>${escapeHtml(s.name)}</td>
+          <td>${escapeHtml(s.semester ?? '-')}</td>
+          <td>${escapeHtml(s.division)}</td>
+          <td>${escapeHtml(s.academic_year || '-')}</td>
           <td>${total}</td>
           <td>${present}</td>
           <td>${pct !== null ? pct + '%' : '—'}</td>
@@ -1502,7 +1864,8 @@ async function loadAttendanceSummary(){
       `;
     }).join('') : '<tr><td colspan="9">No student was found.</td></tr>';
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="9">Failed to load summary: ${err.message}</td></tr>`;
+    if(silent) return;
+    tbody.innerHTML = `<tr><td colspan="9">Failed to load summary: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -1519,6 +1882,12 @@ function openAttendanceCalendar(studentId, studentName){
   loadAttendanceCalendar();
 }
 
+function openAttendanceCalendarById(studentId){
+  const s = (window._attSummaryStudents || []).find(x => String(x.student_id) === String(studentId));
+  const name = s ? s.name : 'Student';
+  openAttendanceCalendar(studentId, name);
+}
+
 function closeAttendanceCalendar(){
   document.getElementById('attCalendarOverlay').classList.remove('open');
 }
@@ -1530,16 +1899,21 @@ function changeAttendanceCalendarMonth(delta){
   loadAttendanceCalendar();
 }
 
-async function loadAttendanceCalendar(){
+let attCalSnap = '';
+async function loadAttendanceCalendar(silent){
+  silent = (silent === true);
   const grid = document.getElementById('attCalendarGrid');
   const { studentId, year, month } = attCalendarState;
   const subjectId = document.getElementById('attSubject').value || 'ALL';
 
   document.getElementById('attCalendarMonthLabel').textContent = `${MONTH_NAMES[month - 1]} ${year}`;
-  grid.innerHTML = 'Loading…';
+  if(!silent) grid.innerHTML = 'Loading…';
 
   try{
     const records = await apiRequest(`/admin/attendance/calendar?student_id=${studentId}&subject_id=${subjectId}&year=${year}&month=${month}`);
+    const calSnap = `${studentId}|${subjectId}|${year}|${month}|` + JSON.stringify(records);
+    if(silent && calSnap === attCalSnap) return;
+    attCalSnap = calSnap;
     const statusByDate = {};
     records.forEach(r => statusByDate[r.attendance_date] = r.status);
 
@@ -1558,7 +1932,8 @@ async function loadAttendanceCalendar(){
     html += '</div>';
     grid.innerHTML = html;
   }catch(err){
-    grid.innerHTML = `Failed to load: ${err.message}`;
+    if(silent) return;
+    grid.innerHTML = `Failed to load: ${escapeHtml(err.message)}`;
   }
 }
 
@@ -1592,19 +1967,19 @@ async function loadPromoteList(){
       tbody.innerHTML = students.map(s => `
         <tr>
           <td><input type="checkbox" class="promote-check" value="${s.id}" checked></td>
-          <td>${s.enrollment}</td>
-          <td>${s.name}</td>
-          <td>${s.semester}</td>
-          <td>${s.division || '-'}</td>
-          <td>${s.academic_year || '-'}</td>
+          <td>${escapeHtml(s.enrollment)}</td>
+          <td>${escapeHtml(s.name)}</td>
+          <td>${escapeHtml(s.semester)}</td>
+          <td>${escapeHtml(s.division || '-')}</td>
+          <td>${escapeHtml(s.academic_year || '-')}</td>
         </tr>
       `).join('');
     }
     listCard.style.display = 'block';
 
-    // Naye semester ka term (odd/even) agar already kisi date range me set hai
-    // (aaj ki date ke hisaab se), to promote form me wahi pre-fill kar do —
-    // taaki admin galti se overwrite na kar de.
+    // If the term (odd/even) of the new semester is already set within some date range
+    // (according to today's date), pre-fill that in the promote form —
+    // so that the admin doesn't overwrite it by mistake.
     const startEl = document.getElementById('promoteTermStart');
     const endEl = document.getElementById('promoteTermEnd');
     if(sem === '6'){
@@ -1641,7 +2016,7 @@ async function confirmPromote(){
   const termStart = document.getElementById('promoteTermStart').value;
   const termEnd = document.getElementById('promoteTermEnd').value;
 
-  // Sem 6 wale sirf graduate hote hain — unke liye naye term ki date nahi chahiye
+  // Sem 6 students only graduate — no date of a new term is needed for them
   if(currentSem !== '6'){
     if(!termStart || !termEnd){
       alert('Enter both the new semester Term Start Date and End Date — promotion cannot continue without them');
@@ -1665,7 +2040,7 @@ async function confirmPromote(){
     document.getElementById('promoteTermStart').value = '';
     document.getElementById('promoteTermEnd').value = '';
     promoteStudentsCache = [];
-    loadStudents();   // view student list ko turant refresh karo, taaki naya semester turant dikhe
+    loadStudents();   // refresh the student list view right away, so the new semester shows immediately
   }catch(err){
     alert('Error promoting students: ' + err.message);
   }
@@ -1673,23 +2048,126 @@ async function confirmPromote(){
 
 // ---- View switching ----
 function switchView(name){
+  if(name === 'chat') loadMyChatHistory();
+  if(name === 'holidays'){ loadHolidays(); loadCancelledSessions(); }
   document.querySelectorAll('.nav-item').forEach(i=> i.classList.toggle('active', i.dataset.view===name));
   document.querySelectorAll('.nav-sub-item').forEach(i=> i.classList.toggle('active', i.dataset.view===name));
   document.querySelectorAll('.view').forEach(v=> v.classList.toggle('active', v.id==='view-'+name));
-  if(name === 'notices') markAdminNoticesRead();
+  if(name === 'notices'){
+    markAdminNoticesRead();
+    Object.keys(NF_SCROLL_BTN).forEach(id => nfScrollToBottom(id, false));
+  }
 }
 
-// Notices tab khulte hi admin ka 'seen' record ho jaata hai, phir list refresh taaki 👁 count update ho
+// As soon as the Notices tab opens, the admin's 'seen' record is created, then the list is refreshed so the 👁 count updates
 async function markAdminNoticesRead(){
   try{
     await apiRequest('/admin/notices/mark-read', { method: 'POST' });
     loadNotices();
-    // Notice dekh li -> header ke 🔔 notification badge ko bhi turant sync karo,
-    // warna wahan purana unseen count dikhta rehta hai
+    // Once the notice is seen -> also sync the 🔔 notification badge in the header right away,
+    // otherwise it keeps showing the old unseen count
     localStorage.setItem('notifSeenAt', toLocalDbDateTime(new Date()));
     refreshNotifBadge();
   }catch(err){
     // silent fail
+  }
+}
+
+// ============================================================
+// HOLIDAYS — /admin/holidays
+// A holiday is not a "held" class: faculty are not asked for attendance and
+// student percentage is not affected.
+// ============================================================
+function holEsc(v){
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadHolidays(){
+  const tbody = document.getElementById('holidaysTableBody');
+  if(!tbody) return;
+  try{
+    const rows = await apiRequest('/admin/holidays');
+    if(!rows.length){
+      tbody.innerHTML = '<tr><td colspan="4">No holidays added yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(h => {
+      const scope = !h.semester ? 'Whole college'
+        : (h.division ? `Sem ${h.semester} · Div ${holEsc(h.division)}` : `Sem ${h.semester} · All divisions`);
+      return `<tr>
+        <td>${holEsc(h.holiday_date)}</td>
+        <td>${holEsc(h.name)}</td>
+        <td>${scope}</td>
+        <td><button class="btn-ghost" onclick="deleteHoliday(${h.id})">Delete</button></td>
+      </tr>`;
+    }).join('');
+  }catch(err){
+    tbody.innerHTML = `<tr><td colspan="4">Holidays could not be loaded: ${holEsc(err.message)}</td></tr>`;
+  }
+}
+
+async function addHoliday(){
+  const holiday_date = document.getElementById('holDate').value;
+  const name = document.getElementById('holName').value.trim();
+  const semester = document.getElementById('holSemester').value;
+  const division = document.getElementById('holDivision').value.trim().toUpperCase();
+  if(!holiday_date || !name){ alert('Date and holiday name are required.'); return; }
+  try{
+    await apiRequest('/admin/holidays', {
+      method: 'POST',
+      body: JSON.stringify({ holiday_date, name, semester: semester || null, division: division || null })
+    });
+    document.getElementById('holName').value = '';
+    document.getElementById('holDivision').value = '';
+    loadHolidays();
+  }catch(err){
+    alert(err.message);
+  }
+}
+
+async function deleteHoliday(id){
+  if(!confirm('Delete this holiday? Lectures on that day will count as held again.')) return;
+  try{
+    await apiRequest('/admin/holidays/' + id, { method: 'DELETE' });
+    loadHolidays();
+  }catch(err){
+    alert(err.message);
+  }
+}
+
+async function loadCancelledSessions(){
+  const tbody = document.getElementById('cancelledSessionsBody');
+  if(!tbody) return;
+  try{
+    const rows = await apiRequest('/admin/cancelled-sessions');
+    if(!rows.length){
+      tbody.innerHTML = '<tr><td colspan="7">No cancelled lectures.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => `<tr>
+      <td>${holEsc(r.session_date)}</td>
+      <td>${holEsc(r.subject_name)}</td>
+      <td>${holEsc(r.session_type)}</td>
+      <td>Sem ${r.semester} · Div ${holEsc(r.division || 'All')}</td>
+      <td>${holEsc(r.faculty_name)}</td>
+      <td>${holEsc(r.reason)}</td>
+      <td><button class="btn-ghost" data-date="${escapeHtml(r.session_date)}" onclick="adminUncancel(${Number(r.timetable_id)}, this.dataset.date)">Undo</button></td>
+    </tr>`).join('');
+  }catch(err){
+    tbody.innerHTML = `<tr><td colspan="7">Could not be loaded: ${holEsc(err.message)}</td></tr>`;
+  }
+}
+
+async function adminUncancel(timetableId, date){
+  if(!confirm('Undo this cancellation? The lecture will count as held again.')) return;
+  try{
+    await apiRequest('/admin/session-uncancel', {
+      method: 'POST',
+      body: JSON.stringify({ timetable_id: timetableId, date })
+    });
+    loadCancelledSessions();
+  }catch(err){
+    alert(err.message);
   }
 }
 
@@ -1715,6 +2193,7 @@ document.querySelectorAll('.nav-sub-item').forEach(item=>{
   item.addEventListener('click', (e)=>{
     e.stopPropagation();
     switchView(item.dataset.view);
+    if(item.dataset.view === 'chatbot') showChatbotTab(item.dataset.tab || 'faq');
     if(window.innerWidth <= 860) closeSidebar();
 
     // If this sub-item is an "Add" action, open the matching inline form
@@ -1732,13 +2211,269 @@ function toggleForm(id){
   if(form) form.classList.toggle('hidden');
 }
 
-// ---- Chatbot pill tabs (FAQ / Knowledge Base / Chat History) ----
-function setChatbotTab(btn, tab){
-  document.querySelectorAll('.pill-tab').forEach(t => t.classList.remove('active'));
-  btn.classList.add('active');
+// ============================================================
+// AI CHATBOT MANAGEMENT (FAQ / Knowledge Base / Chat History)
+// ============================================================
+let cachedFaqs = [];
+let cachedKb = [];
+let chatHistoryTimer = null;
+
+function showChatbotTab(tab){
+  const tabs = ['faq', 'kb', 'history'];
+  document.querySelectorAll('#view-chatbot .pill-tab').forEach((t, i) => t.classList.toggle('active', tabs[i] === tab));
   document.getElementById('chatbotFaq').classList.toggle('hidden', tab !== 'faq');
   document.getElementById('chatbotKb').classList.toggle('hidden', tab !== 'kb');
   document.getElementById('chatbotHistory').classList.toggle('hidden', tab !== 'history');
+  if(tab === 'faq') loadFaqs();
+  if(tab === 'kb') loadKb();
+  if(tab === 'history') loadChatHistory();
+}
+
+function setChatbotTab(btn, tab){
+  showChatbotTab(tab);
+}
+
+function shortText(str, max){
+  const t = String(str ?? '');
+  return t.length > max ? t.slice(0, max) + '…' : t;
+}
+
+// ---- FAQ ----
+async function loadFaqs(){
+  const tbody = document.getElementById('faqTableBody');
+  tbody.innerHTML = '<tr><td colspan="4">Loading…</td></tr>';
+  try{
+    cachedFaqs = await apiRequest('/admin/chatbot/faqs');
+    renderFaqs();
+  }catch(err){
+    tbody.innerHTML = '<tr><td colspan="4">Failed to load FAQs</td></tr>';
+  }
+}
+
+function renderFaqs(){
+  const tbody = document.getElementById('faqTableBody');
+  const q = document.getElementById('faqSearch').value.trim().toLowerCase();
+  const rows = cachedFaqs.filter(f => !q ||
+    (f.question || '').toLowerCase().includes(q) ||
+    (f.answer || '').toLowerCase().includes(q) ||
+    (f.category || '').toLowerCase().includes(q));
+  if(!rows.length){
+    tbody.innerHTML = '<tr><td colspan="4">No FAQs found.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(f => `
+    <tr>
+      <td>${escapeHtmlMR(f.question)}</td>
+      <td>${escapeHtmlMR(shortText(f.answer, 120))}</td>
+      <td>${escapeHtmlMR(f.category || '-')}</td>
+      <td class="row-actions">
+        <button class="icon-action" onclick="editFaq(${f.id})">✎</button>
+        <button class="icon-action danger" onclick="deleteFaq(${f.id})">🗑</button>
+      </td>
+    </tr>`).join('');
+}
+
+function openFaqForm(){
+  document.getElementById('faqEditId').value = '';
+  document.getElementById('faqQuestion').value = '';
+  document.getElementById('faqAnswer').value = '';
+  document.getElementById('faqCategory').value = '';
+  document.getElementById('faqFormTitle').textContent = 'Add FAQ';
+  document.getElementById('faqForm').classList.remove('hidden');
+  document.getElementById('faqQuestion').focus();
+}
+
+function closeFaqForm(){
+  document.getElementById('faqForm').classList.add('hidden');
+}
+
+function editFaq(id){
+  const f = cachedFaqs.find(x => x.id === id);
+  if(!f) return;
+  document.getElementById('faqEditId').value = f.id;
+  document.getElementById('faqQuestion').value = f.question || '';
+  document.getElementById('faqAnswer').value = f.answer || '';
+  document.getElementById('faqCategory').value = f.category || '';
+  document.getElementById('faqFormTitle').textContent = 'Edit FAQ';
+  document.getElementById('faqForm').classList.remove('hidden');
+  document.getElementById('faqForm').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function saveFaq(){
+  const editId = document.getElementById('faqEditId').value;
+  const payload = {
+    question: document.getElementById('faqQuestion').value.trim(),
+    answer: document.getElementById('faqAnswer').value.trim(),
+    category: document.getElementById('faqCategory').value.trim()
+  };
+  if(!payload.question || !payload.answer){
+    alert('Question and answer are both required');
+    return;
+  }
+  try{
+    if(editId){
+      await apiRequest(`/admin/chatbot/faqs/${editId}`, { method: 'PUT', body: JSON.stringify(payload) });
+    } else {
+      await apiRequest('/admin/chatbot/faqs', { method: 'POST', body: JSON.stringify(payload) });
+    }
+    closeFaqForm();
+    loadFaqs();
+  }catch(err){
+    alert('Error: ' + err.message);
+  }
+}
+
+async function deleteFaq(id){
+  const f = cachedFaqs.find(x => x.id === id);
+  if(!confirm(`Delete this FAQ?\n\n${f ? f.question : ''}`)) return;
+  try{
+    await apiRequest(`/admin/chatbot/faqs/${id}`, { method: 'DELETE' });
+    loadFaqs();
+  }catch(err){
+    alert('Error: ' + err.message);
+  }
+}
+
+// ---- Knowledge base ----
+async function loadKb(){
+  const tbody = document.getElementById('kbTableBody');
+  tbody.innerHTML = '<tr><td colspan="4">Loading…</td></tr>';
+  try{
+    cachedKb = await apiRequest('/admin/chatbot/knowledge');
+    renderKb();
+  }catch(err){
+    tbody.innerHTML = '<tr><td colspan="4">Failed to load knowledge base</td></tr>';
+  }
+}
+
+function renderKb(){
+  const tbody = document.getElementById('kbTableBody');
+  const q = document.getElementById('kbSearch').value.trim().toLowerCase();
+  const rows = cachedKb.filter(k => !q ||
+    (k.title || '').toLowerCase().includes(q) ||
+    (k.content || '').toLowerCase().includes(q));
+  if(!rows.length){
+    tbody.innerHTML = '<tr><td colspan="4">No knowledge entries found.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(k => `
+    <tr>
+      <td>${escapeHtmlMR(k.title)}</td>
+      <td>${escapeHtmlMR(shortText(k.content, 140))}</td>
+      <td>${formatDateTime(k.created_at)}</td>
+      <td class="row-actions">
+        <button class="icon-action" onclick="editKb(${k.id})">✎</button>
+        <button class="icon-action danger" onclick="deleteKb(${k.id})">🗑</button>
+      </td>
+    </tr>`).join('');
+}
+
+function openKbForm(){
+  document.getElementById('kbEditId').value = '';
+  document.getElementById('kbTitle').value = '';
+  document.getElementById('kbContent').value = '';
+  document.getElementById('kbFormTitle').textContent = 'Add knowledge entry';
+  document.getElementById('kbForm').classList.remove('hidden');
+  document.getElementById('kbTitle').focus();
+}
+
+function closeKbForm(){
+  document.getElementById('kbForm').classList.add('hidden');
+}
+
+function editKb(id){
+  const k = cachedKb.find(x => x.id === id);
+  if(!k) return;
+  document.getElementById('kbEditId').value = k.id;
+  document.getElementById('kbTitle').value = k.title || '';
+  document.getElementById('kbContent').value = k.content || '';
+  document.getElementById('kbFormTitle').textContent = 'Edit knowledge entry';
+  document.getElementById('kbForm').classList.remove('hidden');
+  document.getElementById('kbForm').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function saveKb(){
+  const editId = document.getElementById('kbEditId').value;
+  const payload = {
+    title: document.getElementById('kbTitle').value.trim(),
+    content: document.getElementById('kbContent').value.trim()
+  };
+  if(!payload.title || !payload.content){
+    alert('Title and content are both required');
+    return;
+  }
+  try{
+    if(editId){
+      await apiRequest(`/admin/chatbot/knowledge/${editId}`, { method: 'PUT', body: JSON.stringify(payload) });
+    } else {
+      await apiRequest('/admin/chatbot/knowledge', { method: 'POST', body: JSON.stringify(payload) });
+    }
+    closeKbForm();
+    loadKb();
+  }catch(err){
+    alert('Error: ' + err.message);
+  }
+}
+
+async function deleteKb(id){
+  const k = cachedKb.find(x => x.id === id);
+  if(!confirm(`Delete the knowledge entry "${k ? k.title : ''}"?`)) return;
+  try{
+    await apiRequest(`/admin/chatbot/knowledge/${id}`, { method: 'DELETE' });
+    loadKb();
+  }catch(err){
+    alert('Error: ' + err.message);
+  }
+}
+
+// ---- Chat history ----
+function debounceChatHistory(){
+  clearTimeout(chatHistoryTimer);
+  chatHistoryTimer = setTimeout(loadChatHistory, 300);
+}
+
+async function loadChatHistory(){
+  const tbody = document.getElementById('chatHistoryBody');
+  tbody.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
+  const search = document.getElementById('historySearch').value.trim();
+  try{
+    const rows = await apiRequest('/admin/chatbot/history' + (search ? `?search=${encodeURIComponent(search)}` : ''));
+    if(!rows.length){
+      tbody.innerHTML = '<tr><td colspan="6">No chats found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td>${escapeHtmlMR(r.user_name || 'Deleted user')}${r.login_id ? ` <span style="color:var(--muted);font-size:12px;">(${escapeHtmlMR(r.login_id)})</span>` : ''}</td>
+        <td>${escapeHtmlMR(r.role || '-')}</td>
+        <td>${escapeHtmlMR(shortText(r.message, 100))}</td>
+        <td>${escapeHtmlMR(shortText(r.response, 120))}</td>
+        <td>${formatDateTime(r.created_at)}</td>
+        <td class="row-actions"><button class="icon-action danger" onclick="deleteChatHistory(${r.id})">🗑</button></td>
+      </tr>`).join('');
+  }catch(err){
+    tbody.innerHTML = '<tr><td colspan="6">Failed to load chat history</td></tr>';
+  }
+}
+
+async function deleteChatHistory(id){
+  if(!confirm('Delete this chat?')) return;
+  try{
+    await apiRequest(`/admin/chatbot/history/${id}`, { method: 'DELETE' });
+    loadChatHistory();
+  }catch(err){
+    alert('Error: ' + err.message);
+  }
+}
+
+async function clearChatHistory(){
+  if(!confirm('Delete ALL chat history? This cannot be undone.')) return;
+  try{
+    await apiRequest('/admin/chatbot/history', { method: 'DELETE' });
+    loadChatHistory();
+  }catch(err){
+    alert('Error: ' + err.message);
+  }
 }
 
 // ---- Mobile sidebar drawer ----
@@ -1758,7 +2493,7 @@ function toggleDark(){
   document.getElementById('darkBtn').textContent = isDark ? '☀' : '🌙';
   const t = document.getElementById('settingsDarkToggle');
   if(t) t.checked = isDark;
-  localStorage.setItem('darkMode', isDark ? 'true' : 'false');   // refresh/navigate ke baad bhi yaad rahe
+  localStorage.setItem('darkMode', isDark ? 'true' : 'false');   // remember it even after a refresh/navigation
 }
 
 function applyStoredDarkMode(){
@@ -1775,13 +2510,24 @@ function applyStoredDarkMode(){
 // ============================================================
 let cachedNotes = [];
 
-function populateNoteSubjects(semester){
-  const sem = parseInt(semester);
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
+function populateNoteSubjects(semester, selectedSubjectId){
   const select = document.getElementById('noteSubject');
   if(!select) return;
-  select.innerHTML = subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('')
-    || '<option value="">There are no subjects for this semester</option>';
+  const batch = document.getElementById('noteBatch') ? document.getElementById('noteBatch').value : '';
+  if(!semester){
+    select.innerHTML = '<option value="">— Select semester first —</option>';
+    return;
+  }
+  if(!batch){
+    select.innerHTML = '<option value="">— Select batch first —</option>';
+    return;
+  }
+  const sem = parseInt(semester);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
+  const placeholder = `<option value="" ${selectedSubjectId ? '' : 'selected disabled'}>Select subject</option>`;
+  select.innerHTML = subjectsForSem.length
+    ? placeholder + subjectsForSem.map(s => `<option value="${s.id}" ${String(s.id)===String(selectedSubjectId)?'selected':''}>${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('')
+    : '<option value="" selected disabled>There are no subjects for this batch/semester</option>';
 }
 
 function populateNoteFilterSubjects(semester){
@@ -1794,7 +2540,7 @@ function populateNoteFilterSubjects(semester){
     subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
   }
   select.innerHTML = '<option value="ALL">All subjects</option>' +
-    subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('');
+    subjectsForSem.map(s => `<option value="${s.id}">${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('');
   if(current && [...select.options].some(o => o.value === current)) select.value = current;
 }
 
@@ -1813,10 +2559,10 @@ function openAddNoteForm(){
 function resetNoteForm(){
   document.getElementById('noteEditId').value = '';
   document.getElementById('noteTitle').value = '';
-  document.getElementById('noteSemester').value = '1';
-  populateNoteSubjects('1');
+  document.getElementById('noteSemester').value = '';
   document.getElementById('noteDivision').value = '';
-  document.getElementById('noteBatch').value = '2024-25';
+  document.getElementById('noteBatch').value = '';   // it will stay on the "Select batch" placeholder
+  populateNoteSubjects('');
   document.getElementById('noteDescription').value = '';
   const fileInput = document.getElementById('noteFile');
   if(fileInput) fileInput.value = '';
@@ -1830,13 +2576,12 @@ function editNote(note){
   document.getElementById('noteEditId').value = note.id;
   document.getElementById('noteTitle').value = note.title;
   document.getElementById('noteSemester').value = note.semester;
-  populateNoteSubjects(note.semester);
-  document.getElementById('noteSubject').value = note.subject_id || '';
   document.getElementById('noteDivision').value = note.division || '';
-  document.getElementById('noteBatch').value = note.academic_year || '2024-25';
+  document.getElementById('noteBatch').value = note.academic_year || '';
+  populateNoteSubjects(note.semester, note.subject_id);
   document.getElementById('noteDescription').value = note.description || '';
   document.getElementById('notesFormTitle').textContent = 'Edit note details';
-  document.getElementById('noteFileField').style.display = 'none';   // edit sirf details ka hota hai, file replace nahi
+  document.getElementById('noteFileField').style.display = 'none';   // editing changes only the details, the file is not replaced
   document.getElementById('notesForm').classList.remove('hidden');
 }
 
@@ -1920,24 +2665,37 @@ async function loadNotes(){
 
     tbody.innerHTML = cachedNotes.length ? cachedNotes.map(n => `
       <tr>
-        <td>${fileIcon(n.file_type)} ${n.title}</td>
-        <td>${n.subject_name || '-'}</td>
-        <td>${n.semester}</td>
-        <td>${n.division || 'All'}</td>
-        <td>${n.academic_year || '-'}</td>
-        <td>${n.file_name}</td>
-        <td>${formatFileSize(n.file_size)}</td>
-        <td>${new Date(n.uploaded_at).toLocaleDateString('en-IN')}</td>
+        <td>${fileIcon(n.file_type)} ${escapeHtml(n.title)}</td>
+        <td>${escapeHtml(n.subject_name || '-')}</td>
+        <td>${escapeHtml(n.semester)}</td>
+        <td>${escapeHtml(n.division || 'All')}</td>
+        <td>${escapeHtml(n.academic_year || '-')}</td>
+        <td>${escapeHtml(n.file_name)}</td>
+        <td>${escapeHtml(formatFileSize(n.file_size))}</td>
+        <td>${escapeHtml(new Date(n.uploaded_at).toLocaleDateString('en-IN'))}</td>
         <td class="row-actions">
-          <button class="icon-action" onclick="downloadNote(${n.id}, '${n.file_name.replace(/'/g, "\\'")}')" title="Download">⬇</button>
-          <button class="icon-action" onclick='editNote(${JSON.stringify(n)})' title="Edit">✎</button>
-          <button class="icon-action danger" onclick="deleteNote(${n.id}, '${n.title.replace(/'/g, "\\'")}')" title="Delete">🗑</button>
+          <button class="icon-action" onclick="downloadNoteById('${n.id}')" title="Download">⬇</button>
+          <button class="icon-action" onclick="editNoteById('${n.id}')" title="Edit">✎</button>
+          <button class="icon-action danger" onclick="deleteNoteById('${n.id}')" title="Delete">🗑</button>
         </td>
       </tr>
     `).join('') : '<tr><td colspan="9">No notes were found.</td></tr>';
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="9">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
+}
+
+function downloadNoteById(id){
+  const n = (cachedNotes || []).find(x => String(x.id) === String(id));
+  if(n) downloadNote(n.id, n.file_name);
+}
+function editNoteById(id){
+  const n = (cachedNotes || []).find(x => String(x.id) === String(id));
+  if(n) editNote(n);
+}
+function deleteNoteById(id){
+  const n = (cachedNotes || []).find(x => String(x.id) === String(id));
+  if(n) deleteNote(n.id, n.title);
 }
 
 async function deleteNote(id, title){
@@ -1953,7 +2711,7 @@ async function deleteNote(id, title){
 async function downloadNote(id, fileName){
   try{
     const res = await fetch(API_BASE + `/admin/notes/${id}/download`, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_admin') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin') }
     });
     if(!res.ok){
       alert('Download failed');
@@ -1979,13 +2737,24 @@ async function downloadNote(id, fileName){
 // ============================================================
 let cachedAssignments = [];
 
-function populateAssignmentSubjects(semester){
-  const sem = parseInt(semester);
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
+function populateAssignmentSubjects(semester, selectedSubjectId){
   const select = document.getElementById('assignSubject');
   if(!select) return;
-  select.innerHTML = subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('')
-    || '<option value="">There are no subjects for this semester</option>';
+  const batch = document.getElementById('assignBatch') ? document.getElementById('assignBatch').value : '';
+  if(!semester){
+    select.innerHTML = '<option value="">— Select semester first —</option>';
+    return;
+  }
+  if(!batch){
+    select.innerHTML = '<option value="">— Select batch first —</option>';
+    return;
+  }
+  const sem = parseInt(semester);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
+  const placeholder = `<option value="" ${selectedSubjectId ? '' : 'selected disabled'}>Select subject</option>`;
+  select.innerHTML = subjectsForSem.length
+    ? placeholder + subjectsForSem.map(s => `<option value="${s.id}" ${String(s.id)===String(selectedSubjectId)?'selected':''}>${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('')
+    : '<option value="" selected disabled>There are no subjects for this batch/semester</option>';
 }
 
 function populateAssignmentFilterSubjects(semester){
@@ -1998,7 +2767,7 @@ function populateAssignmentFilterSubjects(semester){
     subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
   }
   select.innerHTML = '<option value="ALL">All subjects</option>' +
-    subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('');
+    subjectsForSem.map(s => `<option value="${s.id}">${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('');
   if(current && [...select.options].some(o => o.value === current)) select.value = current;
 }
 
@@ -2017,10 +2786,10 @@ function openAddAssignmentForm(){
 function resetAssignmentForm(){
   document.getElementById('assignEditId').value = '';
   document.getElementById('assignTitle').value = '';
-  document.getElementById('assignSemester').value = '1';
-  populateAssignmentSubjects('1');
+  document.getElementById('assignSemester').value = '';
   document.getElementById('assignDivision').value = '';
-  document.getElementById('assignBatch').value = '2024-25';
+  document.getElementById('assignBatch').value = '';   // it will stay on the "Select batch" placeholder
+  populateAssignmentSubjects('');
   document.getElementById('assignDueDate').value = '';
   document.getElementById('assignDescription').value = '';
   const fileInput = document.getElementById('assignFile');
@@ -2035,14 +2804,13 @@ function editAssignment(a){
   document.getElementById('assignEditId').value = a.id;
   document.getElementById('assignTitle').value = a.title;
   document.getElementById('assignSemester').value = a.semester;
-  populateAssignmentSubjects(a.semester);
-  document.getElementById('assignSubject').value = a.subject_id || '';
   document.getElementById('assignDivision').value = a.division || '';
-  document.getElementById('assignBatch').value = a.academic_year || '2024-25';
+  document.getElementById('assignBatch').value = a.academic_year || '';
+  populateAssignmentSubjects(a.semester, a.subject_id);
   document.getElementById('assignDueDate').value = a.due_date ? a.due_date.split('T')[0] : '';
   document.getElementById('assignDescription').value = a.description || '';
   document.getElementById('assignFormTitle').textContent = 'Edit assignment details';
-  document.getElementById('assignFileField').style.display = 'none';   // edit sirf details ka hota hai, attachment replace nahi hoti
+  document.getElementById('assignFileField').style.display = 'none';   // editing changes only the details, the attachment is not replaced
   document.getElementById('assignForm').classList.remove('hidden');
 }
 
@@ -2096,7 +2864,7 @@ function isOverdue(dueDate){
   if(!dueDate) return false;
   const due = new Date(dueDate);
   const today = new Date();
-  due.setHours(0, 0, 0, 0);      // sirf date compare karo, time ka farak ignore karo
+  due.setHours(0, 0, 0, 0);      // compare only the date, ignore the difference in time
   today.setHours(0, 0, 0, 0);
   return due < today;
 }
@@ -2125,24 +2893,41 @@ async function loadAssignments(){
       const dueLabel = a.due_date ? new Date(a.due_date).toLocaleDateString('en-IN') : '-';
       return `
         <tr class="${overdue ? 'tt-low-attendance' : ''}">
-          <td>${a.title}${a.file_name ? ` <span title="${a.file_name}">📎</span>` : ''}</td>
-          <td>${a.subject_name || '-'}</td>
-          <td>${a.semester}</td>
-          <td>${a.division || 'All'}</td>
-          <td>${a.academic_year || '-'}</td>
-          <td>${dueLabel}${overdue ? ' ⚠' : ''}</td>
-          <td><button class="pill warn" onclick="openAssignmentSubmissions(${a.id}, '${a.title.replace(/'/g, "\\'")}')">${a.submission_count} submitted</button></td>
+          <td>${escapeHtml(a.title)}${a.file_name ? ` <span title="${escapeHtml(a.file_name)}">📎</span>` : ''}</td>
+          <td>${escapeHtml(a.subject_name || '-')}</td>
+          <td>${escapeHtml(a.semester)}</td>
+          <td>${escapeHtml(a.division || 'All')}</td>
+          <td>${escapeHtml(a.academic_year || '-')}</td>
+          <td>${escapeHtml(dueLabel)}${overdue ? ' ⚠' : ''}</td>
+          <td><button class="pill warn" onclick="openAssignmentSubmissionsById('${a.id}')">${escapeHtml(a.submission_count)} submitted</button></td>
           <td class="row-actions">
-            ${a.file_name ? `<button class="icon-action" onclick="downloadAssignmentFile(${a.id}, '${a.file_name.replace(/'/g, "\\'")}')" title="Download attachment">⬇</button>` : ''}
-            <button class="icon-action" onclick='editAssignment(${JSON.stringify(a)})' title="Edit">✎</button>
-            <button class="icon-action danger" onclick="deleteAssignment(${a.id}, '${a.title.replace(/'/g, "\\'")}')" title="Delete">🗑</button>
+            ${a.file_name ? `<button class="icon-action" onclick="downloadAssignmentFileById('${a.id}')" title="Download attachment">⬇</button>` : ''}
+            <button class="icon-action" onclick="editAssignmentById('${a.id}')" title="Edit">✎</button>
+            <button class="icon-action danger" onclick="deleteAssignmentById('${a.id}')" title="Delete">🗑</button>
           </td>
         </tr>
       `;
     }).join('') : '<tr><td colspan="8">No assignments were found.</td></tr>';
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="8">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
+}
+
+function openAssignmentSubmissionsById(id){
+  const a = (cachedAssignments || []).find(x => String(x.id) === String(id));
+  if(a) openAssignmentSubmissions(a.id, a.title);
+}
+function downloadAssignmentFileById(id){
+  const a = (cachedAssignments || []).find(x => String(x.id) === String(id));
+  if(a) downloadAssignmentFile(a.id, a.file_name);
+}
+function editAssignmentById(id){
+  const a = (cachedAssignments || []).find(x => String(x.id) === String(id));
+  if(a) editAssignment(a);
+}
+function deleteAssignmentById(id){
+  const a = (cachedAssignments || []).find(x => String(x.id) === String(id));
+  if(a) deleteAssignment(a.id, a.title);
 }
 
 async function deleteAssignment(id, title){
@@ -2158,7 +2943,7 @@ async function deleteAssignment(id, title){
 async function downloadAssignmentFile(id, fileName){
   try{
     const res = await fetch(API_BASE + `/admin/assignments/${id}/download`, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_admin') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin') }
     });
     if(!res.ok){
       alert('Download failed');
@@ -2181,7 +2966,7 @@ async function downloadAssignmentFile(id, fileName){
 // ---- Assignment Submissions modal ----
 let currentSubmissionsAssignmentId = null;
 let cachedSubmissions = [];
-let editingSubmissionStudentId = null;   // abhi kis student ki row edit mode me hai
+let editingSubmissionStudentId = null;   // which student's row is currently in edit mode
 
 async function openAssignmentSubmissions(assignmentId, title){
   currentSubmissionsAssignmentId = assignmentId;
@@ -2213,12 +2998,12 @@ async function loadAssignmentSubmissions(){
     cachedSubmissions = await apiRequest(`/admin/assignments/${currentSubmissionsAssignmentId}/submissions`);
     renderAssignmentSubmissions();
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="6">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-// Read-only rows + jo student edit mode me hai uske liye editable row — Student panel me yahi data
-// sirf READ-ONLY dikhega (wahan koi edit button nahi hoga), edit sirf Admin/Faculty panel me hi hai.
+// Read-only rows + an editable row for the student who is in edit mode — in the Student panel this same data
+// will show READ-ONLY (there will be no edit button there), editing exists only in the Admin/Faculty panel.
 function renderAssignmentSubmissions(){
   const tbody = document.getElementById('assignSubmissionsBody');
 
@@ -2231,7 +3016,7 @@ function renderAssignmentSubmissions(){
   const search = (document.getElementById('submissionSearch').value || '').trim().toLowerCase();
 
   const filtered = cachedSubmissions.filter(r => {
-    // Jo row abhi edit ho rahi hai wo filter se hide nahi honi chahiye, warna editing beech me tut jayegi
+    // The row that is currently being edited must not be hidden by the filter, otherwise the editing will break midway
     if(editingSubmissionStudentId === r.student_id) return true;
     if(statusFilter && getSubmissionStatus(r).key !== statusFilter) return false;
     if(search && !r.name.toLowerCase().includes(search) && !String(r.enrollment).toLowerCase().includes(search)) return false;
@@ -2248,8 +3033,8 @@ function renderAssignmentSubmissions(){
       const status = getSubmissionStatus(r);
       return `
         <tr>
-          <td>${r.enrollment}</td>
-          <td>${r.name}</td>
+          <td>${escapeHtml(r.enrollment)}</td>
+          <td>${escapeHtml(r.name)}</td>
           <td>
             <select id="editStatus_${r.student_id}" onchange="onEditStatusChange(${r.student_id})" style="padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);">
               <option value="pending" ${status.key==='pending'?'selected':''}>Pending</option>
@@ -2257,8 +3042,8 @@ function renderAssignmentSubmissions(){
               <option value="late" ${status.key==='late'?'selected':''}>Late</option>
             </select>
           </td>
-          <td><input type="date" id="editDate_${r.student_id}" value="${r.submitted_at || ''}" ${status.key==='pending'?'disabled':''} style="padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);"></td>
-          <td><input type="number" min="0" id="editMarks_${r.student_id}" value="${r.marks_obtained ?? ''}" ${status.key==='pending'?'disabled':''} style="width:60px; padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);"></td>
+          <td><input type="date" id="editDate_${r.student_id}" value="${escapeHtml(r.submitted_at || '')}" ${status.key==='pending'?'disabled':''} style="padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);"></td>
+          <td><input type="number" min="0" id="editMarks_${r.student_id}" value="${escapeHtml(r.marks_obtained ?? '')}" ${status.key==='pending'?'disabled':''} style="width:60px; padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);"></td>
           <td class="row-actions">
             <button class="icon-action" onclick="saveSubmissionEdit(${r.student_id})" title="Save">✓</button>
             <button class="icon-action" onclick="cancelSubmissionEdit()" title="Cancel">✕</button>
@@ -2271,11 +3056,11 @@ function renderAssignmentSubmissions(){
     const submitted = !!r.submission_id;
     return `
       <tr>
-        <td>${r.enrollment}</td>
-        <td>${r.name}</td>
+        <td>${escapeHtml(r.enrollment)}</td>
+        <td>${escapeHtml(r.name)}</td>
         <td><span class="pill ${status.cls}">${status.label}</span></td>
-        <td>${submitted ? new Date(r.submitted_at).toLocaleDateString('en-IN') : '-'}</td>
-        <td>${submitted ? (r.marks_obtained ?? '-') : '-'}</td>
+        <td>${submitted ? escapeHtml(new Date(r.submitted_at).toLocaleDateString('en-IN')) : '-'}</td>
+        <td>${submitted ? escapeHtml(r.marks_obtained ?? '-') : '-'}</td>
         <td class="row-actions">
           <button class="icon-action" onclick="startSubmissionEdit(${r.student_id})" title="Edit">✎</button>
         </td>
@@ -2294,7 +3079,7 @@ function cancelSubmissionEdit(){
   renderAssignmentSubmissions();
 }
 
-// Status "Pending" par set kare to Date/Marks fields disable ho jayein (unka koi matlab nahi rehta)
+// If the Status is set to "Pending", disable the Date/Marks fields (they have no meaning then)
 function onEditStatusChange(studentId){
   const status = document.getElementById(`editStatus_${studentId}`).value;
   const isPending = status === 'pending';
@@ -2320,7 +3105,7 @@ async function saveSubmissionEdit(studentId){
     });
     editingSubmissionStudentId = null;
     await loadAssignmentSubmissions();
-    loadAssignments();   // list ka "X submitted" badge bhi refresh ho jaye
+    loadAssignments();   // also refresh the "X submitted" badge of the list
   }catch(err){
     alert('Error: ' + err.message);
   }
@@ -2330,17 +3115,25 @@ async function saveSubmissionEdit(studentId){
 // MARKS MANAGEMENT
 // ============================================================
 let cachedMarksStudents = [];
-const PASS_PERCENT = 40;   // yahan se passing % change kar sakte ho
+const PASS_PERCENT = 40;   // you can change the passing % from here
 
 function populateMarksSubjects(semester){
-  const sem = parseInt(semester);
-  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem);
   const select = document.getElementById('marksSubject');
   if(!select) return;
-  const current = select.value;
-  select.innerHTML = subjectsForSem.map(s => `<option value="${s.id}">${s.subject_name} (${s.subject_code})</option>`).join('')
-    || '<option value="">There are no subjects for this semester</option>';
-  if(current && [...select.options].some(o => o.value === current)) select.value = current;
+  const batch = document.getElementById('marksBatch') ? document.getElementById('marksBatch').value : '';
+  if(!semester){
+    select.innerHTML = '<option value="" selected disabled>— Select semester first —</option>';
+    return;
+  }
+  if(!batch){
+    select.innerHTML = '<option value="" selected disabled>— Select batch first —</option>';
+    return;
+  }
+  const sem = parseInt(semester);
+  const subjectsForSem = cachedSubjects.filter(s => parseInt(s.semester) === sem && s.academic_year === batch);
+  select.innerHTML = subjectsForSem.length
+    ? '<option value="" selected disabled>Select subject</option>' + subjectsForSem.map(s => `<option value="${s.id}">${escapeHtml(s.subject_name)} (${escapeHtml(s.subject_code)})</option>`).join('')
+    : '<option value="" selected disabled>There are no subjects for this batch/semester</option>';
 }
 
 function onMarksFilterChange(){
@@ -2348,8 +3141,8 @@ function onMarksFilterChange(){
   loadMarksClass();
 }
 
-// Max marks badalne par poori list reload nahi karni — sirf already type kiye hue marks ka Pass/Fail
-// naye max marks ke hisaab se recalculate karo, taaki unsaved values reset na hon
+// When max marks change, don't reload the whole list — only recalculate the Pass/Fail of the marks
+// already typed according to the new max marks, so that unsaved values don't get reset
 function onMaxMarksChange(){
   cachedMarksStudents.forEach(s => {
     if(document.getElementById(`marksInput_${s.student_id}`)) updateMarksRowStatus(s.student_id);
@@ -2379,11 +3172,11 @@ async function loadMarksClass(){
     );
     renderMarksTable();
   }catch(err){
-    tbody.innerHTML = `<tr><td colspan="7">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-// DOM me agar input already hai to uski live value lo (taaki search/filter se unsaved typing reset na ho), warna cached value
+// If the input already exists in the DOM, take its live value (so that unsaved typing isn't reset by search/filter), otherwise the cached value
 function getCurrentMarksValue(studentId, cachedValue){
   const el = document.getElementById(`marksInput_${studentId}`);
   return el ? el.value : (cachedValue ?? '');
@@ -2416,11 +3209,11 @@ function renderMarksTable(){
     const currentVal = getCurrentMarksValue(s.student_id, s.marks_obtained);
     return `
     <tr>
-      <td>${s.enrollment}</td>
-      <td>${s.name}</td>
-      <td>${s.semester ?? '-'}</td>
-      <td>${s.division || '-'}</td>
-      <td>${s.academic_year || '-'}</td>
+      <td>${escapeHtml(s.enrollment)}</td>
+      <td>${escapeHtml(s.name)}</td>
+      <td>${escapeHtml(s.semester ?? '-')}</td>
+      <td>${escapeHtml(s.division || '-')}</td>
+      <td>${escapeHtml(s.academic_year || '-')}</td>
       <td>
         <input type="number" min="0" max="${maxMarks}" step="0.5" id="marksInput_${s.student_id}"
                value="${currentVal}" placeholder="/${maxMarks}"
@@ -2444,7 +3237,7 @@ function marksStatusPill(marks, maxMarks){
     : `<span class="pill good">Pass</span>`;
 }
 
-// Marks type karte hi turant us row ka Pass/Fail pill update karo (bina save kiye bhi live dikhe)
+// As soon as marks are typed, update that row's Pass/Fail pill right away (it shows live even without saving)
 function updateMarksRowStatus(studentId){
   const maxMarks = parseFloat(document.getElementById('marksMaxMarks').value) || 0;
   const val = document.getElementById(`marksInput_${studentId}`).value;
@@ -2452,7 +3245,7 @@ function updateMarksRowStatus(studentId){
   updateMarksSummary();
 }
 
-// Class ka Average / Highest / Lowest — abhi jo bhi input boxes me values hain, unse live calculate hota hai
+// The class Average / Highest / Lowest — calculated live from whatever values are currently in the input boxes
 function updateMarksSummary(){
   const line = document.getElementById('marksSummaryLine');
   if(!line) return;
@@ -2476,7 +3269,7 @@ function updateMarksSummary(){
   line.textContent = `Average: ${avg} · Highest: ${max} · Lowest: ${min} · Entries: ${values.length}/${cachedMarksStudents.length}`;
 }
 
-// Publish badge — sirf tabhi "Published" dikhega jab sab entered-marks records published ho chuke hon
+// Publish badge — shows "Published" only when all entered-marks records have been published
 function updatePublishBadge(){
   const badge = document.getElementById('marksPublishBadge');
   const btn = document.getElementById('marksPublishBtn');
@@ -2582,7 +3375,7 @@ function resetFeeForm(){
   document.getElementById('feeTitle').value = '';
   document.getElementById('feeAmount').value = '';
   document.getElementById('feeDueDate').value = '';
-  document.getElementById('feeSemester').value = '1';
+  document.getElementById('feeSemester').value = '';
   document.getElementById('feeDivision').value = '';
   document.getElementById('feeBatch').value = '';
   document.getElementById('feePaymentLink').value = '';
@@ -2612,7 +3405,7 @@ async function populateFeeStudents(){
   try{
     cachedFeeStudents = await apiRequest('/admin/fees/students?' + params.toString());
     sel.innerHTML = cachedFeeStudents.length
-      ? cachedFeeStudents.map(s => `<option value="${s.student_id}">${s.name} (${s.enrollment})</option>`).join('')
+      ? cachedFeeStudents.map(s => `<option value="${s.student_id}">${escapeHtml(s.name)} (${escapeHtml(s.enrollment)})</option>`).join('')
       : '<option value="">No students found</option>';
   }catch(err){
     sel.innerHTML = `<option value="">Failed to load students</option>`;
@@ -2646,7 +3439,7 @@ async function loadFees(){
   try{
     allFees = await apiRequest('/admin/fees?' + params.toString());
     renderFeeFolders();
-    // Agar koi folder/sub-folder pehle se khula hua tha, use naye data ke saath refresh karo.
+    // If any folder/sub-folder was already open, refresh it with the new data.
     if(openFeeFolderKey){
       const stillHasFolder = allFees.some(f => feeFolderKey(f) === openFeeFolderKey);
       if(!stillHasFolder){
@@ -2659,7 +3452,7 @@ async function loadFees(){
       }
     }
   }catch(err){
-    if(grid) grid.innerHTML = `<div style="color:var(--muted); font-size:13px;">Failed to load fees: ${err.message}</div>`;
+    if(grid) grid.innerHTML = `<div style="color:var(--muted); font-size:13px;">Failed to load fees: ${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -2694,11 +3487,11 @@ function renderFeeFolders(){
     const unpaidCount = g.records.length - paidCount;
     const total = g.records.reduce((sum, r) => sum + Number(r.amount || 0), 0);
     return `
-      <div class="fee-folder-card" onclick="openFeeFolder('${key}')">
+      <div class="fee-folder-card" data-key="${escapeHtml(key)}" onclick="openFeeFolder(this.dataset.key)">
         <button class="icon-action danger fee-folder-delete" title="Delete folder"
-          onclick="deleteFeeFolder('${key}', event)">🗑</button>
+          data-key="${escapeHtml(key)}" onclick="deleteFeeFolder(this.dataset.key, event)">🗑</button>
         <div class="fee-folder-icon">📁</div>
-        <div class="fee-folder-name">Sem ${g.semester} • Div ${g.division} • ${g.academic_year}</div>
+        <div class="fee-folder-name">Sem ${escapeHtml(g.semester)} • Div ${escapeHtml(g.division)} • ${escapeHtml(g.academic_year)}</div>
         <div class="fee-folder-meta">${g.records.length} record${g.records.length === 1 ? '' : 's'} · ₹${total.toLocaleString('en-IN')}</div>
         <div class="fee-folder-stats">
           <span class="pill good">${paidCount} Paid</span>
@@ -2709,7 +3502,7 @@ function renderFeeFolders(){
   }).join('');
 }
 
-// Poore folder (Sem + Div + Batch group) ke saare fee records — sab titles milaake — ek saath delete karta hai.
+// Deletes all fee records of the whole folder (Sem + Div + Batch group) — across all titles — in one go.
 async function deleteFeeFolder(key, event){
   if(event) event.stopPropagation();
 
@@ -2732,8 +3525,8 @@ async function deleteFeeFolder(key, event){
   }
 }
 
-// Batch folder khulne par seedha records nahi, pehle us batch ke andar fee-title ke hisaab se
-// sub-folders dikhaata hai (e.g. "Tuition Fee", "Exam Fee" — har title ka apna alag folder).
+// When a Batch folder is opened, instead of records directly, it first shows sub-folders inside that batch
+// by fee title (e.g. "Tuition Fee", "Exam Fee" — each title has its own separate folder).
 function openFeeFolder(key){
   openFeeFolderKey = key;
   openFeeTitleKey = null;
@@ -2779,7 +3572,7 @@ function renderFeeTitleFolders(key){
         <button class="icon-action danger fee-folder-delete" title="Delete this folder"
           onclick="deleteFeeTitleFolder('${openFeeFolderKey}', '${safeTitle}', event)">🗑</button>
         <div class="fee-folder-icon">📁</div>
-        <div class="fee-folder-name">${title}</div>
+        <div class="fee-folder-name">${escapeHtml(title)}</div>
         <div class="fee-folder-meta">${recs.length} record${recs.length === 1 ? '' : 's'} · ₹${total.toLocaleString('en-IN')}</div>
         <div class="fee-folder-stats">
           <span class="pill good">${paidCount} Paid</span>
@@ -2790,8 +3583,8 @@ function renderFeeTitleFolders(key){
   }).join('');
 }
 
-// Us batch ke andar ek fee-title (sub-folder) ke saare records ek saath delete karta hai —
-// baaki titles ke records touch nahi hote.
+// Deletes all records of one fee-title (sub-folder) inside that batch in one go —
+// the records of the other titles are not touched.
 async function deleteFeeTitleFolder(key, title, event){
   if(event) event.stopPropagation();
   if(!key || !title) return;
@@ -2814,8 +3607,8 @@ async function deleteFeeTitleFolder(key, title, event){
   }
 }
 
-// Sub-folder khulne par asli student-wise records table dikhta hai (existing behavior, bas ab
-// fee_title se bhi filter hota hai).
+// When a sub-folder is opened, the actual student-wise records table shows (existing behavior, just that it is now
+// also filtered by fee_title).
 function openFeeTitleFolder(title){
   openFeeTitleKey = title;
   const records = allFees.filter(f => feeFolderKey(f) === openFeeFolderKey && f.fee_title === title);
@@ -2827,19 +3620,20 @@ function openFeeTitleFolder(title){
     : title;
   document.getElementById('feesFolderTitle').textContent = heading;
 
+  window._feesCache = new Map(records.map(f => [String(f.id), f]));
   tbody.innerHTML = records.length ? records.map(f => `
       <tr>
-        <td>${f.student_name} (${f.enrollment})</td>
-        <td>${f.fee_title}</td>
+        <td>${escapeHtml(f.student_name)} (${escapeHtml(f.enrollment)})</td>
+        <td>${escapeHtml(f.fee_title)}</td>
         <td>₹${Number(f.amount).toLocaleString('en-IN')}</td>
-        <td>${f.due_date || '-'}</td>
-        <td>${f.payment_link ? `<a href="${f.payment_link}" target="_blank" class="card-link">View link</a>` : '-'}</td>
+        <td>${escapeHtml(f.due_date || '-')}</td>
+        <td>${f.payment_link ? `<a href="${escapeHtml(f.payment_link)}" target="_blank" rel="noopener" class="card-link">View link</a>` : '-'}</td>
         <td><span class="pill ${f.status === 'paid' ? 'good' : 'bad'}" style="cursor:pointer"
-              onclick="toggleFeeStatus(${f.id}, '${f.status}')">${f.status === 'paid' ? 'Paid' : 'Unpaid'}</span></td>
+              onclick="toggleFeeStatus(${f.id}, '${escapeHtml(f.status)}')">${f.status === 'paid' ? 'Paid' : 'Unpaid'}</span></td>
         <td class="row-actions">
-          <button class="icon-action" onclick='viewFeeDetails(${JSON.stringify(f)})' title="View">👁</button>
-          <button class="icon-action" onclick='editFee(${JSON.stringify(f)})' title="Edit">✎</button>
-          <button class="icon-action danger" onclick="deleteFee(${f.id}, '${f.fee_title}')" title="Delete">🗑</button>
+          <button class="icon-action" onclick="viewFeeDetailsById('${f.id}')" title="View">👁</button>
+          <button class="icon-action" onclick="editFeeById('${f.id}')" title="Edit">✎</button>
+          <button class="icon-action danger" onclick="deleteFeeById('${f.id}')" title="Delete">🗑</button>
         </td>
       </tr>
     `).join('') : '<tr><td colspan="7">No fee records found.</td></tr>';
@@ -2848,7 +3642,20 @@ function openFeeTitleFolder(title){
   document.getElementById('feesRecordsView').classList.remove('hidden');
 }
 
-// Records table se wapas title-sub-folder grid par.
+function viewFeeDetailsById(id){
+  const f = window._feesCache ? window._feesCache.get(String(id)) : (allFees || []).find(x => String(x.id) === String(id));
+  if(f) viewFeeDetails(f);
+}
+function editFeeById(id){
+  const f = window._feesCache ? window._feesCache.get(String(id)) : (allFees || []).find(x => String(x.id) === String(id));
+  if(f) editFee(f);
+}
+function deleteFeeById(id){
+  const f = window._feesCache ? window._feesCache.get(String(id)) : (allFees || []).find(x => String(x.id) === String(id));
+  if(f) deleteFee(f.id, f.fee_title);
+}
+
+// Back from the records table to the title-sub-folder grid.
 function closeFeeTitleFolder(){
   openFeeTitleKey = null;
   document.getElementById('feesRecordsView').classList.add('hidden');
@@ -2860,7 +3667,7 @@ function closeFeeTitleFolder(){
   }
 }
 
-// Title-sub-folder grid se wapas top-level (Sem/Div/Batch) folder grid par.
+// Back from the title-sub-folder grid to the top-level (Sem/Div/Batch) folder grid.
 function closeFeeFolder(){
   openFeeFolderKey = null;
   openFeeTitleKey = null;
@@ -2892,6 +3699,10 @@ async function saveFee(){
     } else {
       const semester = document.getElementById('feeSemester').value;
       const academic_year = document.getElementById('feeBatch').value || null;
+      if(!semester){
+        alert('Select semester');
+        return;
+      }
       const applyAll = document.getElementById('feeApplyAll').checked;
 
       let student_ids;
@@ -2935,7 +3746,7 @@ function viewFeeDetails(fee){
 
   const linkEl = document.getElementById('feeDetailLink');
   linkEl.innerHTML = fee.payment_link
-    ? `<a href="${fee.payment_link}" target="_blank" class="card-link">${fee.payment_link}</a>`
+    ? (/^https?:\/\//i.test(fee.payment_link) ? `<a href="${escapeHtml(fee.payment_link)}" target="_blank" rel="noopener noreferrer" class="card-link">${escapeHtml(fee.payment_link)}</a>` : escapeHtml(fee.payment_link))
     : '-';
 
   document.getElementById('feeDetailStatus').innerHTML =
@@ -2962,8 +3773,8 @@ function editFee(fee){
   document.getElementById('feeDivision').value = fee.division || '';
   document.getElementById('feeBatch').value = fee.academic_year || '';
 
-  // Edit me sirf ek hi record update hota hai — student badla nahi ja sakta,
-  // isliye bulk/"apply to whole class" controls yahan chhupa dete hain.
+  // Edit updates only a single record — the student can't be changed,
+  // so the bulk/"apply to whole class" controls are hidden here.
   document.getElementById('feeApplyAllWrap').classList.add('hidden');
   document.getElementById('feeStudentWrap').classList.add('hidden');
 
@@ -3061,11 +3872,15 @@ function nfFileChip(n, onclickCode){
   return `<div class="nf-file" onclick="${onclickCode}" title="Download">📎 <span class="nf-file-name">${nfEsc(n.file_name)}</span>${n.file_size ? ` <small>${nfFileSize(n.file_size)}</small>` : ''}</div>`;
 }
 
-// List pehle se is_pinned DESC, created_at DESC aati hai — pinned ek "📌 Pinned" divider ke neeche, baaki date ke hisab se
+// The backend sends the list as is_pinned DESC, created_at DESC (newest-first), but the feed should
+// look like WhatsApp — older on top, newer at the bottom. So we reverse the order here; pinned ones stay
+// on top under the "📌 Pinned" divider, and the rest follow the date dividers
 function nfRenderFeed(notices, cardFn){
+  const pinned = notices.filter(n => n.is_pinned).reverse();
+  const others = notices.filter(n => !n.is_pinned).reverse();
   let html = '';
   let lastLabel = null;
-  notices.forEach(n => {
+  [...pinned, ...others].forEach(n => {
     const label = n.is_pinned ? '📌 Pinned' : nfDateLabel(n.created_at);
     if(label !== lastLabel){
       html += `<div class="nf-divider${n.is_pinned ? ' pinned' : ''}">${nfEsc(label)}</div>`;
@@ -3076,21 +3891,51 @@ function nfRenderFeed(notices, cardFn){
   return `<div class="nf-feed">${html}</div>`;
 }
 
+function nfCloseMenus(){
+  document.querySelectorAll('.nf-menu.open').forEach(m => m.classList.remove('open', 'flip-up'));
+  document.querySelectorAll('.nf-card.menu-open').forEach(c => c.classList.remove('menu-open'));
+}
+
 function nfToggleMenu(btn, ev){
   ev.stopPropagation();
   const menu = btn.closest('.nf-menu');
   const wasOpen = menu.classList.contains('open');
-  document.querySelectorAll('.nf-menu.open').forEach(m => m.classList.remove('open'));
-  if(!wasOpen) menu.classList.add('open');
+  nfCloseMenus();
+  if(wasOpen) return;
+  menu.classList.add('open');
+
+  // An open menu brings its card to the front, so the next card doesn't cover it
+  const card = menu.closest('.nf-card');
+  if(card) card.classList.add('menu-open');
+
+  // If there is little space below the feed, open the menu upwards (otherwise it gets cut off at the feed's edge)
+  const list = menu.querySelector('.nf-menu-list');
+  const feed = menu.closest('.notice-feed-scroll');
+  if(list && feed){
+    const need = list.offsetHeight + 8;
+    const feedRect = feed.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const roomBelow = feedRect.bottom - menuRect.bottom;
+    const roomAbove = menuRect.top - feedRect.top;
+    menu.classList.toggle('flip-up', roomBelow < need && roomAbove > roomBelow);
+  }
 }
-document.addEventListener('click', () => {
-  document.querySelectorAll('.nf-menu.open').forEach(m => m.classList.remove('open'));
-});
+document.addEventListener('click', nfCloseMenus);
 
 function nfToggleBody(el){ el.classList.toggle('expanded'); }
 
 let cachedAdminNotices = [];
 const NF_ROLE_LABEL = { student: 'Students', faculty: 'Faculty' };
+
+// Who sent the notice — "Prof. Name" + Faculty label for faculty, "Name" + Admin label for admin
+function nfAdminSender(n){
+  const name = (n.posted_by_name || '').trim();
+  if(!name) return '';
+  const isFaculty = n.posted_by_role === 'faculty';
+  const label = isFaculty ? 'Prof. ' + name.replace(/^Prof\.?\s*/i, '') : name;
+  const roleText = isFaculty ? 'Faculty' : (n.posted_by_role === 'admin' ? 'Admin' : '');
+  return `<div class="nf-sender">${nfEsc(label)}${roleText ? ` <small>${roleText}</small>` : ''}</div>`;
+}
 
 function nfAdminCard(n){
   const cat = n.category || 'Academic';
@@ -3102,8 +3947,11 @@ function nfAdminCard(n){
     n.academic_year || ''
   ].filter(Boolean).join(' · ');
   const seen = (n.seen_count || 0) > 0;
+  // The admin's own notice — "sent" bubble on the right; faculty's/others' — card on the left, with the sender's name on top
+  const cardCls = n.is_mine ? 'sent' : `received ${tagCls ? 'nf-cat-' + tagCls : ''}`;
   return `
-    <div class="nf-card nf-full ${tagCls ? 'nf-cat-' + tagCls : ''}">
+    <div class="nf-card ${cardCls}">
+      ${n.is_mine ? '' : nfAdminSender(n)}
       <div class="nf-top">
         <span class="notice-tag ${tagCls}">${nfEsc(cat)}</span>
         ${scope ? `<span class="nf-scope">${nfEsc(scope)}</span>` : ''}
@@ -3127,7 +3975,7 @@ function nfAdminCard(n){
     </div>`;
 }
 
-// Card ke saare buttons id se kaam karte hain (title me quotes hone par onclick tootta nahi)
+// All buttons on the card work by id (so onclick doesn't break when the title has quotes)
 function nfAdminAction(action, id){
   const n = cachedAdminNotices.find(x => x.id === id);
   if(!n) return;
@@ -3138,9 +3986,50 @@ function nfAdminAction(action, id){
   else if(action === 'download') downloadNoticeFile(id);
 }
 
-async function loadNotices(){
+// ---- Notices feed scroll (WhatsApp-style) ----
+const NF_SCROLL_BTN = { noticesListBody: 'noticesScrollBtn' };
+
+function nfNearBottom(el, threshold = 40){
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+}
+
+function nfUpdateScrollBtn(feedId){
+  const el = document.getElementById(feedId);
+  const btn = document.getElementById(NF_SCROLL_BTN[feedId]);
+  if(!el || !btn) return;
+  btn.classList.toggle('hidden', nfNearBottom(el));
+}
+
+function nfScrollToBottom(feedId, smooth = true){
+  const el = document.getElementById(feedId);
+  if(!el) return;
+  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+  nfUpdateScrollBtn(feedId);
+}
+
+Object.keys(NF_SCROLL_BTN).forEach(feedId => {
+  const el = document.getElementById(feedId);
+  if(el) el.addEventListener('scroll', () => nfUpdateScrollBtn(feedId));
+});
+
+// After a re-render: if the user was at the latest (bottom) or the feed was just built for the first time, keep it at the bottom,
+// otherwise (they were reading older notices, or pinned/edited) leave their scroll position where it was
+function nfSetFeedHtml(feedId, html){
+  const el = document.getElementById(feedId);
+  if(!el) return;
+  const firstRender = !el.querySelector('.nf-feed');
+  const wasNearBottom = firstRender || nfNearBottom(el);
+  const scrollTopBefore = el.scrollTop;
+  el.innerHTML = html;
+  el.scrollTop = wasNearBottom ? el.scrollHeight : scrollTopBefore;
+  nfUpdateScrollBtn(feedId);
+}
+
+let adminNoticesSnap = '';
+async function loadNotices(silent){
   const container = document.getElementById('noticesListBody');
-  if(container) container.innerHTML = '<div class="notice-row"><span>Loading…</span></div>';
+  // Show "Loading…" only when the feed hasn't been built yet — otherwise the scroll position would reset on every reload
+  if(container && !container.querySelector('.nf-feed')) container.innerHTML = '<div class="notice-row"><span>Loading…</span></div>';
 
   const category = document.getElementById('noticeFilterCategory').value;
   const semester = document.getElementById('noticeFilterSemester').value;
@@ -3155,10 +4044,15 @@ async function loadNotices(){
   try{
     const notices = await apiRequest('/admin/notices?' + params.toString());
     if(!container) return;
+    // background refresh: kuch badla nahi to feed ko chhedo mat (expanded cards / scroll safe)
+    const snap = params.toString() + '|' + JSON.stringify(notices);
+    if(silent === true && snap === adminNoticesSnap) return;
+    adminNoticesSnap = snap;
     cachedAdminNotices = notices;
-    container.innerHTML = notices.length ? nfRenderFeed(notices, nfAdminCard) : '<div class="nf-empty">No notices found.</div>';
+    nfSetFeedHtml('noticesListBody', notices.length ? nfRenderFeed(notices, nfAdminCard) : '<div class="nf-empty">No notices found.</div>');
   }catch(err){
-    if(container) container.innerHTML = `<div class="notice-row"><span>Failed to load notices: ${err.message}</span></div>`;
+    if(silent === true) return;
+    if(container) container.innerHTML = `<div class="notice-row"><span>Failed to load notices: ${escapeHtml(err.message)}</span></div>`;
   }
 }
 
@@ -3173,7 +4067,7 @@ async function saveNotice(){
 
   try{
     if(editId){
-      // Edit me file attachment change nahi hoti — sirf details update hoti hain
+      // The file attachment is not changed on edit — only the details are updated
       const payload = {
         title,
         content: document.getElementById('noticeContent').value.trim(),
@@ -3204,7 +4098,8 @@ async function saveNotice(){
     }
     toggleForm('noticeForm');
     resetNoticeForm();
-    loadNotices();
+    await loadNotices();
+    if(!editId) nfScrollToBottom('noticesListBody');   // their own new notice should show at the bottom
   }catch(err){
     alert('Error: ' + err.message);
   }
@@ -3222,7 +4117,7 @@ function editNotice(notice){
   document.getElementById('noticePinned').value = notice.is_pinned ? '1' : '0';
   document.getElementById('noticeFile').value = '';
   document.getElementById('noticeExistingFile').textContent = notice.file_name
-    ? `Current attachment: ${notice.file_name} (naya upload abhi supported nahi, sirf details edit hoti hain)`
+    ? `Current attachment: ${notice.file_name} (uploading a new file is not supported yet, only the details can be edited)`
     : '';
   document.getElementById('noticeFormTitle').textContent = 'Edit notice';
   document.getElementById('noticeForm').classList.remove('hidden');
@@ -3250,7 +4145,7 @@ async function deleteNotice(id, title){
 async function downloadNoticeFile(id){
   try{
     const res = await fetch(API_BASE + `/admin/notices/${id}/download`, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_admin') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin') }
     });
     if(!res.ok){
       alert('Download failed');
@@ -3290,14 +4185,14 @@ async function openNoticeReads(noticeId, title){
     document.getElementById('noticeReadsSummary').textContent = `${data.seen_count} of ${data.target_total} seen`;
     body.innerHTML = data.seen_by.length ? data.seen_by.map(r => `
       <tr>
-        <td>${r.name}</td>
-        <td>${r.login_id}</td>
-        <td style="text-transform:capitalize;">${r.role}</td>
-        <td>${formatDateTime(r.seen_at)}</td>
+        <td>${escapeHtml(r.name)}</td>
+        <td>${escapeHtml(r.login_id)}</td>
+        <td style="text-transform:capitalize;">${escapeHtml(r.role)}</td>
+        <td>${escapeHtml(formatDateTime(r.seen_at))}</td>
       </tr>
     `).join('') : '<tr><td colspan="4">No one has viewed this yet.</td></tr>';
   }catch(err){
-    body.innerHTML = `<tr><td colspan="4">Failed to load: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="4">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -3305,7 +4200,7 @@ function closeNoticeReads(){
   document.getElementById('noticeReadsOverlay').classList.remove('open');
 }
 
-// ---- Marks Requests (faculty submissions ka approval workflow) ----
+// ---- Marks Requests (approval workflow for faculty submissions) ----
 function escapeHtmlMR(str){
   return String(str ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
 }
@@ -3349,7 +4244,7 @@ async function loadMarksRequests(status){
         <td>${escapeHtmlMR(r.faculty_name)}</td>
         <td>${escapeHtmlMR(r.subject_name)}</td>
         <td>${escapeHtmlMR(r.exam_type)}</td>
-        <td>Sem ${r.semester} / ${r.division || 'All'}</td>
+        <td>Sem ${escapeHtml(r.semester)} / ${escapeHtml(r.division || 'All')}</td>
         <td>${escapeHtmlMR(r.academic_year)}</td>
         <td>${r.student_count}</td>
         <td>${formatDateTime(r.submitted_at)}</td>
@@ -3385,11 +4280,11 @@ async function openMarksRequestDetail(requestId){
       <tr>
         <td>${escapeHtmlMR(s.enrollment)}</td>
         <td>${escapeHtmlMR(s.name)}</td>
-        <td>${s.marks_obtained ?? '—'}</td>
+        <td>${escapeHtml(s.marks_obtained ?? '—')}</td>
       </tr>
     `).join('') || '<tr><td colspan="3" style="color:var(--muted);">No student was found.</td></tr>';
 
-    // Status ke hisaab se sahi actions dikhao
+    // Show the right actions according to the status
     pendingActions.style.display = req.status === 'pending' ? 'flex' : 'none';
     publishBtn.classList.toggle('hidden', req.status !== 'approved');
   }catch(err){
@@ -3525,7 +4420,7 @@ async function loadLoginHistory(){
 // ============================================================
 // Academic management — Academic Year + live Divisions summary
 // ============================================================
-// Date ko readable format me dikhane ke liye (e.g. "2026-07-01" -> "1 Jul 2026")
+// To show a date in a readable format (e.g. "2026-07-01" -> "1 Jul 2026")
 function formatShortDate(dateStr){
   if(!dateStr) return '—';
   const d = new Date(dateStr);
@@ -3533,16 +4428,19 @@ function formatShortDate(dateStr){
   return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
+let academicYearsCache = [];
+
 async function loadAcademicYears(){
   const container = document.getElementById('academicYearsList');
   try{
     const years = await apiRequest('/admin/academic-years');
-    applyAcademicYearsToDropdowns(years);   // saare "Batch (Academic Year)" dropdowns yahi se refresh hote hain
+    applyAcademicYearsToDropdowns(years);   // all the "Batch (Academic Year)" dropdowns are refreshed from here
 
     if(years.length === 0){
       container.innerHTML = '<div class="notice-row" style="border-bottom:none;">No academic year has been added</div>';
       return;
     }
+    academicYearsCache = years;   // to pre-fill the edit form
     const todayStr = new Date().toISOString().slice(0, 10);
 
     container.innerHTML = years.map((y, i) => {
@@ -3551,7 +4449,7 @@ async function loadAcademicYears(){
       const semRows = [1,2,3,4,5,6].map(n => {
         const start = y[`sem${n}_start`];
         const end = y[`sem${n}_end`];
-        if(!start && !end) return '';   // is year ke is semester ki date set hi nahi hai — skip
+        if(!start && !end) return '';   // this semester's date of this year is not set at all — skip
         const running = start && end && todayStr >= start && todayStr <= end;
         return `<div style="margin-top:4px;">
             <b style="color:${running ? 'var(--ink)' : 'var(--muted)'};">Sem ${n}${running ? ' — running now' : ''}</b>:
@@ -3564,7 +4462,13 @@ async function loadAcademicYears(){
         : `<div style="margin-top:8px; font-size:12.5px; color:var(--muted);">No semester dates are set</div>`;
 
       return `<div class="notice-row"${isLast ? ' style="border-bottom:none;"' : ''}>
-          <b>${escapeHtmlMR(y.year_label)}</b>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <b>${escapeHtmlMR(y.year_label)}</b>
+            <span>
+              <button class="icon-action" title="Edit" onclick="editAcademicYear(${y.id})">✎</button>
+              <button class="icon-action danger" title="Delete" onclick="deleteAcademicYear(${y.id}, '${escapeHtmlMR(y.year_label)}')">🗑</button>
+            </span>
+          </div>
           ${semBlock}
         </div>`;
     }).join('');
@@ -3573,29 +4477,79 @@ async function loadAcademicYears(){
   }
 }
 
-async function addAcademicYear(){
+async function deleteAcademicYear(id, label){
+  if(!confirm(`Delete academic year ${label}?\n\nIt will be removed from every Batch dropdown (admin panel and register page). Existing student/subject records are not deleted.`)) return;
+  try{
+    await apiRequest(`/admin/academic-years/${id}`, { method: 'DELETE' });
+    loadAcademicYears();
+  }catch(err){
+    alert('Delete failed: ' + err.message);
+  }
+}
+
+function resetAcademicYearForm(){
+  document.getElementById('academicYearEditId').value = '';
   const input = document.getElementById('newAcademicYear');
-  const yearLabel = input.value.trim();
+  input.value = '';
+  input.disabled = false;
+  document.getElementById('academicYearFormTitle').textContent = 'Add academic year';
+  for(let n = 1; n <= 6; n++){
+    document.getElementById(`newSem${n}Start`).value = '';
+    document.getElementById(`newSem${n}End`).value = '';
+  }
+}
+
+function openAddAcademicYearForm(){
+  resetAcademicYearForm();
+  document.getElementById('academicYearForm').classList.remove('hidden');
+}
+
+function closeAcademicYearForm(){
+  resetAcademicYearForm();
+  document.getElementById('academicYearForm').classList.add('hidden');
+}
+
+function editAcademicYear(id){
+  const y = academicYearsCache.find(row => row.id === id);
+  if(!y) return;
+  document.getElementById('academicYearEditId').value = y.id;
+  const input = document.getElementById('newAcademicYear');
+  input.value = y.year_label;
+  input.disabled = true;   // the label is linked to students/subjects etc., so it can't be edited
+  document.getElementById('academicYearFormTitle').textContent = `Edit academic year — ${y.year_label}`;
+  for(let n = 1; n <= 6; n++){
+    document.getElementById(`newSem${n}Start`).value = y[`sem${n}_start`] ? String(y[`sem${n}_start`]).slice(0, 10) : '';
+    document.getElementById(`newSem${n}End`).value = y[`sem${n}_end`] ? String(y[`sem${n}_end`]).slice(0, 10) : '';
+  }
+  const form = document.getElementById('academicYearForm');
+  form.classList.remove('hidden');
+  form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function addAcademicYear(){
+  const editId = document.getElementById('academicYearEditId').value;
+  const yearLabel = document.getElementById('newAcademicYear').value.trim();
   if(!yearLabel){
     alert('Enter the academic year (e.g. 2027-28)');
     return;
   }
   const payload = { year_label: yearLabel };
   for(let n = 1; n <= 6; n++){
-    payload[`sem${n}_start`] = document.getElementById(`newSem${n}Start`).value || null;
-    payload[`sem${n}_end`] = document.getElementById(`newSem${n}End`).value || null;
+    const start = document.getElementById(`newSem${n}Start`).value || null;
+    const end = document.getElementById(`newSem${n}End`).value || null;
+    if(start && end && start > end){
+      alert(`Sem ${n}: start date must be before end date`);
+      return;
+    }
+    payload[`sem${n}_start`] = start;
+    payload[`sem${n}_end`] = end;
   }
   try{
-    await apiRequest('/admin/academic-years', {
-      method: 'POST',
+    await apiRequest(editId ? `/admin/academic-years/${editId}` : '/admin/academic-years', {
+      method: editId ? 'PUT' : 'POST',
       body: JSON.stringify(payload)
     });
-    input.value = '';
-    for(let n = 1; n <= 6; n++){
-      document.getElementById(`newSem${n}Start`).value = '';
-      document.getElementById(`newSem${n}End`).value = '';
-    }
-    toggleForm('academicYearForm');
+    closeAcademicYearForm();
     loadAcademicYears();
   }catch(err){
     alert('Save failed: ' + err.message);
@@ -3612,7 +4566,7 @@ async function loadDivisionsSummary(){
     }
     body.innerHTML = rows.map(r => `<tr>
         <td>${escapeHtmlMR(r.division)}</td>
-        <td>${deptName(r.department)}</td>
+        <td>${escapeHtml(deptName(r.department))}</td>
         <td>Sem ${r.semester}</td>
         <td>${r.student_count}</td>
       </tr>`).join('');
@@ -3622,11 +4576,11 @@ async function loadDivisionsSummary(){
 }
 
 // ============================================================
-// Saare "Batch (Academic Year)" dropdowns (Add forms + filters) ko
-// Academic Management ke academic_years table se sync karta hai.
-// Jahan "All batches"/"Any" jaisa koi khaali placeholder option pehle
-// se hai wahan wahi preserve hota hai; jahan nahi hai wahan Active
-// (current) academic year default-select ho jaata hai.
+// Syncs all the "Batch (Academic Year)" dropdowns (Add forms + filters)
+// with the academic_years table of Academic Management.
+// Where an empty placeholder option like "All batches"/"Any" already
+// exists, that is preserved; where there is none, the Active
+// (current) academic year is selected by default.
 // ============================================================
 const BATCH_YEAR_SELECT_IDS = [
   'studentBatch', 'studentFilterYear',
@@ -3651,9 +4605,9 @@ function formatYearLabel(label){
 function applyAcademicYearsToDropdowns(years){
   if(!years || years.length === 0) return;
 
-  // Jis row ke kisi bhi semester (1-6) ki date-range me aaj ki date fit
-  // baithti hai wahi "current" batch maana jaata hai; warna sabse recent
-  // year_label fallback ban jaata hai.
+  // The row whose date range (of any semester 1-6) contains today's date
+  // is treated as the "current" batch; otherwise the most recent
+  // year_label becomes the fallback.
   const todayStr = new Date().toISOString().slice(0, 10);
   const current = years.find(y =>
     [1,2,3,4,5,6].some(n => y[`sem${n}_start`] && y[`sem${n}_end`] && todayStr >= y[`sem${n}_start`] && todayStr <= y[`sem${n}_end`])
@@ -3666,7 +4620,7 @@ function applyAcademicYearsToDropdowns(years){
     const firstOption = sel.options[0];
     const hasPlaceholder = !!firstOption && firstOption.value === '';
     const placeholderText = hasPlaceholder ? firstOption.textContent : null;
-    const previousValue = sel.value;   // agar edit form khula hai to uski existing value preserve karni hai
+    const previousValue = sel.value;   // if the edit form is open, its existing value must be preserved
 
     sel.innerHTML = '';
     if(hasPlaceholder){
@@ -3686,25 +4640,25 @@ function applyAcademicYearsToDropdowns(years){
     if(previousValue && stillValid){
       sel.value = previousValue;
     } else if(!hasPlaceholder){
-      sel.value = current.year_label;   // "All"/"Any" wale placeholder nahi hai to Active year default select karo
+      sel.value = current.year_label;   // if there is no "All"/"Any" placeholder, select the Active year by default
     }
   });
 }
 
 // ============================================================
-// Logout — token/role/name clear karke login page pe bhej do
+// Logout — clear token/role/name and send to the login page
 // ============================================================
 function logout(){
   if(!confirm('Log out?')) return;
-  localStorage.removeItem('token_admin');
-  localStorage.removeItem('name_admin');
+  sessionStorage.removeItem('token_admin');
+  sessionStorage.removeItem('name_admin');
   window.location.href = '../login_panel/login.html';
 }
 
-// Login ke waqt jo 'name' localStorage me save hota hai, use sidebar +
-// profile dropdown me dikha do (hardcoded "Admin" ki jagah)
+// Show the 'name' saved in sessionStorage at login in the sidebar +
+// profile dropdown (instead of the hardcoded "Admin")
 function applyProfileNameToUI(){
-  const name = localStorage.getItem('name_admin') || 'Admin';
+  const name = sessionStorage.getItem('name_admin') || 'Admin';
   const initial = name.charAt(0).toUpperCase();
   const nameEls = [document.getElementById('sidebarProfileName'), document.getElementById('profileMenuName')];
   nameEls.forEach(el => { if(el) el.textContent = name; });
@@ -3713,16 +4667,16 @@ function applyProfileNameToUI(){
 }
 
 // ============================================================
-// 'since' timestamp ko DB ke naive local (IST) datetime format me bhejna zaroori hai —
-// new Date().toISOString() UTC deta hai, jo notices/marks_requests ke local timestamps
-// se 5:30 ghante mismatch kar deta hai aur "seen" kiya hua bhi unseen dikhta rehta hai.
+// The 'since' timestamp must be sent in the DB's naive local (IST) datetime format —
+// new Date().toISOString() gives UTC, which mismatches the local timestamps of notices/marks_requests
+// by 5:30 hours, and even a notice that was already seen keeps showing as unseen.
 function toLocalDbDateTime(d){
   const pad = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 // Topbar dropdowns — profile menu, global search.
-// Sirf ek dropdown ek waqt pe khula rahe, aur bahar click karne pe band ho jaaye.
+// Only one dropdown stays open at a time, and it closes on clicking outside.
 // ============================================================
 function closeAllMenus(){
   ['profileMenu', 'globalSearchResults'].forEach(id => {
@@ -3739,7 +4693,7 @@ function toggleProfileMenu(e){
   if(wasHidden) menu.classList.remove('hidden');
 }
 
-// Page load pe (aur har 60 sec me) unseen count check karke red dot pe number dikhata hai
+// On page load (and every 60 sec) checks the unseen count and shows the number on the red dot
 async function refreshNotifBadge(){
   try{
     const since = localStorage.getItem('notifSeenAt') || '';
@@ -3752,15 +4706,87 @@ async function refreshNotifBadge(){
       dot.classList.add('hidden');
     }
   }catch(err){
-    // silent fail — badge bas nahi update hoga
+    // silent fail — the badge just won't update
   }
 }
 
 // ============================================================
-// Global search — header search box se students/faculty naam
-// ya enrollment/ID se dhundta hai
+// Global search — searches students/faculty by name
+// or enrollment/ID from the header search box
 // ============================================================
 let globalSearchDebounce = null;
+
+// ============================================================
+// Sidebar menu search — the header search box also finds sidebar
+// titles (menu items / groups / sub-items); clicking a result opens it.
+// ============================================================
+let menuSearchItems = [];
+
+function getMenuSearchItems(){
+  const items = [];
+  const clean = el => {
+    const c = el.cloneNode(true);
+    c.querySelectorAll('.ic, .chev, .nav-badge, .nav-unread-dot, ul').forEach(n => n.remove());
+    return c.textContent.replace(/\s+/g, ' ').trim();
+  };
+  const iconOf = el => { const ic = el.querySelector('.ic'); return ic ? ic.textContent.trim() : ''; };
+
+  document.querySelectorAll('.sidebar .nav > .nav-item').forEach(el => {
+    items.push({ type: 'item', el, label: clean(el), icon: iconOf(el), parent: '' });
+  });
+  document.querySelectorAll('.sidebar .nav-group').forEach(g => {
+    const head = g.querySelector('.nav-group-head');
+    if(!head) return;
+    const title = clean(head);
+    const icon = iconOf(head);
+    items.push({ type: 'group', el: g, label: title, icon, parent: '' });
+    g.querySelectorAll('.nav-sub-item').forEach(sub => {
+      items.push({ type: 'sub', el: sub, label: clean(sub), icon, parent: title });
+    });
+  });
+  return items;
+}
+
+function getMenuMatches(q){
+  const needle = (q || '').trim().toLowerCase();
+  if(!needle){ menuSearchItems = []; return menuSearchItems; }
+  menuSearchItems = getMenuSearchItems().filter(it =>
+    it.label.toLowerCase().includes(needle) ||
+    (it.type === 'sub' && it.parent.toLowerCase().includes(needle))
+  ).slice(0, 8);
+  return menuSearchItems;
+}
+
+function goToMenuItem(i){
+  const it = menuSearchItems[i];
+  if(!it) return;
+  document.getElementById('globalSearchResults').classList.add('hidden');
+  document.getElementById('globalSearchInput').value = '';
+  if(it.type === 'group'){
+    // Group title: expand that group in the sidebar (and open the drawer on mobile)
+    document.querySelectorAll('.nav-group.open').forEach(g => { if(g !== it.el) g.classList.remove('open'); });
+    it.el.classList.add('open');
+    if(window.innerWidth <= 860) openSidebar();
+    return;
+  }
+  if(it.type === 'sub'){
+    const g = it.el.closest('.nav-group');
+    if(g){
+      document.querySelectorAll('.nav-group.open').forEach(o => { if(o !== g) o.classList.remove('open'); });
+      g.classList.add('open');
+    }
+  }
+  it.el.click();   // reuses the sidebar item's own handler (switchView, form open, mobile close…)
+}
+
+function menuSearchHtml(matches){
+  if(!matches.length) return '';
+  return '<div class="dropdown-item" style="font-weight:600; cursor:default; background:var(--mint-100);">Menu</div>' +
+    matches.map((it, i) => `
+      <div class="dropdown-item" onclick="goToMenuItem(${i})">
+        ${it.icon ? it.icon + ' ' : ''}${escapeHtmlMR(it.label)}${it.parent ? ` <span style="color:var(--muted); font-size:12px;">· ${escapeHtmlMR(it.parent)}</span>` : ''}
+      </div>`).join('');
+}
 
 function onGlobalSearchInput(){
   clearTimeout(globalSearchDebounce);
@@ -3777,8 +4803,9 @@ function onGlobalSearchInput(){
 async function runGlobalSearch(query){
   const resultsBox = document.getElementById('globalSearchResults');
   closeAllMenus();
+  const menuHtml = menuSearchHtml(getMenuMatches(query));   // sidebar titles match instantly, no API call
   resultsBox.classList.remove('hidden');
-  resultsBox.innerHTML = '<div class="dropdown-empty">Searching…</div>';
+  resultsBox.innerHTML = menuHtml + '<div class="dropdown-empty">Searching…</div>';
 
   try{
     const [students, faculty] = await Promise.all([
@@ -3786,28 +4813,28 @@ async function runGlobalSearch(query){
       apiRequest('/admin/faculty?search=' + encodeURIComponent(query))
     ]);
 
-    let html = '';
+    let html = menuHtml;
     if(students.length){
       html += '<div class="dropdown-item" style="font-weight:600; cursor:default; background:var(--mint-100);">Students</div>';
       html += students.slice(0, 5).map(s => `
-        <div class="dropdown-item" onclick="goToSearchResult('student', '${s.enrollment}')">
+        <div class="dropdown-item" data-id="${escapeHtml(s.enrollment)}" onclick="goToSearchResult('student', this.dataset.id)">
           ${escapeHtmlMR(s.name)} <span style="color:var(--muted); font-size:12px;">· ${escapeHtmlMR(s.enrollment)}</span>
         </div>`).join('');
     }
     if(faculty.length){
       html += '<div class="dropdown-item" style="font-weight:600; cursor:default; background:var(--mint-100);">Faculty</div>';
       html += faculty.slice(0, 5).map(f => `
-        <div class="dropdown-item" onclick="goToSearchResult('faculty', '${f.faculty_id}')">
+        <div class="dropdown-item" data-id="${escapeHtml(f.faculty_id)}" onclick="goToSearchResult('faculty', this.dataset.id)">
           ${escapeHtmlMR(f.name)} <span style="color:var(--muted); font-size:12px;">· ${escapeHtmlMR(f.faculty_id)}</span>
         </div>`).join('');
     }
     resultsBox.innerHTML = html || '<div class="dropdown-empty">No matches found</div>';
   }catch(err){
-    resultsBox.innerHTML = '<div class="dropdown-empty">Search failed</div>';
+    resultsBox.innerHTML = menuHtml + '<div class="dropdown-empty">Search failed</div>';
   }
 }
 
-// Result pe click karte hi us view pe jaake, uski row dhund ke highlight/scroll kar deta hai
+// On clicking a result, goes to that view, finds its row and highlights/scrolls to it
 function goToSearchResult(type, idText){
   document.getElementById('globalSearchResults').classList.add('hidden');
   document.getElementById('globalSearchInput').value = '';
@@ -3832,11 +4859,11 @@ function goToSearchResult(type, idText){
   });
 }
 
-document.addEventListener('click', closeAllMenus);   // dropdown ke bahar click = band
+document.addEventListener('click', closeAllMenus);   // click outside the dropdown = close
 
 // ============================================================
-// REPORTS — filter panels ke Subject dropdown ko selected Batch+Sem
-// ke hisaab se dynamically bharta hai, aur Excel download trigger karta hai.
+// REPORTS — dynamically fills the Subject dropdown of the filter panels according to
+// the selected Batch+Sem, and triggers the Excel download.
 // ============================================================
 async function onReportBatchOrSemChange(reportType){
   const batch = document.getElementById(`rep${reportType}Batch`).value;
@@ -3861,7 +4888,7 @@ async function onReportBatchOrSemChange(reportType){
 async function downloadReportFile(url, filenameFallback){
   try{
     const res = await fetch(API_BASE + url, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_admin') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin') }
     });
     if(!res.ok){
       const err = await res.json().catch(() => ({}));
@@ -3934,14 +4961,14 @@ async function loadBackupsList(){
       <tr>
         <td style="word-break:break-all;">${escapeHtmlMR(b.filename)}</td>
         <td>${escapeHtmlMR(b.created_at)}</td>
-        <td>${b.size_kb} KB</td>
+        <td>${escapeHtml(b.size_kb)} KB</td>
         <td style="white-space:nowrap;">
-          <button class="btn-ghost" style="padding:4px 8px; font-size:11px;" onclick="downloadBackupFile('${b.filename}')">Download</button>
-          <button class="btn-ghost" style="padding:4px 8px; font-size:11px; color:var(--danger,#d33);" onclick="deleteBackupFile('${b.filename}')">Delete</button>
+          <button class="btn-ghost" style="padding:4px 8px; font-size:11px;" data-fn="${escapeHtml(b.filename)}" onclick="downloadBackupFile(this.dataset.fn)">Download</button>
+          <button class="btn-ghost" style="padding:4px 8px; font-size:11px; color:var(--danger,#d33);" data-fn="${escapeHtml(b.filename)}" onclick="deleteBackupFile(this.dataset.fn)">Delete</button>
         </td>
       </tr>`).join('');
     selectEl.innerHTML = '<option value="">-- Or upload a new file below --</option>' +
-      backups.map(b => `<option value="${b.filename}">${escapeHtmlMR(b.filename)} (${b.created_at})</option>`).join('');
+      backups.map(b => `<option value="${escapeHtml(b.filename)}">${escapeHtmlMR(b.filename)} (${escapeHtml(b.created_at)})</option>`).join('');
   }catch(err){
     body.innerHTML = '<tr><td colspan="4">Failed to load</td></tr>';
   }
@@ -3998,7 +5025,7 @@ async function restoreBackup(){
   try{
     const res = await fetch(API_BASE + '/admin/restore', {
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_admin') },
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_admin') },
       body: formData
     });
     const data = await res.json();
@@ -4016,7 +5043,7 @@ async function restoreBackup(){
   }
 }
 
-// Password field ka Show/Hide toggle (Security page — Change Password)
+// Show/Hide toggle for the Password field (Security page — Change Password)
 function toggleVis(id, btn){
   const input = document.getElementById(id);
   const isPwd = input.type === 'password';

@@ -1,4 +1,4 @@
-if(!localStorage.getItem('token_student')){
+if(!sessionStorage.getItem('token_student')){
   window.location.href = '../login_panel/login.html';
 }
 
@@ -10,13 +10,13 @@ async function apiRequest(path, options = {}){
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + localStorage.getItem('token_student')
+      'Authorization': 'Bearer ' + sessionStorage.getItem('token_student')
     }
   });
   const data = await res.json().catch(() => ({}));
   if(res.status === 401 || res.status === 403){
-    // token invalid/expired ya student nahi hai — wapas login bhej do
-    localStorage.removeItem('token_student');
+    // token invalid/expired or not a student — send back to login
+    sessionStorage.removeItem('token_student');
     window.location.href = '../login_panel/login.html';
     throw new Error(data.message || 'Unauthorized');
   }
@@ -26,7 +26,22 @@ async function apiRequest(path, options = {}){
   return data;
 }
 
-
+// ---- Live-update helpers ----
+// stChanged: backend data pehle jaisa hi hai to UI dobara draw nahi hota (scroll position / open cards disturb nahi hote)
+const stCache = {};
+function stChanged(key, data){
+  const snap = JSON.stringify(data);
+  if(stCache[key] === snap) return false;
+  stCache[key] = snap;
+  return true;
+}
+// stScrollDown: container ko bilkul neeche tak scroll karta hai (layout settle hone ke baad bhi dobara)
+function stScrollDown(id){
+  const el = typeof id === 'string' ? document.getElementById(id) : id;
+  if(!el) return;
+  el.scrollTop = el.scrollHeight;
+  requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+}
 
 // ---- Navigation ----
   document.querySelectorAll('.nav-item').forEach(item=>{
@@ -38,13 +53,14 @@ async function apiRequest(path, options = {}){
   function switchView(name){
     document.querySelectorAll('.nav-item').forEach(i=> i.classList.toggle('active', i.dataset.view===name));
     document.querySelectorAll('.view').forEach(v=> v.classList.toggle('active', v.id==='view-'+name));
-    if(name === 'timetable' || name === 'Home') refreshStudentTimetable();
+    if(name === 'chat'){ loadChatHistory(); stScrollDown('chatLog'); chatUnreadCounts.chatLog = 0; updateScrollBottomBtn('chatLog'); }
+    if(name === 'timetable' || name === 'dashboard') refreshStudentTimetable();
     if(name === 'notes') loadStudentNotes();
     if(name === 'assignments') loadStudentAssignments();
     if(name === 'fees') loadStudentFees();
     if(name === 'attendance') loadStudentAttendance();
     if(name === 'results') loadStudentResults();
-    if(name === 'notices') markStudentNoticesSeen();
+    if(name === 'notices'){ markStudentNoticesSeen(); stScrollDown('allNoticesContainer'); noticesUnseenNewCount = 0; updateNoticesScrollBtn(); }
     if(name === 'faculty') loadStudentFaculty();
   }
 
@@ -69,10 +85,100 @@ async function apiRequest(path, options = {}){
 
   // ---- Floating chat popup ----
   function togglePopup(){
-    document.getElementById('popup').classList.toggle('hidden');
+    const popup = document.getElementById('popup');
+    popup.classList.toggle('hidden');
+    if(!popup.classList.contains('hidden')){
+      loadChatHistory();
+      stScrollDown('popupLog');
+      chatUnreadCounts.popupLog = 0;
+      updateScrollBottomBtn('popupLog');
+    }
   }
 
   // ---- Chat send (backend-connected — /student/assistant) ----
+  // WhatsApp-style scroll: a message you sent always shows at the bottom,
+  // but if the user has scrolled up to read older messages, a new/incoming
+  // bot reply doesn't disturb them — only the jump-to-bottom arrow shows an
+  // unread count badge, which they can click to reach the new messages
+  const scrollBtnMap = {
+    chatLog: { btn: 'chatScrollBtn', badge: 'chatScrollBadge' },
+    popupLog: { btn: 'popupScrollBtn', badge: 'popupScrollBadge' }
+  };
+  const chatUnreadCounts = { chatLog: 0, popupLog: 0 };
+
+  function isNearBottom(log, threshold = 48){
+    return log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
+  }
+
+  function updateScrollBottomBtn(logId){
+    const map = scrollBtnMap[logId];
+    const log = document.getElementById(logId);
+    if(!map || !log) return;
+    const btn = document.getElementById(map.btn);
+    const badge = document.getElementById(map.badge);
+    if(!btn) return;
+    const atBottom = isNearBottom(log);
+    btn.classList.toggle('hidden', atBottom);
+    const unread = chatUnreadCounts[logId] || 0;
+    if(badge){
+      if(!atBottom && unread > 0){
+        badge.textContent = unread > 9 ? '9+' : String(unread);
+        badge.classList.remove('hidden');
+      } else {
+        badge.classList.add('hidden');
+      }
+    }
+  }
+
+  // A new message (the user's own or the bot's) arrived — if the user is already near the bottom,
+  // scroll straight down, otherwise only increase the unread count (don't jump)
+  // wasNear: message add/resize hone se PEHLE ki position (reply lamba ho to baad mein check karna galat hota hai)
+  function handleNewChatMessage(logId, wasNear){
+    const log = document.getElementById(logId);
+    if(!log) return;
+    const near = (wasNear === undefined) ? isNearBottom(log) : wasNear;
+    if(near){
+      stScrollDown(log);
+      chatUnreadCounts[logId] = 0;
+    } else {
+      chatUnreadCounts[logId] = (chatUnreadCounts[logId] || 0) + 1;
+    }
+    updateScrollBottomBtn(logId);
+  }
+
+  function scrollChatToBottom(logId){
+    const log = document.getElementById(logId);
+    if(!log) return;
+    log.scrollTo({ top: log.scrollHeight, behavior: 'smooth' });
+    chatUnreadCounts[logId] = 0;
+    updateScrollBottomBtn(logId);
+  }
+
+  // Keep the arrow+badge state updated even when the chat-log/popup-log is scrolled manually
+  Object.keys(scrollBtnMap).forEach(logId => {
+    const log = document.getElementById(logId);
+    if(!log) return;
+    log.addEventListener('scroll', () => {
+      if(isNearBottom(log)) chatUnreadCounts[logId] = 0;
+      updateScrollBottomBtn(logId);
+    });
+  });
+
+  // The reply can come back instantly (FAQ answers) - keep the loading dots visible for a moment so the chat feels natural
+  function chatMinDelay(startedAt, ms = 800){
+    const left = ms - (Date.now() - startedAt);
+    return left > 0 ? new Promise(r => setTimeout(r, left)) : Promise.resolve();
+  }
+  
+  // Bot reply aane par: pehle check karo user neeche tha ya nahi, phir content badlo, phir scroll
+  function finishBotReply(logId, typingId, html){
+    const log = document.getElementById(logId);
+    const el = document.getElementById(typingId);
+    const wasNear = log ? isNearBottom(log, 160) : true;
+    if(el) el.innerHTML = html;
+    handleNewChatMessage(logId, wasNear);
+  }
+
   async function sendChat(inputId, logId){
     const input = document.getElementById(inputId);
     const text = input.value.trim();
@@ -80,26 +186,76 @@ async function apiRequest(path, options = {}){
     const log = document.getElementById(logId);
     log.insertAdjacentHTML('beforeend', `<div class="msg user">${escapeHtml(text)}</div>`);
     input.value = '';
-    log.scrollTop = log.scrollHeight;
     const typingId = 'typing-' + Date.now();
-    log.insertAdjacentHTML('beforeend', `<div class="msg bot" id="${typingId}">…</div>`);
-    log.scrollTop = log.scrollHeight;
+    log.insertAdjacentHTML('beforeend', `<div class="msg bot" id="${typingId}"><span class="typing-dots"><i></i><i></i><i></i></span></div>`);
+    // aapka bheja hua message + typing dots hamesha neeche dikhne chahiye (instant scroll, smooth nahi)
+    stScrollDown(log);
+    chatUnreadCounts[logId] = 0;
+    updateScrollBottomBtn(logId);
+    const startedAt = Date.now();
     try{
       const data = await apiRequest('/student/assistant', {
         method: 'POST',
         body: JSON.stringify({ message: text })
       });
-      const el = document.getElementById(typingId);
-      if(el) el.innerHTML = escapeHtml(data.reply || '...').replace(/\n/g, '<br>');
+      await chatMinDelay(startedAt);
+      finishBotReply(logId, typingId, escapeHtml(data.reply || '...').replace(/\n/g, '<br>'));
     }catch(err){
-      const el = document.getElementById(typingId);
-      if(el) el.textContent = 'Response could not be loaded, try again.';
+      finishBotReply(logId, typingId, 'Response could not be loaded, try again.');
     }
-    log.scrollTop = log.scrollHeight;
   }
 
-  // Dashboard "Ask StudentHub" card + suggestion tags — floating popup hi actual chat surface hai,
-  // dashboard card se bheja gaya sawal usi popup me khulta/dikhta hai
+  // ---- Chat history: this user's own previous questions & replies are shown in the chat page and the popup ----
+  const CHAT_GREETINGS = {};
+
+  function updateChatGreetings(name){
+    const fullName = name || sessionStorage.getItem('name_student') || '';
+    const firstName = fullName.trim().split(/\s+/)[0] || 'there';
+    document.querySelectorAll('.student-chat-name').forEach(el => {
+      el.textContent = firstName;
+    });
+    const mainGreeting = document.getElementById('chatMainGreeting');
+    if(mainGreeting) CHAT_GREETINGS['chatLog'] = mainGreeting.outerHTML;
+    const popupGreeting = document.getElementById('chatPopupGreeting');
+    if(popupGreeting) CHAT_GREETINGS['popupLog'] = popupGreeting.outerHTML;
+  }
+
+  function renderChatHistory(logId, items){
+    const log = document.getElementById(logId);
+    if(!log) return;
+    if(log.querySelector('[id^="typing-"]')) return;   // a reply is loading right now - do not wipe it
+    if(CHAT_GREETINGS[logId] === undefined){
+      updateChatGreetings();
+      const first = log.querySelector('.msg.bot');
+      CHAT_GREETINGS[logId] = first ? first.outerHTML : '';
+    }
+    log.innerHTML = CHAT_GREETINGS[logId] + items.map(m => {
+      const when = m.created_at ? new Date(m.created_at).toLocaleString() : '';
+      return `<div class="msg user" title="${when}">${escapeHtml(m.message || '')}</div>` +
+             `<div class="msg bot" title="${when}">${escapeHtml(m.response || '').replace(/\n/g, '<br>')}</div>`;
+    }).join('');
+    stScrollDown(log);
+    if(typeof chatUnreadCounts !== 'undefined') chatUnreadCounts[logId] = 0;
+    if(typeof updateScrollBottomBtn === 'function') updateScrollBottomBtn(logId);
+  }
+
+  async function loadChatHistory(){
+    updateChatGreetings();
+    try{
+      const items = await apiRequest('/student/chat-history');
+      ['chatLog', 'popupLog'].forEach(id => renderChatHistory(id, items));
+    }catch(err){
+      /* history is optional - the chat still works without it */
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    updateChatGreetings();
+    loadChatHistory();
+  });
+
+  // Dashboard "Ask StudentHub" card + suggestion tags — the floating popup is the actual chat surface,
+  // a question sent from the dashboard card opens/shows in that same popup
   function askAIFromDashboard(){
     const input = document.getElementById('askaiInput');
     const text = input.value.trim();
@@ -124,7 +280,7 @@ async function apiRequest(path, options = {}){
 
 // ============================================================
 // TIMETABLE (real data) — /student/timetable + /student/exam-timetable
-// Weekly grid (desktop) / din-wise tabs (mobile) / Home "Today's timetable" / exam cards
+// Weekly grid (desktop) / day-wise tabs (mobile) / Home "Today's timetable" / exam cards
 // ============================================================
 const ST_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const ST_DAY_FULL = { Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday', Fri: 'Friday', Sat: 'Saturday' };
@@ -137,6 +293,7 @@ let stExamMode = 'regular';            // 'regular' | 'Mid-Sem' | 'Remedial'
 let stSelectedDay = null;
 let stLastFetch = 0;
 let stTTError = '';
+let stUpcoming = [];                  // cancelled lectures / holidays of the next 30 days
 
 function stEsc(v){ return escapeHtml(String(v ?? '')); }
 function stTodayKey(){ return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date().getDay()]; }
@@ -152,8 +309,29 @@ function stFacultyLabel(slot){
   const nm = (slot.faculty_short_name && slot.faculty_short_name.trim()) || slot.faculty_name;
   return nm ? 'Prof. ' + nm : '';
 }
+function stSessionBadge(slot){
+  const type = slot.session_type === 'Lab' ? 'Lab' : 'Lecture';
+  return `<em class="tt-type ${type === 'Lab' ? 'is-lab' : 'is-lecture'}">${type}</em>`;
+}
+const ST_LUNCH_START_STR = '13:30';
+const ST_LUNCH_END_STR = '14:00';
+// One cell of the weekly grid: subject, Lecture/Lab label, faculty · room (same order as the faculty/admin grid)
+function stGridCellHtml(l){
+  const type = l.session_type === 'Lab' ? 'Lab' : 'Lecture';
+  const meta = [stFacultyLabel(l), l.room_no || 'Room TBA'].filter(Boolean).join(' · ');
+  return `<div class="tt-subject${stIsOff(l) ? ' tt-off' : ''}">${stEsc(l.subject_name || 'Lecture')}</div>` +
+    `<div class="tt-session ${type === 'Lab' ? 'is-lab' : 'is-lecture'}">${type}</div>` +
+    `<div class="tt-meta">${stEsc(meta)}</div>` + stStatusPill(l);
+}
 function stDetail(slot){
   return [slot.room_no || 'Room TBA', stFacultyLabel(slot)].filter(Boolean).join(' · ');
+}
+// This week's status of a slot: 'held' | 'cancelled' | 'holiday' (comes from the backend)
+function stIsOff(slot){ return slot.status === 'cancelled' || slot.status === 'holiday'; }
+function stStatusPill(slot){
+  if(slot.status === 'cancelled') return `<span class="tt-status-pill is-cancelled">Cancelled${slot.status_note ? ' · ' + stEsc(slot.status_note) : ''}</span>`;
+  if(slot.status === 'holiday') return `<span class="tt-status-pill is-holiday">Holiday${slot.status_note ? ' · ' + stEsc(slot.status_note) : ''}</span>`;
+  return '';
 }
 function stSlotsOfDay(day){
   return stTT.slots.filter(s => s.day_of_week === day).sort((a, b) => stMin(a.start_time) - stMin(b.start_time));
@@ -164,15 +342,18 @@ async function refreshStudentTimetable(force){
   if(!force && Date.now() - stLastFetch < 30000) { renderStudentTimetable(); return; }
   stLastFetch = Date.now();
   renderStudentBanner();
-  const [ttRes, exRes] = await Promise.allSettled([
+  const [ttRes, exRes, upRes] = await Promise.allSettled([
     apiRequest('/student/timetable'),
-    apiRequest('/student/exam-timetable')
+    apiRequest('/student/exam-timetable'),
+    apiRequest('/student/upcoming-changes')
   ]);
+  if(upRes.status === 'fulfilled') stUpcoming = upRes.value.changes || [];
   if(ttRes.status === 'fulfilled'){
     stTT = { student: ttRes.value.student || null, slots: ttRes.value.slots || [] };
     stTTError = '';
   }else{
-    stTTError = ttRes.reason && ttRes.reason.message ? ttRes.reason.message : 'Request failed';
+    // background refresh fail ho to purana timetable dikhta rahe, error sirf tab jab kuch loaded hi nahi
+    if(!stTT.student && !stTT.slots.length) stTTError = ttRes.reason && ttRes.reason.message ? ttRes.reason.message : 'Request failed';
     stLastFetch = 0;
   }
   if(exRes.status === 'fulfilled') stExams = exRes.value.exams || [];
@@ -181,21 +362,61 @@ async function refreshStudentTimetable(force){
 
 function renderStudentTimetable(){
   renderStudentBanner();
+  renderStudentUpcoming();
   renderStudentHomeToday();
   renderStudentWeekTable();
   renderStudentDayView();
   renderStudentExams();
   renderStudentMidExamStat();
 }
-// Now/Next highlight update hota rahe (har minute cache se dobara draw)
+// keep the Now/Next highlight updating (redraw from cache every minute)
 setInterval(renderStudentTimetable, 60000);
 
-// ---- Banner (naam + semester + division) ----
+// ---- Upcoming changes: cancelled lectures / holidays known in advance (next 30 days) ----
+function stUpcomingHtml(){
+  const byDate = {};
+  stUpcoming.forEach(c => { (byDate[c.date] = byDate[c.date] || []).push(c); });
+  return Object.keys(byDate).sort().map(date => {
+    const d = new Date(date + 'T00:00:00');
+    const label = d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+    const rows = byDate[date].map(c => {
+      if(c.status === 'holiday'){
+        return `<div style="font-size:12.5px; padding:2px 0;">🎉 No lectures — <b>${stEsc(c.note)}</b> (Holiday)</div>`;
+      }
+      const type = c.session_type === 'Lab' ? 'Lab' : 'Lecture';
+      return `<div style="font-size:12.5px; padding:2px 0;">
+        <b class="tt-off">${stEsc(c.subject_name || 'Lecture')}</b>
+        <em class="tt-type ${type === 'Lab' ? 'is-lab' : 'is-lecture'}">${type}</em>
+        · ${stFmt(c.start_time)}
+        <span class="tt-status-pill is-cancelled">Cancelled${c.note ? ' · ' + stEsc(c.note) : ''}</span>
+      </div>`;
+    }).join('');
+    return `<div style="display:flex; gap:12px; padding:8px 0; border-bottom:1px solid var(--line);">
+      <div style="min-width:86px; font-weight:600; font-size:12.5px;">${label}</div>
+      <div>${rows}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderStudentUpcoming(){
+  const homeCard = document.getElementById('homeUpcomingCard');
+  const homeBox = document.getElementById('homeUpcoming');
+  const ttBox = document.getElementById('ttUpcomingBox');
+  const ttList = document.getElementById('ttUpcoming');
+  const has = stUpcoming.length > 0;
+  const html = has ? stUpcomingHtml() : '';
+  if(homeCard) homeCard.classList.toggle('hidden', !has);
+  if(homeBox) homeBox.innerHTML = html;
+  if(ttBox) ttBox.classList.toggle('hidden', !has);
+  if(ttList) ttList.innerHTML = html;
+}
+
+// ---- Banner (name + semester + division) ----
 function renderStudentBanner(){
   const nameEl = document.getElementById('stuBannerName');
   const eyebrowEl = document.getElementById('stuBannerEyebrow');
   if(!nameEl || !eyebrowEl) return;
-  const fullName = (localStorage.getItem('name_student') || 'Student').trim();
+  const fullName = (sessionStorage.getItem('name_student') || 'Student').trim();
   nameEl.textContent = `Welcome back, ${fullName}`;
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good Morning' : (hour < 17 ? 'Good Afternoon' : 'Good Evening');
@@ -207,7 +428,7 @@ function renderStudentBanner(){
   eyebrowEl.textContent = parts.join(' · ');
 }
 
-// ---- Din ke lectures ki list (Home + mobile day view) ----
+// ---- List of a day's lectures (Home + mobile day view) ----
 function stDayRowsHtml(daySlots, isToday){
   const nowMin = stNowMin();
   const bars = ['bar1', 'bar2', 'bar3'];
@@ -221,11 +442,11 @@ function stDayRowsHtml(daySlots, isToday){
     const isNow = isToday && start <= nowMin && nowMin < end;
     const isDone = isToday && end <= nowMin;
     html += `
-      <div class="tt-row${isNow ? ' now' : ''}${isDone ? ' done' : ''}">
+      <div class="tt-row${isNow && !stIsOff(l) ? ' now' : ''}${isDone || stIsOff(l) ? ' done' : ''}">
         <div class="tt-bar ${bars[i % 3]}"></div>
         <div class="tt-time"><b>${stFmt(l.start_time)}</b><span>${stFmt(l.end_time)}</span></div>
-        <div class="tt-info"><b>${stEsc(l.subject_name || 'Lecture')}</b><span>${stEsc(stDetail(l))}</span></div>
-        ${isNow ? '<span class="tt-now-pill">Now</span>' : ''}
+        <div class="tt-info"><b class="${stIsOff(l) ? 'tt-off' : ''}">${stEsc(l.subject_name || 'Lecture')} ${stSessionBadge(l)}</b><span>${stEsc(stDetail(l))}</span>${stStatusPill(l)}</div>
+        ${isNow && !stIsOff(l) ? '<span class="tt-now-pill">Now</span>' : ''}
       </div>`;
   });
   return html;
@@ -256,10 +477,11 @@ function renderStudentHomeToday(){
   }
   box.innerHTML = stDayRowsHtml(list, true);
 
-  // Chip: abhi kaun si chal rahi hai / agli kab hai
+  // Chip: which lecture is running right now / when the next one is
   const nowMin = stNowMin();
-  const ongoing = list.find(l => stMin(l.start_time) <= nowMin && nowMin < stMin(l.end_time));
-  const next = list.find(l => stMin(l.start_time) > nowMin);
+  const heldList = list.filter(l => !stIsOff(l));
+  const ongoing = heldList.find(l => stMin(l.start_time) <= nowMin && nowMin < stMin(l.end_time));
+  const next = heldList.find(l => stMin(l.start_time) > nowMin);
   if(chip){
     let text = '';
     if(ongoing) text = `Now: ${ongoing.subject_name || 'Lecture'}`;
@@ -271,6 +493,30 @@ function renderStudentHomeToday(){
 }
 
 // ---- Weekly grid (desktop) ----
+// Same algorithm as the admin panel grid: a long slot (e.g. 11:30–1:30 lab) is merged with rowspan
+// instead of getting its own duplicate time row.
+function stBuildSegments(slots){
+  const boundaries = new Set();
+  slots.forEach(s => { boundaries.add(stMin(s.start_time)); boundaries.add(stMin(s.end_time)); });
+  boundaries.add(ST_LUNCH_START);
+  boundaries.add(ST_LUNCH_END);
+  const sorted = [...boundaries].filter(Number.isFinite).sort((a, b) => a - b);
+  const segs = [];
+  for(let i = 0; i < sorted.length - 1; i++){
+    if(sorted[i + 1] > sorted[i]) segs.push({ start: sorted[i], end: sorted[i + 1] });
+  }
+  return segs;
+}
+function stIsLunchSeg(seg){ return seg && seg.start === ST_LUNCH_START && seg.end === ST_LUNCH_END; }
+function stMinToLabel(m){
+  const h = Math.floor(m / 60), mm = m % 60;
+  return stFmt(`${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`);
+}
+function stSlotForSeg(slots, day, seg){
+  return slots.find(s => s.day_of_week === day && stMin(s.start_time) <= seg.start && stMin(s.end_time) >= seg.end) || null;
+}
+function stSlotKey(s){ return String(s.id ?? [s.day_of_week, s.start_time, s.end_time, s.subject_name, s.session_type].join('|')); }
+
 function renderStudentWeekTable(){
   const table = document.getElementById('ttWeekTable');
   if(!table) return;
@@ -281,36 +527,35 @@ function renderStudentWeekTable(){
   }
   const days = ST_DAYS.filter(d => d !== 'Sat' || slots.some(s => s.day_of_week === 'Sat'));
   const today = stTodayKey();
-  const nowMin = stNowMin();
+  const segments = stBuildSegments(slots);
 
-  const seen = new Map();
-  slots.forEach(s => seen.set(s.start_time + '-' + s.end_time, { start: s.start_time, end: s.end_time }));
-  const ranges = [...seen.values()].sort((a, b) => stMin(a.start) - stMin(b.start));
+  table.className = 'tt-grid-table';
+  let html = `<tr><th class="tt-time-col">Time</th>${days.map(d => `<th class="${d === today ? 'tt-today' : ''}">${ST_DAY_FULL[d]}</th>`).join('')}</tr>`;
 
-  const before = ranges.some(r => stMin(r.start) < ST_LUNCH_START);
-  const after = ranges.some(r => stMin(r.start) >= ST_LUNCH_END);
-  const rows = [];
-  let lunchAdded = false;
-  ranges.forEach(r => {
-    if(before && after && !lunchAdded && stMin(r.start) >= ST_LUNCH_END){ rows.push({ lunch: true }); lunchAdded = true; }
-    rows.push(r);
-  });
-
-  let html = `<tr><th>Time</th>${days.map(d => `<th class="${d === today ? 'tt-today' : ''}">${ST_DAY_FULL[d]}</th>`).join('')}</tr>`;
-  rows.forEach(r => {
-    if(r.lunch){
-      html += `<tr class="tt-lunch"><td colspan="${days.length + 1}">🍽 Lunch break · 1:30 PM – 2:00 PM</td></tr>`;
+  segments.forEach((seg, rowIndex) => {
+    html += `<tr><td class="tt-time-col">${stMinToLabel(seg.start)} - ${stMinToLabel(seg.end)}</td>`;
+    if(stIsLunchSeg(seg)){
+      html += `<td class="tt-break-cell" colspan="${days.length}">Lunch Break</td></tr>`;
       return;
     }
-    html += `<tr><td class="tt-slot-time">${stFmt(r.start)} – ${stFmt(r.end)}</td>`;
-    days.forEach(d => {
-      const here = slots.filter(s => s.day_of_week === d && s.start_time === r.start && s.end_time === r.end);
-      const isToday = d === today;
-      const isNow = isToday && stMin(r.start) <= nowMin && nowMin < stMin(r.end);
-      const cls = `${isToday ? 'tt-today' : ''}${isNow && here.length ? ' tt-now' : ''}`.trim();
-      html += here.length
-        ? `<td class="${cls}">${here.map(l => `<div class="tt-cell"><b>${stEsc(l.subject_name || 'Lecture')}</b><span>${stEsc(stDetail(l))}</span></div>`).join('')}</td>`
-        : `<td class="${cls}"><span class="tt-none">—</span></td>`;
+    days.forEach(day => {
+      const match = stSlotForSeg(slots, day, seg);
+      if(!match){
+        html += '<td class="tt-cell-empty">—</td>';
+        return;
+      }
+      const prevSeg = rowIndex > 0 ? segments[rowIndex - 1] : null;
+      const prevMatch = prevSeg && !stIsLunchSeg(prevSeg) ? stSlotForSeg(slots, day, prevSeg) : null;
+      if(prevMatch && stSlotKey(prevMatch) === stSlotKey(match)) return;   // covered by the rowspan above
+
+      let span = 1;
+      for(let j = rowIndex + 1; j < segments.length; j++){
+        if(stIsLunchSeg(segments[j])) break;
+        const nextMatch = stSlotForSeg(slots, day, segments[j]);
+        if(nextMatch && stSlotKey(nextMatch) === stSlotKey(match)) span++;
+        else break;
+      }
+      html += `<td class="tt-gcell" rowspan="${span}">${stGridCellHtml(match)}</td>`;
     });
     html += '</tr>';
   });
@@ -357,7 +602,7 @@ function openStudentExamTimetable(type){
   stSetTTMode(type);
 }
 
-// Exam aaj se kitne din baad hai (negative = ho chuka)
+// How many days from today the exam is (negative = already over)
 function stExamDiff(e){
   const [y, m, d] = e.exam_date.split('-').map(Number);
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -398,7 +643,7 @@ function renderStudentExams(){
   }).join('')}</div>`;
 }
 
-// Home stat card: agla Mid-Sem exam kitne din baad hai
+// Home stat card: how many days until the next Mid-Sem exam
 function renderStudentMidExamStat(){
   const el = document.getElementById('statMidExam');
   if(!el) return;
@@ -410,7 +655,7 @@ function renderStudentMidExamStat(){
   el.textContent = diff === 0 ? 'Today' : (diff === 1 ? 'Tomorrow' : `${diff} Days`);
 }
 
-// Page khulte hi load
+// Load as soon as the page opens
 refreshStudentTimetable(true);
 loadStudentAttendance();
 loadStudentResults();
@@ -430,20 +675,22 @@ function stNoteIcon(fileType){
   return ST_NOTE_ICONS[(fileType || '').toLowerCase()] || '📄';
 }
 
-async function loadStudentNotes(){
+async function loadStudentNotes(silent){
   const grid = document.getElementById('notesGrid');
   if(!grid) return;
   try{
     const data = await apiRequest('/student/materials');
+    if(!stChanged('notes', data)) return;
     stNotesData = data.materials || [];
     populateNotesSubjectFilter();
     renderStudentNotes();
   }catch(err){
+    if(silent) return;
     grid.innerHTML = `<div class="tt-msg">Materials could not be loaded: ${escapeHtml(err.message)}</div>`;
   }
 }
 
-// Sirf wahi subjects dropdown me dikhao jinka kam se kam ek material ho
+// Show only those subjects in the dropdown that have at least one material
 function populateNotesSubjectFilter(){
   const select = document.getElementById('notesSubjectFilter');
   if(!select) return;
@@ -471,7 +718,7 @@ function renderStudentNotes(){
     return;
   }
 
-  // Subject-wise groups: pehli baar jis order me subject aaya, wahi order rakha (extra sort nahi)
+  // Subject-wise groups: keep the order in which each subject first appeared (no extra sorting)
   const groups = new Map();
   materials.forEach(m => {
     const key = m.subject_name || 'Other';
@@ -495,13 +742,13 @@ function renderStudentNotes(){
   `).join('');
 }
 
-// id se hi kaam karta hai (title/filename me quotes/apostrophe hone par onclick tootta nahi)
+// works by id only (so onclick doesn't break when the title/filename has quotes/apostrophes)
 async function downloadStudentMaterial(id){
   const note = stNotesData.find(x => x.id === id);
   const fileName = note ? note.file_name : `material-${id}`;
   try{
     const res = await fetch(API_BASE + `/student/materials/${id}/download`, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_student') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_student') }
     });
     if(!res.ok){
       alert('Download failed');
@@ -540,21 +787,23 @@ function stAssignmentStatus(a){
   return { label: late ? 'Late' : 'Pending', cls: late ? 'bad' : 'warn' };
 }
 
-async function loadStudentAssignments(){
+async function loadStudentAssignments(silent){
   const tbody = document.getElementById('assignmentsTableBody');
   try{
     const data = await apiRequest('/student/assignments');
+    if(!stChanged('assignments', data)) return;
     stAssignmentsData = data.assignments || [];
     if(tbody) renderStudentAssignments();
     updatePendingAssignmentsStat();
   }catch(err){
+    if(silent) return;
     if(tbody) tbody.innerHTML = `<tr><td colspan="5">Assignments could not be loaded: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-// Dashboard "Pending assignments" stat card — real count nikalta hai, hardcoded nahi.
-// Un-submitted assignments count hote hain (chahe due date nikal gayi ho ya na), kyunki
-// dono cases me student ko abhi bhi action lena hai.
+// Dashboard "Pending assignments" stat card — computes the real count, not hardcoded.
+// Un-submitted assignments are counted (whether or not the due date has passed), because
+// in both cases the student still has to take action.
 function updatePendingAssignmentsStat(){
   const el = document.getElementById('statPendingAssignments');
   if(!el) return;
@@ -586,11 +835,12 @@ function renderStudentAssignments(){
   }).join('');
 }
 
-async function loadStudentFees(){
+async function loadStudentFees(silent){
   const tbody = document.getElementById('feesTableBody');
-  if(tbody) tbody.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
+  if(tbody && !silent && !stCache.fees) tbody.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
   try{
     const data = await apiRequest('/student/fees');
+    if(!stChanged('fees', data)) return;
     const fees = data.fees || [];
     updatePendingFeeStat(fees);
     if(!tbody) return;
@@ -619,8 +869,8 @@ async function loadStudentFees(){
   }
 }
 
-// Dashboard "Fee status" stat card — amount ki jagah fee ka title + status dikhata hai
-// (jo bhi fee sabse pehle due hai). Ek se zyada pending hone par "+N more" bhi jud jaata hai.
+// Dashboard "Fee status" stat card — shows the fee title + status instead of the amount
+// (whichever fee is due first). If more than one is pending, "+N more" is added too.
 function updatePendingFeeStat(fees){
   const el = document.getElementById('statPendingFee');
   const statusEl = document.getElementById('statPendingFeeStatus');
@@ -641,13 +891,13 @@ function updatePendingFeeStat(fees){
   if(statusEl){ statusEl.textContent = 'Pending'; statusEl.className = 'pill bad'; }
 }
 
-// id se hi kaam karta hai (title/filename me quotes/apostrophe hone par onclick tootta nahi)
+// works by id only (so onclick doesn't break when the title/filename has quotes/apostrophes)
 async function downloadStudentAssignment(id){
   const assignment = stAssignmentsData.find(x => x.id === id);
   const fileName = assignment ? assignment.problem_file_name : `assignment-${id}`;
   try{
     const res = await fetch(API_BASE + `/student/assignments/${id}/download`, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_student') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_student') }
     });
     if(!res.ok){
       alert('Download failed');
@@ -669,10 +919,10 @@ async function downloadStudentAssignment(id){
 
 // ============================================================
 // ATTENDANCE (read-only) — /student/attendance
-// Admin/Faculty hi attendance mark karte hain (`attendance` table);
-// student ke liye yeh sirf subject-wise summary dikhata hai, wahi
-// jaisa logic Admin ke attendance/summary aur Faculty ke students
-// list me % nikaalne ke liye use hota hai.
+// Only Admin/Faculty mark attendance (`attendance` table);
+// for the student this only shows a subject-wise summary, using the same
+// logic as Admin's attendance/summary and Faculty's students
+// list to work out the %.
 // ============================================================
 function stAttendanceStatus(pct){
   if(pct < 75) return { label: 'Below 75%', cls: 'bad' };
@@ -680,12 +930,14 @@ function stAttendanceStatus(pct){
   return { label: 'Excellent', cls: 'good' };
 }
 
-async function loadStudentAttendance(){
+async function loadStudentAttendance(silent){
   try{
     const data = await apiRequest('/student/attendance');
+    if(!stChanged('attendance', data)) return;
     renderStudentAttendance(data.subjects || []);
     renderAttendanceDashboardStat(data.overall_percentage || 0);
   }catch(err){
+    if(silent) return;
     const tbody = document.getElementById('attendanceTableBody');
     if(tbody) tbody.innerHTML = `<tr><td colspan="5">Attendance could not be loaded: ${escapeHtml(err.message)}</td></tr>`;
   }
@@ -729,13 +981,13 @@ function renderAttendanceDashboardStat(pct){
 
 // ============================================================
 // RESULTS (read-only) — /student/results
-// Faculty marks bharta hai -> Admin approve karta hai -> Admin
-// publish karta hai; student ko sirf published marks dikhte hain.
+// Faculty enters marks -> Admin approves -> Admin
+// publishes; the student only sees published marks.
 // ============================================================
 const ST_EXAM_COLUMNS = ['Mid-Semester', 'Remedial', 'Internal', 'Practical'];
 
-// Jis exam ke marks published hain sirf uska pill banta hai — us exam ka apna
-// pass/fail bhi wahi passing_percentage se decide hota hai jo overall status me use hoti hai.
+// A pill is built only for an exam whose marks are published — that exam's own
+// pass/fail is also decided by the same passing_percentage used in the overall status.
 function stExamCell(exam, passingPct){
   if(!exam) return '—';
   const pct = exam.marks_obtained * 100 / exam.max_marks;
@@ -743,12 +995,14 @@ function stExamCell(exam, passingPct){
   return `<span class="pill ${cls}">${exam.marks_obtained}/${exam.max_marks}</span>`;
 }
 
-async function loadStudentResults(){
+async function loadStudentResults(silent){
   const tbody = document.getElementById('resultsTableBody');
   try{
     const data = await apiRequest('/student/results');
+    if(!stChanged('results', data)) return;
     renderStudentResults(data.subjects || [], data.passing_percentage);
   }catch(err){
+    if(silent) return;
     if(tbody) tbody.innerHTML = `<tr><td colspan="5">Results could not be loaded: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
@@ -774,14 +1028,16 @@ function renderStudentResults(subjects, passingPct){
 
 // ============================================================
 // NOTICES (read-only) — /student/notices
-// Admin/Faculty hi notices post/edit/pin/delete karte hain;
-// student sirf apni class ki broadcast notices + apni personal
-// notices dekhta hai — "All notices" page ab Admin/Faculty jaisa
-// hi WhatsApp-style feed hai (received-card, menu/edit/pin nahi
-// kyunki student notice create nahi karta), unread badge/mark-read
-// bhi Faculty panel jaisa hi.
+// Only Admin/Faculty post/edit/pin/delete notices;
+// a student sees only the broadcast notices of their own class + their own
+// personal notices — the "All notices" page is now the same WhatsApp-style
+// feed as Admin/Faculty (received-card, no menu/edit/pin
+// because a student doesn't create notices), and the unread badge/mark-read
+// work the same as in the Faculty panel.
 // ============================================================
 let stNoticesData = [];
+let knownNoticeIds = new Set();
+let noticesUnseenNewCount = 0;
 const NF_CAT_CLASS = { Academic: '', Event: 'event', Important: 'urgent' };
 
 function stNoticeTagClass(category){
@@ -825,26 +1081,38 @@ function stNoticeScope(n){
   return [n.semester ? 'Sem ' + n.semester : '', n.division ? 'Div ' + n.division : ''].filter(Boolean).join(' · ');
 }
 
-// Admin/Faculty ke nfFileChip jaisa hi — 📎 icon + filename + size, click pe download
+// Same as Admin/Faculty's nfFileChip — 📎 icon + filename + size, click to download
 function stNoticeFileChip(n){
   if(!n.file_name) return '';
   return `<div class="nf-file" onclick="stNoticeAction('download', ${n.id})" title="Download">📎 <span class="nf-file-name">${escapeHtml(n.file_name)}</span>${n.file_size ? ` <small>${nfFileSize(n.file_size)}</small>` : ''}</div>`;
 }
 
-// Card ke buttons id se kaam karte hain (title/filename me quotes/apostrophe hone par
-// onclick attribute tootta nahi) — Admin/Faculty ke nfFacAction jaisa hi pattern.
+// The card's buttons work by id (so the onclick attribute doesn't break when the
+// title/filename has quotes/apostrophes) — same pattern as Admin/Faculty's nfFacAction.
 function stNoticeAction(action, id){
   const n = stNoticesData.find(x => x.id === id);
   if(!n) return;
   if(action === 'download') downloadStudentNotice(id, n.file_name);
 }
 
-// Admin/Faculty ke nfFacReceivedCard jaisa hi — student ke liye "received" card
+// Who sent the notice — "Prof. Name" for faculty, "Name" + Admin label for admin
+// (like a sender's name shown above the message in a WhatsApp group)
+function stNoticeSender(n){
+  const name = (n.posted_by_name || '').trim();
+  if(!name) return '';
+  const isFaculty = n.posted_by_role === 'faculty';
+  const label = isFaculty ? 'Prof. ' + name.replace(/^Prof\.?\s*/i, '') : name;
+  const roleText = isFaculty ? 'Faculty' : (n.posted_by_role === 'admin' ? 'Admin' : '');
+  return `<div class="nf-sender">${escapeHtml(label)}${roleText ? ` <small>${roleText}</small>` : ''}</div>`;
+}
+
+// Same as Admin/Faculty's nfFacReceivedCard — the "received" card for the student
 function stNoticeCard(n){
   const tagCls = n.is_personal ? '' : stNoticeTagClass(n.category);
   const scope = stNoticeScope(n);
   return `
     <div class="nf-card ${tagCls ? 'nf-cat-' + tagCls : ''}">
+      ${stNoticeSender(n)}
       <div class="nf-top">
         <span class="notice-tag ${tagCls}">${n.is_personal ? 'For you' : escapeHtml(n.category || 'Academic')}</span>
         ${scope ? `<span class="nf-scope">${escapeHtml(scope)}</span>` : ''}
@@ -859,10 +1127,14 @@ function stNoticeCard(n){
 async function loadStudentNotices(){
   try{
     const data = await apiRequest('/student/notices');
+    stChanged('notices', data);
     stNoticesData = data.notices || [];
+    knownNoticeIds = new Set(stNoticesData.map(n => n.id));
     renderHomeNotices();
     renderAllNotices();
     renderNoticesBadge();
+    stScrollDown('allNoticesContainer');
+    updateNoticesScrollBtn();
   }catch(err){
     const grid = document.getElementById('homeNoticesGrid');
     if(grid) grid.innerHTML = `<div class="tt-msg">Notices could not be loaded: ${escapeHtml(err.message)}</div>`;
@@ -894,7 +1166,7 @@ function renderHomeNotices(){
   }).join('');
 }
 
-// Admin/Faculty ke nfRenderFeed jaisa hi — pinned/date dividers ke saath poori feed
+// Same as Admin/Faculty's nfRenderFeed — the whole feed with pinned/date dividers
 function renderAllNotices(){
   const container = document.getElementById('allNoticesContainer');
   if(!container) return;
@@ -902,9 +1174,14 @@ function renderAllNotices(){
     container.innerHTML = '<div class="nf-empty">No notices yet.</div>';
     return;
   }
+  // The backend sends newest-first (Home needs that for its "latest 3"), but
+  // like WhatsApp we want older notices on top and newer ones at the bottom here —
+  // so we reverse the order only for this feed. Pinned notices always stay on top.
+  const pinned = stNoticesData.filter(n => n.is_pinned).reverse();
+  const others = stNoticesData.filter(n => !n.is_pinned).reverse();
   let html = '';
   let lastLabel = null;
-  stNoticesData.forEach(n => {
+  [...pinned, ...others].forEach(n => {
     const label = n.is_pinned ? '📌 Pinned' : nfDateLabel(n.created_at);
     if(label !== lastLabel){
       html += `<div class="nf-divider${n.is_pinned ? ' pinned' : ''}">${escapeHtml(label)}</div>`;
@@ -939,14 +1216,95 @@ async function markStudentNoticesSeen(){
     stNoticesData.forEach(n => n.is_read = true);
     renderNoticesBadge();
   }catch(err){
-    // silent fail — badge visible rehna harmful nahi hai
+    // silent fail — it's harmless if the badge stays visible
   }
 }
+
+// ---- Notices feed scroll (WhatsApp-style, same as chat) ----
+// Older notices on top, newer notices at the bottom. "Reading older notices" means
+// the user has scrolled up — the ↓ arrow is there to take them to the latest (bottom)
+function isNoticesNearBottom(container, threshold = 40){
+  return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+}
+
+function updateNoticesScrollBtn(){
+  const container = document.getElementById('allNoticesContainer');
+  const btn = document.getElementById('noticesScrollBtn');
+  const badge = document.getElementById('noticesScrollBadge');
+  if(!container || !btn) return;
+  const nearBottom = isNoticesNearBottom(container);
+  btn.classList.toggle('hidden', nearBottom);
+  if(badge){
+    if(!nearBottom && noticesUnseenNewCount > 0){
+      badge.textContent = noticesUnseenNewCount > 9 ? '9+' : String(noticesUnseenNewCount);
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+}
+
+function scrollNoticesToBottom(){
+  const container = document.getElementById('allNoticesContainer');
+  if(!container) return;
+  container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+  noticesUnseenNewCount = 0;
+  updateNoticesScrollBtn();
+}
+
+(function wireNoticesScroll(){
+  const container = document.getElementById('allNoticesContainer');
+  if(!container) return;
+  container.addEventListener('scroll', () => {
+    if(isNoticesNearBottom(container)) noticesUnseenNewCount = 0;
+    updateNoticesScrollBtn();
+  });
+})();
+
+// In the background we quietly check for new notices (like a new
+// message arriving in chat) — if the user has scrolled up while reading older notices,
+// we keep the list where it is without disturbing it and only show the badge
+// count on the arrow; if the user is already at the bottom (latest), it scrolls straight down
+async function pollStudentNotices(){
+  const container = document.getElementById('allNoticesContainer');
+  try{
+    const data = await apiRequest('/student/notices');
+    if(!stChanged('notices', data)) return;   // kuch naya nahi — feed ko chhedo mat (expanded cards / scroll safe)
+    const freshNotices = data.notices || [];
+    const newCount = freshNotices.filter(n => !knownNoticeIds.has(n.id)).length;
+
+    const wasNearBottom = container ? isNoticesNearBottom(container) : true;
+    const scrollTopBefore = container ? container.scrollTop : 0;
+
+    stNoticesData = freshNotices;
+    knownNoticeIds = new Set(freshNotices.map(n => n.id));
+    renderHomeNotices();
+    renderAllNotices();
+    renderNoticesBadge();
+
+    if(container){
+      if(wasNearBottom){
+        // the user is already at the latest — scroll straight down as soon as a new notice arrives
+        stScrollDown(container);
+        noticesUnseenNewCount = 0;
+      } else {
+        // the user is reading older notices — the new notices are added below, so
+        // keep the position and only increase the unread badge on the arrow
+        container.scrollTop = scrollTopBefore;
+        if(newCount > 0) noticesUnseenNewCount += newCount;
+      }
+      updateNoticesScrollBtn();
+    }
+  }catch(err){
+    // this is a background poll — let it fail silently, don't disturb the UI
+  }
+}
+// (notices ka polling ab neeche stBackgroundRefresh ke andar hota hai)
 
 async function downloadStudentNotice(id, fileName){
   try{
     const res = await fetch(API_BASE + `/student/notices/${id}/download`, {
-      headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token_student') }
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_student') }
     });
     if(!res.ok){
       alert('Download failed');
@@ -969,12 +1327,11 @@ async function downloadStudentNotice(id, fileName){
 
 // ============================================================
 // FACULTY DIRECTORY (read-only) — /student/faculty
-// Sirf woh faculty dikhte hain jo is student ke apne semester/
-// division ke subjects padhate hain (Admin ke get_faculty jaisa
-// hi data, bas apni class ke hisaab se filtered).
-// "Message" ke liye poore project me koi chat/DM system nahi hai
-// (Admin/Faculty panel me bhi nahi) — isliye button mailto: link
-// banata hai (faculty ke email se), koi naya backend feature nahi.
+// Shows only the faculty who teach subjects of this student's own semester/
+// division (the same data as Admin's get_faculty,
+// just filtered for their own class).
+// The "Message" button opens a wa.me link to the faculty's WhatsApp number
+// (if the faculty has set a WhatsApp number), otherwise falls back to a mailto: email.
 // ============================================================
 function stFacInitials(name){
   const words = (name || '').replace(/^Prof\.?\s*/i, '').split(/\s+/).filter(Boolean);
@@ -983,13 +1340,15 @@ function stFacInitials(name){
 
 let stFacultyData = [];
 
-async function loadStudentFaculty(){
+async function loadStudentFaculty(silent){
   const grid = document.getElementById('facultyGrid');
   try{
     const data = await apiRequest('/student/faculty');
+    if(!stChanged('faculty', data)) return;
     stFacultyData = data.faculty || [];
     if(grid) renderStudentFaculty(stFacultyData);
   }catch(err){
+    if(silent) return;
     if(grid) grid.innerHTML = `<div class="tt-msg">Faculty directory could not be loaded: ${escapeHtml(err.message)}</div>`;
   }
 }
@@ -1004,9 +1363,11 @@ function renderStudentFaculty(facultyList){
 
   grid.innerHTML = facultyList.map(f => {
     const displayName = f.short_name ? `Prof. ${f.short_name}` : f.name;
-    const msgBtn = f.email
-      ? `<a class="fac-msg" href="mailto:${escapeHtml(f.email)}" style="text-decoration:none; display:inline-block; text-align:center;">Message</a>`
-      : '';
+    const msgBtn = f.whatsapp_number
+      ? `<a class="fac-msg" href="https://wa.me/${encodeURIComponent(f.whatsapp_number)}" target="_blank" rel="noopener" style="text-decoration:none; display:inline-block; text-align:center;">Message</a>`
+      : (f.email
+        ? `<a class="fac-msg" href="mailto:${escapeHtml(f.email)}" style="text-decoration:none; display:inline-block; text-align:center;">Message</a>`
+        : '');
     return `
       <div class="fac-card">
         <div class="fac-avatar">${escapeHtml(stFacInitials(f.name))}</div>
@@ -1033,6 +1394,7 @@ async function loadStudentProfile(){
     if(bannerEnrollEl) bannerEnrollEl.textContent = p.enrollment ? `Enrollment No. ${p.enrollment}` : '';
     document.getElementById('settingsEmail').value = p.email || '';
     document.getElementById('settingsMobile').value = p.mobile || '';
+    document.getElementById('settingsWhatsapp').value = p.whatsapp_number || '';
     document.getElementById('settingsSemester').value = p.semester ? `Semester ${p.semester}` : '-';
     updateProfileHeader(p);
   }catch(err){
@@ -1040,8 +1402,8 @@ async function loadStudentProfile(){
   }
 }
 
-// Sidebar-foot + topbar avatar/name/role ko real profile data se bharta hai
-// (hardcoded "Shubham" / "Semester 5 · Student" ki jagah).
+// Fills the sidebar-foot + topbar avatar/name/role from the real profile data
+// (instead of the hardcoded "Shubham" / "Semester 5 · Student").
 function stInitials(name){
   const words = (name || '').trim().split(/\s+/).filter(Boolean);
   return words.slice(0, 2).map(w => w[0].toUpperCase()).join('') || '?';
@@ -1056,11 +1418,14 @@ function updateProfileHeader(p){
   roleEls.forEach(el => { if(el) el.textContent = role; });
   const initialEls = [document.getElementById('sidebarAvatarInitial'), document.getElementById('topbarAvatarInitial')];
   initialEls.forEach(el => { if(el) el.textContent = initial; });
+  if (typeof updateChatGreetings === 'function') {
+    updateChatGreetings(p.name);
+  }
 }
 
 // ============================================================
-// Topbar profile dropdown — ek waqt me ek dropdown khula rahe,
-// bahar click karne pe band ho jaaye (faculty panel jaisa hi)
+// Topbar profile dropdown — only one dropdown stays open at a time,
+// and it closes on clicking outside (same as the faculty panel)
 // ============================================================
 function closeAllMenus(){
   const menu = document.getElementById('profileMenu');
@@ -1076,22 +1441,22 @@ function toggleProfileMenu(e){
   if(wasHidden) menu.classList.remove('hidden');
 }
 
-document.addEventListener('click', closeAllMenus);   // dropdown ke bahar click = band
+document.addEventListener('click', closeAllMenus);   // click outside the dropdown = close
 
 // ============================================================
-// Logout — token/name clear karke login page pe bhej do
+// Logout — clear token/name and send to the login page
 // ============================================================
 function logout(){
   if(!confirm('Log out?')) return;
-  localStorage.removeItem('token_student');
-  localStorage.removeItem('name_student');
+  sessionStorage.removeItem('token_student');
+  sessionStorage.removeItem('name_student');
   window.location.href = '../login_panel/login.html';
 }
 
 // ============================================================
-// Topbar live search — real loaded data se (subjects/timetable,
-// notes, faculty directory). Naya backend endpoint nahi banaya —
-// jo data already page pe load ho chuka hai usi me se dhoondta hai.
+// Topbar live search — from the real loaded data (subjects/timetable,
+// notes, faculty directory). No new backend endpoint was added —
+// it searches within the data already loaded on the page.
 // ============================================================
 function onTopbarSearch(){
   const box = document.getElementById('topbarSearchInput');
@@ -1102,6 +1467,8 @@ function onTopbarSearch(){
     resultsEl.innerHTML = '';
     return;
   }
+
+  const menuMatches = getMenuMatches(q);
 
   const subjectMap = new Map();
   stTT.slots.forEach(s => {
@@ -1119,13 +1486,13 @@ function onTopbarSearch(){
     (f.name || '').toLowerCase().includes(q) || (f.subjects_taught || '').toLowerCase().includes(q)
   ).slice(0, 5);
 
-  if(!subjectMatches.length && !noteMatches.length && !facultyMatches.length){
+  if(!menuMatches.length && !subjectMatches.length && !noteMatches.length && !facultyMatches.length){
     resultsEl.innerHTML = '<div class="topbar-search-empty">Nothing found</div>';
     resultsEl.classList.add('open');
     return;
   }
 
-  let html = '';
+  let html = menuSearchHtml(menuMatches);
   if(subjectMatches.length){
     html += '<div class="topbar-search-group">Subjects</div>';
     html += subjectMatches.map(([name, code]) => `
@@ -1154,6 +1521,77 @@ function onTopbarSearch(){
   resultsEl.classList.add('open');
 }
 
+// ============================================================
+// Sidebar menu search — the header search box also finds sidebar
+// titles (menu items / groups / sub-items); clicking a result opens it.
+// ============================================================
+let menuSearchItems = [];
+
+function getMenuSearchItems(){
+  const items = [];
+  const clean = el => {
+    const c = el.cloneNode(true);
+    c.querySelectorAll('.ic, .chev, .nav-badge, .nav-unread-dot, ul').forEach(n => n.remove());
+    return c.textContent.replace(/\s+/g, ' ').trim();
+  };
+  const iconOf = el => { const ic = el.querySelector('.ic'); return ic ? ic.textContent.trim() : ''; };
+
+  document.querySelectorAll('.sidebar .nav > .nav-item').forEach(el => {
+    items.push({ type: 'item', el, label: clean(el), icon: iconOf(el), parent: '' });
+  });
+  document.querySelectorAll('.sidebar .nav-group').forEach(g => {
+    const head = g.querySelector('.nav-group-head');
+    if(!head) return;
+    const title = clean(head);
+    const icon = iconOf(head);
+    items.push({ type: 'group', el: g, label: title, icon, parent: '' });
+    g.querySelectorAll('.nav-sub-item').forEach(sub => {
+      items.push({ type: 'sub', el: sub, label: clean(sub), icon, parent: title });
+    });
+  });
+  return items;
+}
+
+function getMenuMatches(q){
+  const needle = (q || '').trim().toLowerCase();
+  if(!needle){ menuSearchItems = []; return menuSearchItems; }
+  menuSearchItems = getMenuSearchItems().filter(it =>
+    it.label.toLowerCase().includes(needle) ||
+    (it.type === 'sub' && it.parent.toLowerCase().includes(needle))
+  ).slice(0, 8);
+  return menuSearchItems;
+}
+
+function goToMenuItem(i){
+  const it = menuSearchItems[i];
+  if(!it) return;
+  closeTopbarSearch();
+  if(it.type === 'group'){
+    // Group title: expand that group in the sidebar (and open the drawer on mobile)
+    document.querySelectorAll('.nav-group.open').forEach(g => { if(g !== it.el) g.classList.remove('open'); });
+    it.el.classList.add('open');
+    if(window.innerWidth <= 860) openSidebar();
+    return;
+  }
+  if(it.type === 'sub'){
+    const g = it.el.closest('.nav-group');
+    if(g){
+      document.querySelectorAll('.nav-group.open').forEach(o => { if(o !== g) o.classList.remove('open'); });
+      g.classList.add('open');
+    }
+  }
+  it.el.click();   // reuses the sidebar item's own handler (switchView, form open, mobile close…)
+}
+
+function menuSearchHtml(matches){
+  if(!matches.length) return '';
+  return '<div class="topbar-search-group">Menu</div>' + matches.map((it, i) => `
+    <div class="topbar-search-row" onclick="goToMenuItem(${i})">
+      <span>${it.icon ? it.icon + ' ' : ''}${escapeHtml(it.label)}</span>
+      <span>${escapeHtml(it.parent)}</span>
+    </div>`).join('');
+}
+
 function closeTopbarSearch(){
   const box = document.getElementById('topbarSearchInput');
   const resultsEl = document.getElementById('topbarSearchResults');
@@ -1174,6 +1612,7 @@ document.addEventListener('click', function(e){
 async function saveStudentSettings(){
   const name = document.getElementById('settingsFullName').value.trim();
   const mobile = document.getElementById('settingsMobile').value.trim();
+  const whatsapp = document.getElementById('settingsWhatsapp').value.trim();
   const currentPassword = document.getElementById('settingsCurrentPassword').value;
   const newPassword = document.getElementById('settingsNewPassword').value;
   const confirmPassword = document.getElementById('settingsConfirmPassword').value;
@@ -1186,16 +1625,20 @@ async function saveStudentSettings(){
     alert('Mobile number must be 10 digits');
     return;
   }
+  if(whatsapp && !/^\d{10,15}$/.test(whatsapp)){
+    alert('WhatsApp number must be 10-15 digits (with country code if needed)');
+    return;
+  }
 
   try{
     await apiRequest('/student/profile', {
       method: 'PUT',
-      body: JSON.stringify({ name, mobile: mobile || null })
+      body: JSON.stringify({ name, mobile: mobile || null, whatsapp_number: whatsapp || null })
     });
-    localStorage.setItem('name_student', name);
+    sessionStorage.setItem('name_student', name);
     if(typeof renderStudentBanner === 'function') renderStudentBanner();
 
-    // Password sirf tabhi update karo jab New password bhara ho
+    // Update the password only when a New password has been filled in
     if(newPassword){
       if(!currentPassword){
         alert('Enter your current password to change it');
@@ -1249,7 +1692,7 @@ document.addEventListener('DOMContentLoaded', function(){
   const noticeT = document.getElementById('settingsNoticeNotif');
   if(noticeT){
     const saved = localStorage.getItem('stuNoticeNotif');
-    noticeT.checked = saved === null ? true : saved === '1';   // default ON jab tak user khud badle nahi
+    noticeT.checked = saved === null ? true : saved === '1';   // default ON until the user changes it themselves
   }
   const attT = document.getElementById('settingsAttendanceAlert');
   if(attT){
@@ -1259,3 +1702,27 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 
 loadStudentProfile();
+
+// ============================================================
+// LIVE AUTO-REFRESH — page refresh kiye bina faculty/admin ke updates dikhne ke liye
+// Har ST_REFRESH_MS par sab data chupchaap dobara fetch hota hai (sirf tab jab tab visible ho),
+// aur tab/window par wapas aate hi turant. UI tabhi redraw hota hai jab data sach mein badla ho.
+// ============================================================
+const ST_REFRESH_MS = 20000;
+let stLastBg = 0;
+function stBackgroundRefresh(){
+  if(document.hidden) return;
+  if(Date.now() - stLastBg < 5000) return;   // focus + visibilitychange dono ek saath fire hon to double call na ho
+  stLastBg = Date.now();
+  refreshStudentTimetable(true);
+  loadStudentAttendance(true);
+  loadStudentResults(true);
+  loadStudentAssignments(true);
+  loadStudentNotes(true);
+  loadStudentFaculty(true);
+  loadStudentFees(true);
+  pollStudentNotices();
+}
+setInterval(stBackgroundRefresh, ST_REFRESH_MS);
+document.addEventListener('visibilitychange', () => { if(!document.hidden) stBackgroundRefresh(); });
+window.addEventListener('focus', stBackgroundRefresh);

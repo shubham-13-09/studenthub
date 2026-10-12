@@ -36,10 +36,12 @@ async function handleLogin(e) {
     const data = await res.json();
 
     if (res.ok) {
-      // Token role ke hisaab se alag key me — taaki admin/faculty/student ek hi browser me
-      // ek saath khule ho to ek dusre ka token overwrite/delete na karein
-      localStorage.setItem('token_' + data.role, data.token);
-      localStorage.setItem('name_' + data.role, data.name);
+      // Store the token under a role-specific key so that admin, faculty and student
+      sessionStorage.setItem('token_' + data.role, data.token);
+      sessionStorage.setItem('name_' + data.role, data.name);
+      if (data.must_change_password) {
+        sessionStorage.setItem('must_change_password_' + data.role, 'true');
+      }
 
       if (data.role === 'student') window.location.href = '../student_panel/student.html';
       else if (data.role === 'faculty') window.location.href = '../faculty_panel/faculty.html';
@@ -48,7 +50,7 @@ async function handleLogin(e) {
       alert(data.message);
     }
   } catch (err) {
-    alert('Server se connect nahi ho paya. Backend chal raha hai check karo.');
+    alert('Unable to connect to the server. Please check that the backend is running.');
   }
   return false;
 }
@@ -62,7 +64,7 @@ function resetForgotFlow() {
   document.getElementById('fg_otp').value = '';
 }
 
-// enrollment ko step 2/3 me use karne ke liye yahin save kar lete hain
+// Keep the enrollment number here so steps 2 and 3 can reuse it
 let fg_enrollment = '';
 
 async function sendOtp() {
@@ -95,10 +97,10 @@ async function sendOtp() {
       document.getElementById('forgotStep2').classList.remove('hidden');
       document.getElementById('forgotStepSub').textContent = 'Check your email for the OTP we just sent.';
     } else {
-      alert(data.message || 'OTP bhejne me error aaya.');
+      alert(data.message || 'Failed to send OTP. Please try again.');
     }
   } catch (err) {
-    alert('Server se connect nahi ho paya. Backend chal raha hai check karo.');
+    alert('Unable to connect to the server. Please check that the backend is running.');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Send OTP'; }
   }
@@ -124,10 +126,10 @@ async function verifyOtp() {
       document.getElementById('forgotStep3').classList.remove('hidden');
       document.getElementById('forgotStepSub').textContent = 'OTP verified. Set your new password.';
     } else {
-      alert(data.message || 'OTP verify nahi hua.');
+      alert(data.message || 'OTP verification failed. Please try again.');
     }
   } catch (err) {
-    alert('Server se connect nahi ho paya. Backend chal raha hai check karo.');
+    alert('Unable to connect to the server. Please check that the backend is running.');
   }
 }
 
@@ -153,9 +155,9 @@ async function updatePassword() {
       alert('Password updated successfully! Please login with your new password.');
       showView('login');
     } else {
-      alert(data.message || 'Password update nahi hua.');
+      alert(data.message || 'Password update failed. Please try again.');
     }
   } catch (err) {
-    alert('Server se connect nahi ho paya. Backend chal raha hai check karo.');
+    alert('Unable to connect to the server. Please check that the backend is running.');
   }
 }

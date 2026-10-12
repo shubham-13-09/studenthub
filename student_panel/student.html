@@ -19,7 +19,7 @@
     </div>
 
     <ul class="nav">
-      <li class="nav-item active" data-view="Home"><span class="ic">🏠</span> Home</li>
+      <li class="nav-item active" data-view="dashboard"><span class="ic">🏠</span> Dashboard</li>
       <li class="nav-item" data-view="chat"><span class="ic">🤖</span> AI Chat</li>
       <li class="nav-item" data-view="timetable"><span class="ic">📆</span> Timetable</li>
       <li class="nav-item" data-view="notes"><span class="ic">📖</span> Notes</li>
@@ -52,7 +52,7 @@
     <div class="topbar">
       <div class="icon-btn menu-btn" id="menuBtn" onclick="openSidebar()">☰</div>
       <div class="search" style="position:relative;">
-        🔍 <input type="text" id="topbarSearchInput" placeholder="Search subject, notes, faculty…"
+        🔍 <input type="text" id="topbarSearchInput" placeholder="Search menu, subject, notes, faculty…"
           oninput="onTopbarSearch()" onfocus="onTopbarSearch()">
         <div class="topbar-search-results" id="topbarSearchResults"></div>
       </div>
@@ -76,7 +76,7 @@
     <div class="content">
 
       <!-- ===== DASHBOARD ===== -->
-      <div class="view active" id="view-Home">
+      <div class="view active" id="view-dashboard">
         <div class="banner">
           <div class="banner-text">
             <div class="banner-eyebrow" id="stuBannerEyebrow">Welcome</div>
@@ -122,6 +122,13 @@
                 <div class="card-link" onclick="switchView('timetable')">View all</div>
               </div>
               <div id="homeTodayTT"><div class="tt-msg">Loading…</div></div>
+            </div>
+
+            <div class="card hidden" id="homeUpcomingCard">
+              <div class="card-head">
+                <div class="card-title">Upcoming changes</div>
+              </div>
+              <div id="homeUpcoming"></div>
             </div>
 
             <div class="card">
@@ -172,14 +179,16 @@
         </div>
         <div class="chat-shell">
           <div class="chat-log" id="chatLog">
-            <div class="msg bot">Hi Shubham 👋 I'm StudentHub Chatbot. Ask me about your timetable, attendance, results, or campus notices.</div>
-            <div class="msg user">What's my attendance percentage?</div>
-            <div class="msg bot">You're at 87% overall attendance — comfortably above the 75% minimum. Data Structures is your lowest subject at 79%.</div>
+            <div class="msg bot" id="chatMainGreeting">Hi <span class="student-chat-name">there</span> 👋 I'm StudentHub Chatbot. Ask me about your timetable, attendance, results, or campus notices.</div>
           </div>
+          <button class="scroll-bottom-btn hidden" id="chatScrollBtn" onclick="scrollChatToBottom('chatLog','chatScrollBtn')" title="Go to latest messages">
+            ↓<span class="scroll-bottom-badge hidden" id="chatScrollBadge">0</span>
+          </button>
           <div class="chat-input-row">
             <input type="text" id="chatInput" placeholder="Type your question…" onkeydown="if(event.key==='Enter') sendChat('chatInput','chatLog')">
-            <button class="chat-send" onclick="sendChat('chatInput','chatLog')">Send</button>
+            <button class="chat-send" onclick="sendChat('chatInput','chatLog')" title="Send">➤</button>
           </div>
+          <div class="chat-note">StudentHub AI can make mistakes. Please verify important information.</div>
         </div>
       </div>
 
@@ -219,9 +228,14 @@
             <button data-mode="Remedial" onclick="stSetTTMode('Remedial')">Remedial exam</button>
           </div>
 
+          <div id="ttUpcomingBox" class="hidden" style="margin-bottom:14px;">
+            <div class="card-title" style="margin-bottom:8px;">Upcoming changes (next 30 days)</div>
+            <div id="ttUpcoming"></div>
+          </div>
+
           <div id="ttRegular">
             <div class="tt-desktop table-scroll">
-              <table class="tt-week" id="ttWeekTable"><tr><td class="tt-msg">Loading…</td></tr></table>
+              <table class="tt-grid-table" id="ttWeekTable"><tr><td class="tt-msg">Loading…</td></tr></table>
             </div>
             <div class="tt-mobile">
               <div class="tt-daytabs" id="ttDayTabs"></div>
@@ -266,8 +280,13 @@
       <!-- ===== NOTICES ===== -->
       <div class="view" id="view-notices">
         <div class="card-head" style="margin-bottom:16px;"><div class="card-title" style="font-size:20px;">All notices</div></div>
-        <div class="card" id="allNoticesContainer">
-          <div class="tt-msg">Loading…</div>
+        <div class="notice-shell">
+          <div class="notice-feed-scroll" id="allNoticesContainer">
+            <div class="tt-msg">Loading…</div>
+          </div>
+          <button class="scroll-bottom-btn hidden" id="noticesScrollBtn" onclick="scrollNoticesToBottom()" title="Go to latest notices">
+            ↓<span class="scroll-bottom-badge hidden" id="noticesScrollBadge">0</span>
+          </button>
         </div>
       </div>
 
@@ -301,6 +320,7 @@
           <div class="field"><label>Enrollment number</label><input type="text" id="settingsEnrollment" disabled></div>
           <div class="field"><label>Email</label><input type="email" id="settingsEmail" disabled></div>
           <div class="field"><label>Mobile number</label><input type="text" id="settingsMobile" placeholder="10-digit mobile number"></div>
+          <div class="field"><label>WhatsApp number <span style="font-weight:400; color:var(--muted);">(used when you message faculty)</span></label><input type="text" id="settingsWhatsapp" placeholder="e.g. 91XXXXXXXXXX"></div>
           <div class="field"><label>Semester</label><input type="text" id="settingsSemester" disabled></div>
           <div class="field"><label>Current password</label>
             <div class="pwd-wrap">
@@ -346,14 +366,18 @@
       <button class="popup-close" onclick="togglePopup()">✕</button>
     </div>
     <div class="popup-log" id="popupLog">
-      <div class="msg bot">Hi Shubham 👋 Ask me anything about your campus.</div>
+      <div class="msg bot" id="chatPopupGreeting">Hi <span class="student-chat-name">there</span> 👋 Ask me anything about your campus.</div>
     </div>
+    <button class="scroll-bottom-btn hidden" id="popupScrollBtn" onclick="scrollChatToBottom('popupLog','popupScrollBtn')" title="Go to latest messages">
+      ↓<span class="scroll-bottom-badge hidden" id="popupScrollBadge">0</span>
+    </button>
     <div class="popup-input-row">
       <input type="text" id="popupInput" placeholder="Type a message…" onkeydown="if(event.key==='Enter') sendChat('popupInput','popupLog')">
       <button class="popup-send" onclick="sendChat('popupInput','popupLog')">➤</button>
     </div>
   </div>
 
+<script src="../shared/force_password.js"></script>
 <script src="student.js"></script>
 
 </body>

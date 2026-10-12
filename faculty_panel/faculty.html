@@ -25,6 +25,7 @@
 
     <ul class="nav">
       <li class="nav-item active" data-view="dashboard"><span class="ic">🏠</span> Dashboard</li>
+      <li class="nav-item" data-view="chat"><span class="ic">🤖</span> AI Chat</li>
       <li class="nav-item" data-view="subjects"><span class="ic">📚</span> My Subjects</li>
       <li class="nav-item" data-view="attendance"><span class="ic">✓</span> Attendance</li>
       <li class="nav-item" data-view="students"><span class="ic">👨‍🎓</span> Students</li>
@@ -32,6 +33,7 @@
       <li class="nav-item" data-view="fees"><span class="ic">💳</span> Fees Entry</li>
       <li class="nav-item" data-view="materials"><span class="ic">📄</span> Materials</li>
       <li class="nav-item" data-view="assignments"><span class="ic">📋</span> Assignments</li>
+      <li class="nav-item" data-view="reports"><span class="ic">📈</span> Reports</li>
       <li class="nav-item" data-view="timetable"><span class="ic">📆</span> Timetable</li>
       <li class="nav-item" data-view="notices"><span class="ic">📢</span> Notices <span class="nav-unread-dot" id="facultyNoticeDot"></span></li>
       <li class="nav-item" data-view="settings"><span class="ic">⚙</span> Settings</li>
@@ -54,7 +56,7 @@
     <div class="topbar">
       <div class="icon-btn menu-btn" id="menuBtn" onclick="openSidebar()">☰</div>
       <div class="search" style="position:relative;">
-        🔍 <input type="text" id="topbarSearchInput" placeholder="Search subject, student, section…"
+        🔍 <input type="text" id="topbarSearchInput" placeholder="Search menu, subject, student…"
           oninput="onTopbarSearch()" onfocus="onTopbarSearch()">
         <div class="topbar-search-results" id="topbarSearchResults"></div>
       </div>
@@ -140,6 +142,16 @@
                 <div class="empty-state">Loading…</div>
               </div>
             </div>
+
+            <div class="card" id="dashAttendancePendingCard">
+              <div class="card-head">
+                <div class="card-title">Attendance pending</div>
+                <div class="card-link" onclick="switchView('attendance')">Go to attendance</div>
+              </div>
+              <div id="dashAttendancePendingList">
+                <div class="empty-state">Loading…</div>
+              </div>
+            </div>
           </div>
 
           <div>
@@ -179,6 +191,27 @@
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        <div class="card" id="dashCancelledCard">
+          <div class="card-head">
+            <div class="card-title">Cancelled lectures</div>
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px;">
+            <span style="font-size:12.5px; font-weight:600;">Mark leave in advance:</span>
+            <input type="date" id="leaveFrom" style="padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);">
+            <span style="font-size:12.5px;">to</span>
+            <input type="date" id="leaveTo" style="padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);">
+            <select id="leaveReason" style="padding:6px; border:1.5px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink);">
+              <option>Faculty leave</option>
+              <option>Meeting</option>
+              <option>Other</option>
+            </select>
+            <button class="tt-action" onclick="markFacultyLeave()">Cancel my lectures</button>
+          </div>
+          <div id="dashCancelledList">
+            <div class="empty-state">Loading…</div>
           </div>
         </div>
       </div>
@@ -222,6 +255,13 @@
             <label>Subject</label>
             <select id="attClassSelect" onchange="loadFacultyAttendance()">
               <option value="">Select subject</option>
+            </select>
+          </div>
+          <div class="selector-field">
+            <label>Session type</label>
+            <select id="attSessionType" onchange="loadFacultyAttendance()">
+              <option value="Lecture">Lecture</option>
+              <option value="Lab">Lab</option>
             </select>
           </div>
           <div class="selector-field">
@@ -298,6 +338,7 @@
               <th>Batch</th>
               <th>Attendance</th>
               <th>Avg marks</th>
+              <th>Day-wise</th>
             </tr>
           </table>
           <div class="empty-state" id="studentsEmpty">Select a class above.</div>
@@ -388,14 +429,14 @@
         <div class="class-selector">
           <div class="selector-field">
             <label>Batch</label>
-            <select id="feesFilterYear" onchange="onFeesFilterChange()">
-              <option value="">Select batch</option>
+            <select id="feesFilterYear" onchange="loadFacultyFees()">
+              <option value="">All batches</option>
             </select>
           </div>
           <div class="selector-field">
             <label>Semester</label>
-            <select id="feesFilterSem" onchange="onFeesFilterChange()">
-              <option value="">Select semester</option>
+            <select id="feesFilterSem" onchange="loadFacultyFees()">
+              <option value="">All semesters</option>
             </select>
           </div>
           <div class="selector-field">
@@ -404,29 +445,54 @@
               <option value="">All divisions</option>
             </select>
           </div>
+          <div class="selector-field">
+            <label>Search</label>
+            <input type="text" id="feesSearch" placeholder="Student, enrollment or fee item…" oninput="onFeesSearch()">
+          </div>
         </div>
 
         <div class="card">
-          <div class="card-head">
-            <div class="card-title" id="feesClassTitle">Select a batch and semester</div>
-            <button class="btn-save" id="feesSaveBtn" onclick="saveFacultyFees()">Save changes</button>
+          <!-- Level 1: Sem + Division + Batch folders -->
+          <div id="feesFolderView">
+            <div class="fee-folder-grid" id="feesFolderGrid">
+              <div class="empty-state">Loading...</div>
+            </div>
           </div>
-          <table id="feesTable" style="display:none;">
-            <tr>
-              <th>Enrollment</th>
-              <th>Name</th>
-              <th>Sem</th>
-              <th>Div</th>
-              <th>Batch</th>
-              <th>Fee item</th>
-              <th>Amount</th>
-              <th>Status</th>
-            </tr>
-            <tbody id="feesTableBody"></tbody>
-          </table>
-          <div class="empty-state" id="feesEmpty">Select a batch and semester above.</div>
+
+          <!-- Level 2: fee-title sub-folders inside the opened batch folder -->
+          <div id="feesTitleFolderView" class="hidden">
+            <div class="fee-nav-row">
+              <button class="btn-ghost" onclick="closeFeeFolder()">⬅ Back to folders</button>
+              <b id="feesTitleFolderHeading"></b>
+            </div>
+            <div class="fee-folder-grid" id="feesTitleFolderGrid"></div>
+          </div>
+
+          <!-- Level 3: student-wise records of one fee title (status can be changed here) -->
+          <div id="feesRecordsView" class="hidden">
+            <div class="fee-nav-row">
+              <button class="btn-ghost" onclick="closeFeeTitleFolder()">⬅ Back</button>
+              <b id="feesFolderTitle"></b>
+              <button class="btn-save" id="feesSaveBtn" style="margin-left:auto;" onclick="saveFacultyFees()">Save changes</button>
+            </div>
+            <table id="feesTable">
+              <tr>
+                <th>Enrollment</th>
+                <th>Name</th>
+                <th>Sem</th>
+                <th>Div</th>
+                <th>Batch</th>
+                <th>Fee item</th>
+                <th>Amount</th>
+                <th>Status</th>
+              </tr>
+              <tbody id="feesTableBody"></tbody>
+            </table>
+            <div class="empty-state hidden" id="feesEmpty">No fee records found.</div>
+          </div>
+
           <div style="padding:14px 4px 4px; color:var(--muted); font-size:13px;">Note: Faculty can only mark fee status
-            manually (offline payments). Fee setup, online links and overrides are managed by Admin.</div>
+            manually. Fee setup, online links and overrides are managed by Admin.</div>
         </div>
       </div>
 
@@ -559,16 +625,16 @@
           <div class="card-head">
             <div class="card-title">All assignments</div>
             <div style="display:flex; gap:10px; flex-wrap:wrap;">
-              <select id="facAssignFilterSem" onchange="onFacultyAssignmentFilterChange()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facAssignFilterSem" onchange="onFacultyAssignmentFilterChange()" class="filter-select">
                 <option value="">All semesters</option>
               </select>
-              <select id="facAssignFilterSubject" onchange="loadFacultyAssignments()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facAssignFilterSubject" onchange="loadFacultyAssignments()" class="filter-select">
                 <option value="">All subjects</option>
               </select>
-              <select id="facAssignFilterDiv" onchange="loadFacultyAssignments()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facAssignFilterDiv" onchange="loadFacultyAssignments()" class="filter-select">
                 <option value="">All divisions</option>
               </select>
-              <select id="facAssignFilterYear" onchange="loadFacultyAssignments()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facAssignFilterYear" onchange="loadFacultyAssignments()" class="filter-select">
                 <option value="">All batches</option>
               </select>
               <input type="text" id="facAssignSearch" placeholder="Search by title…" oninput="loadFacultyAssignments()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
@@ -602,7 +668,7 @@
             <button class="modal-close" onclick="closeFacultyAssignmentSubmissions()">✕</button>
           </div>
           <div style="display:flex; gap:10px; margin-bottom:14px;">
-            <select id="facSubmissionFilterStatus" onchange="renderFacultyAssignmentSubmissions()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+            <select id="facSubmissionFilterStatus" onchange="renderFacultyAssignmentSubmissions()" class="filter-select">
               <option value="">All statuses</option>
               <option value="submitted">Submitted</option>
               <option value="late">Late</option>
@@ -625,6 +691,35 @@
               </tbody>
             </table>
           </div>
+        </div>
+      </div>
+
+      <!-- Student day-wise attendance modal (Students page -> 📅 View) -->
+      <div class="modal-overlay" id="stuAttOverlay" onclick="if(event.target === this) closeStudentAttendance()">
+        <div class="modal-card modal-card--md">
+          <div class="modal-head">
+            <b id="stuAttTitle">Attendance</b>
+            <button class="modal-close" onclick="closeStudentAttendance()">✕</button>
+          </div>
+          <div id="stuAttSub" class="modal-subtext">-</div>
+          <div id="stuAttSummary" class="stu-att-summary"></div>
+          <div class="att-cal-nav">
+            <button type="button" class="stu-att-nav-btn" onclick="changeStudentAttMonth(-1)">‹ Prev</button>
+            <span id="stuAttMonthLabel"></span>
+            <button type="button" class="stu-att-nav-btn" onclick="changeStudentAttMonth(1)">Next ›</button>
+          </div>
+          <div id="stuAttGrid"></div>
+          <div id="stuAttDayDetail" class="stu-att-day-detail"></div>
+          <div class="att-cal-legend-row">
+            <span><i class="att-cal-swatch present"></i> Present</span>
+            <span><i class="att-cal-swatch absent"></i> Absent</span>
+            <span><i class="att-cal-swatch mixed"></i> Half green / half red = Lecture and Lab differ (tap the day)</span>
+            <span><i class="att-cal-swatch none"></i> No class</span>
+          </div>
+          <div class="stu-att-section-title">This month</div>
+          <div id="stuAttList"></div>
+          <div class="stu-att-section-title">All absent days</div>
+          <div id="stuAttAbsentChips"></div>
         </div>
       </div>
 
@@ -651,6 +746,169 @@
         </div>
       </div>
 
+      <!-- ===== REPORTS ===== -->
+      <div class="view" id="view-reports">
+        <div class="card-head" style="margin-bottom:16px;">
+          <div class="card-title" style="font-size:20px;">Reports</div>
+        </div>
+        <div class="subject-grid">
+          <div class="subject-card" style="cursor:pointer;" onclick="openFacultyReport('attendance')">
+            <div class="subject-card-top"><span class="subj-tag amber">Attendance</span></div>
+            <b>Attendance Report</b>
+            <span class="subject-card-sub">Subject-wise attendance % - download Excel or PDF</span>
+            <div class="subject-card-foot"><span>Generate report →</span></div>
+          </div>
+          <div class="subject-card" style="cursor:pointer;" onclick="openFacultyReport('assignment')">
+            <div class="subject-card-top"><span class="subj-tag mint">Assignments</span></div>
+            <b>Assignment Report</b>
+            <span class="subject-card-sub">Submission status &amp; marks - download Excel or PDF</span>
+            <div class="subject-card-foot"><span>Generate report →</span></div>
+          </div>
+          <div class="subject-card" style="cursor:pointer;" onclick="openFacultyReport('student')">
+            <div class="subject-card-top"><span class="subj-tag mint">Students</span></div>
+            <b>Student Report</b>
+            <span class="subject-card-sub">Attendance, assignments &amp; marks - download Excel or PDF</span>
+            <div class="subject-card-foot"><span>Generate report →</span></div>
+          </div>
+          <div class="subject-card" style="cursor:pointer;" onclick="openFacultyReport('marks')">
+            <div class="subject-card-top"><span class="subj-tag amber">Marks</span></div>
+            <b>Marks Report</b>
+            <span class="subject-card-sub">Exam-wise marks, pass/fail &amp; distribution - download Excel or PDF</span>
+            <div class="subject-card-foot"><span>Generate report →</span></div>
+          </div>
+        </div>
+
+        <!-- Attendance Report filters -->
+        <div class="card form-card hidden" id="facRepAttendancePanel" style="margin-top:16px;">
+          <div class="card-title" style="margin-bottom:14px;">Attendance Report filters</div>
+          <div class="form-grid">
+            <div class="field"><label>Batch</label>
+              <select id="facRepAttBatch" onchange="onFacRepAttBatchChange()"></select></div>
+            <div class="field"><label>Semester</label>
+              <select id="facRepAttSem" onchange="onFacRepAttSemChange()"><option value="">Select semester</option></select></div>
+            <div class="field"><label>Subject</label>
+              <select id="facRepAttSubject" onchange="onFacRepAttSubjectChange()"><option value="">Select semester first</option></select></div>
+            <div class="field"><label>Division</label>
+              <select id="facRepAttDiv"><option value="">All divisions</option></select></div>
+            <div class="field"><label>Attendance %</label>
+              <select id="facRepAttPct" onchange="onFacRepAttPctChange()">
+                <option value="all">All students</option>
+                <option value="below75">Below 75%</option>
+                <option value="above75">75% and above</option>
+                <option value="custom">Custom range</option>
+              </select></div>
+            <div class="field hidden" id="facRepAttPctRange">
+              <label>From % - To %</label>
+              <div style="display:flex; gap:8px;">
+                <input type="number" id="facRepAttPctFrom" min="0" max="100" step="0.1" placeholder="From (e.g. 60)">
+                <input type="number" id="facRepAttPctTo" min="0" max="100" step="0.1" placeholder="To (e.g. 74.9)">
+              </div>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn-save" onclick="downloadFacultyAttendanceReport('xlsx')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadFacultyAttendanceReport('pdf')">⬇ Download PDF</button>
+          </div>
+        </div>
+
+        <!-- Assignment Report filters -->
+        <div class="card form-card hidden" id="facRepAssignPanel" style="margin-top:16px;">
+          <div class="card-title" style="margin-bottom:14px;">Assignment Report filters</div>
+          <div class="form-grid">
+            <div class="field"><label>Batch</label>
+              <select id="facRepAsgBatch" onchange="onFacRepAsgBatchChange()"></select></div>
+            <div class="field"><label>Semester</label>
+              <select id="facRepAsgSem" onchange="onFacRepAsgSemChange()"><option value="">Select semester</option></select></div>
+            <div class="field"><label>Subject</label>
+              <select id="facRepAsgSubject" onchange="onFacRepAsgSubjectChange()"><option value="">Select semester first</option></select></div>
+            <div class="field"><label>Division</label>
+              <select id="facRepAsgDiv" onchange="loadFacRepAsgAssignments()"><option value="">All divisions</option></select></div>
+            <div class="field"><label>Assignment</label>
+              <select id="facRepAsgAssignment"><option value="">All assignments</option></select></div>
+            <div class="field"><label>Report type</label>
+              <select id="facRepAsgType">
+                <option value="summary">Student-wise summary</option>
+                <option value="detail">Assignment-wise detail (select one assignment)</option>
+              </select></div>
+            <div class="field"><label>Status</label>
+              <select id="facRepAsgStatus">
+                <option value="all">All</option>
+                <option value="submitted">Submitted (on time + late)</option>
+                <option value="pending">Not submitted</option>
+                <option value="late">Late</option>
+              </select></div>
+          </div>
+          <div class="form-actions">
+            <button class="btn-save" onclick="downloadFacultyAssignmentReport('xlsx')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadFacultyAssignmentReport('pdf')">⬇ Download PDF</button>
+          </div>
+        </div>
+
+        <!-- Student Report filters -->
+        <div class="card form-card hidden" id="facRepStudentPanel" style="margin-top:16px;">
+          <div class="card-title" style="margin-bottom:14px;">Student Report filters</div>
+          <div class="form-grid">
+            <div class="field"><label>Batch</label>
+              <select id="facRepStuBatch" onchange="onFacRepStuBatchChange()"></select></div>
+            <div class="field"><label>Semester</label>
+              <select id="facRepStuSem" onchange="onFacRepStuSemChange()"><option value="">Select semester</option></select></div>
+            <div class="field"><label>Subject</label>
+              <select id="facRepStuSubject" onchange="onFacRepStuSubjectChange()"><option value="">Select semester first</option></select></div>
+            <div class="field"><label>Division</label>
+              <select id="facRepStuDiv" onchange="onFacRepStuFilterChange()"><option value="">All divisions</option></select></div>
+            <div class="field"><label>Students</label>
+              <select id="facRepStuWho" onchange="onFacRepStuFilterChange()">
+                <option value="all">All students (class summary)</option>
+                <option value="atrisk">At-risk students only (class summary)</option>
+                <option value="one">One student (detailed report)</option>
+              </select></div>
+            <div class="field hidden" id="facRepStuOneWrap"><label>Student</label>
+              <select id="facRepStuOne"><option value="">Select student</option></select></div>
+            <div class="field"><label>Parent mobile</label>
+              <label style="display:flex; align-items:center; gap:8px; font-weight:normal;">
+                <input type="checkbox" id="facRepStuParent"> Include parent's mobile number
+              </label></div>
+          </div>
+          <div class="form-actions">
+            <button class="btn-save" onclick="downloadFacultyStudentReport('xlsx')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadFacultyStudentReport('pdf')">⬇ Download PDF</button>
+          </div>
+        </div>
+
+        <!-- Marks Report filters -->
+        <div class="card form-card hidden" id="facRepMarksPanel" style="margin-top:16px;">
+          <div class="card-title" style="margin-bottom:14px;">Marks Report filters</div>
+          <div class="form-grid">
+            <div class="field"><label>Batch</label>
+              <select id="facRepMkBatch" onchange="onFacRepMkBatchChange()"></select></div>
+            <div class="field"><label>Semester</label>
+              <select id="facRepMkSem" onchange="onFacRepMkSemChange()"><option value="">Select semester</option></select></div>
+            <div class="field"><label>Subject</label>
+              <select id="facRepMkSubject" onchange="onFacRepMkSubjectChange()"><option value="">Select semester first</option></select></div>
+            <div class="field"><label>Division</label>
+              <select id="facRepMkDiv"><option value="">All divisions</option></select></div>
+            <div class="field"><label>Exam type</label>
+              <select id="facRepMkExam">
+                <option value="">All exams (one column per exam)</option>
+                <option value="Mid-Semester">Mid-Semester</option>
+                <option value="Remedial">Remedial</option>
+                <option value="Internal">Internal</option>
+                <option value="Practical">Practical</option>
+              </select></div>
+            <div class="field"><label>Result</label>
+              <select id="facRepMkResult">
+                <option value="all">All</option>
+                <option value="pass">Pass</option>
+                <option value="fail">Fail</option>
+              </select></div>
+          </div>
+          <div class="form-actions">
+            <button class="btn-save" onclick="downloadFacultyMarksReport('xlsx')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadFacultyMarksReport('pdf')">⬇ Download PDF</button>
+          </div>
+        </div>
+      </div>
+
       <!-- ===== TIMETABLE ===== -->
       <div class="view" id="view-timetable">
         <div class="card-head" style="margin-bottom:16px;">
@@ -660,12 +918,12 @@
           <div class="card-head">
             <div class="card-title" id="facTtGridTitle">Weekly grid</div>
             <div style="display:flex; gap:10px; flex-wrap:wrap;">
-              <select id="facTtType" onchange="renderFacultyTimetableGrid()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facTtType" onchange="renderFacultyTimetableGrid()" class="filter-select">
                 <option value="Regular">Regular</option>
                 <option value="Mid-Sem">Mid-Sem</option>
                 <option value="Remedial">Remedial</option>
               </select>
-              <select id="facTtSemester" onchange="renderFacultyTimetableGrid()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facTtSemester" onchange="renderFacultyTimetableGrid()" class="filter-select">
                 <option value="1">Sem 1</option>
                 <option value="2">Sem 2</option>
                 <option value="3">Sem 3</option>
@@ -673,17 +931,16 @@
                 <option value="5">Sem 5</option>
                 <option value="6">Sem 6</option>
               </select>
-              <select id="facTtDivision" onchange="renderFacultyTimetableGrid()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facTtDivision" onchange="renderFacultyTimetableGrid()" class="filter-select">
                 <option value="ALL">All divisions</option>
-                <option value="A">Division A only</option>
-                <option value="B">Division B only</option>
-                <option value="C">Division C only</option>
+                <option value="A">Division A</option>
+                <option value="B">Division B</option>
               </select>
-              <select id="facTtScope" onchange="renderFacultyTimetableGrid()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facTtScope" onchange="renderFacultyTimetableGrid()" class="filter-select">
                 <option value="ALL">All subjects</option>
                 <option value="MINE">My subjects only</option>
               </select>
-              <select id="facTtFilterYear" onchange="renderFacultyTimetableGrid()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <select id="facTtFilterYear" onchange="renderFacultyTimetableGrid()" class="filter-select">
                 <option value="">All batches</option>
               </select>
             </div>
@@ -737,16 +994,39 @@
 
         <div class="card" style="margin-top:16px;">
           <div class="card-head"><div class="card-title">Notices you've posted</div></div>
-          <div id="facultyPostedNoticesList">
-            <div class="notice-row" style="border-bottom:none;">Loading...</div>
+          <div class="notice-shell">
+            <div class="notice-feed-scroll" id="facultyPostedNoticesList">
+              <div class="notice-row" style="border-bottom:none;">Loading...</div>
+            </div>
+            <button class="scroll-bottom-btn hidden" id="facultyPostedScrollBtn" onclick="nfScrollToBottom('facultyPostedNoticesList')" title="Go to latest notices">↓</button>
           </div>
         </div>
 
         <div class="card" style="margin-top:16px;">
           <div class="card-head"><div class="card-title">Notices for you</div></div>
-          <div id="facultyNoticesList">
-            <div class="notice-row" style="border-bottom:none;">Loading...</div>
+          <div class="notice-shell">
+            <div class="notice-feed-scroll" id="facultyNoticesList">
+              <div class="notice-row" style="border-bottom:none;">Loading...</div>
+            </div>
+            <button class="scroll-bottom-btn hidden" id="facultyNoticesScrollBtn" onclick="nfScrollToBottom('facultyNoticesList')" title="Go to latest notices">↓</button>
           </div>
+        </div>
+      </div>
+
+      <!-- ===== AI CHAT ===== -->
+      <div class="view" id="view-chat">
+        <div class="card-head" style="margin-bottom:16px;">
+          <div class="card-title" style="font-size:20px;">Ask StudentHub Assistant</div>
+        </div>
+        <div class="chat-shell">
+          <div class="chat-log" id="chatLog">
+            <div class="msg bot">Hi 👋 I'm StudentHub Assistant. Ask me for a class list, attendance %, or pending submissions.</div>
+          </div>
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" placeholder="Type your question…" onkeydown="if(event.key==='Enter') sendChat('chatInput','chatLog')">
+            <button class="chat-send" onclick="sendChat('chatInput','chatLog')" title="Send">➤</button>
+          </div>
+          <div class="chat-note">StudentHub AI can make mistakes. Please verify important information.</div>
         </div>
       </div>
 
@@ -761,6 +1041,7 @@
           <div class="field"><label>Faculty ID</label><input type="text" id="settingsFacultyId" disabled></div>
           <div class="field"><label>Email</label><input type="email" id="settingsEmail" disabled></div>
           <div class="field"><label>Department</label><input type="text" id="settingsDepartment" disabled></div>
+          <div class="field"><label>WhatsApp number <span style="font-weight:400; color:var(--muted);">(students isi number pe aapko message karenge)</span></label><input type="text" id="settingsWhatsapp" placeholder="e.g. 91XXXXXXXXXX"></div>
           <div class="field"><label>Current password</label>
             <div class="pwd-wrap">
               <input type="password" id="settingsCurrentPassword" placeholder="Required only to change password">
@@ -827,6 +1108,7 @@
     </div>
   </div>
 
+  <script src="../shared/force_password.js"></script>
   <script src="faculty.js"></script>
 </body>
 

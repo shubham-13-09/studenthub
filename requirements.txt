@@ -1,8 +1,10 @@
 Flask
 Flask-Cors
+Flask-Limiter
 mysql-connector-python
 bcrypt
 PyJWT
 python-dotenv
 openpyxl
 gunicorn
+reportlab

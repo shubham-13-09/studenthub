@@ -1,21 +1,73 @@
-from flask import request, jsonify, send_from_directory
+from flask import request, jsonify, send_from_directory, send_file
 from db import get_db
 import bcrypt
+import io
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 
 from app import app
-from auth_middleware import faculty_required
+from auth_middleware import faculty_required, is_default_password
+from session_routes import DAY_ABBR, split_divisions, get_holiday, get_holiday_for_slot, get_cancelled_override, get_session_block_reason, has_scheduled_slot, get_extra_session, record_extra_session, get_substitute_override, get_substitute_target, get_substitute_slots_between
+from chatbot_helper import find_faq_answer, get_fallback_reply, log_chat, logged_assistant, get_user_chat_history
 from admin_routes import NOTES_UPLOAD_FOLDER, _allowed_note_file, ASSIGNMENT_UPLOAD_FOLDER, _allowed_assignment_file, NOTICE_UPLOAD_FOLDER, _allowed_notice_file, _get_academic_year_for_date_semester
 
 
 def _get_faculty_id(cursor, user_id):
-    """JWT ke user_id (users.id) se faculty.id nikaalta hai."""
+    """Gets faculty.id from the JWT's user_id (users.id)."""
     cursor.execute("SELECT id FROM faculty WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
     return row['id'] if row else None
+
+
+def _real_divisions(cursor, semester, academic_year):
+    """The real divisions from the students table for that semester+batch (sorted, duplicate-free)."""
+    cursor.execute("""
+        SELECT DISTINCT division FROM students
+        WHERE semester = %s AND academic_year = %s
+          AND division IS NOT NULL AND division <> ''
+        ORDER BY division
+    """, (semester, academic_year))
+    return [r['division'] for r in cursor.fetchall()]
+
+
+def _resolve_division(cursor, assignment, chosen_division):
+    """If the assignment has its own division, that one is used; otherwise (the assignment is "All divisions")
+    the division picked in the Division dropdown — but only if it really exists in that semester+batch.
+    Returns (division, error_message)."""
+    if assignment['division']:
+        return assignment['division'], None
+    if not chosen_division:
+        return None, None
+    if chosen_division not in _real_divisions(cursor, assignment['semester'], assignment['academic_year']):
+        return None, f"Division {chosen_division} does not exist for Sem {assignment['semester']} ({assignment['academic_year']})"
+    return chosen_division, None
+
+
+def _class_division_scope(cursor, faculty_id, semester, academic_year, division):
+    """For class-level screens such as Fees: whether the faculty teaches that semester+batch(+division).
+    Returns (allowed, sql_clause, params). Even when "All divisions" is chosen, the faculty only sees their assigned
+    divisions (unless none of their assignments is an "All divisions" one)."""
+    cursor.execute("""
+        SELECT division FROM faculty_subjects
+        WHERE faculty_id = %s AND semester = %s AND academic_year = %s
+    """, (faculty_id, semester, academic_year))
+    rows = cursor.fetchall()
+    if not rows:
+        return False, "", ()
+    assigned = {r['division'] for r in rows}
+    if None in assigned:
+        if division:
+            return True, "AND st.division = %s", (division,)
+        return True, "", ()
+    if division:
+        if division not in assigned:
+            return False, "", ()
+        return True, "AND st.division = %s", (division,)
+    ordered = tuple(sorted(assigned))
+    placeholders = ",".join(["%s"] * len(ordered))
+    return True, f"AND st.division IN ({placeholders})", ordered
 
 
 # ============================================================
@@ -24,10 +76,10 @@ def _get_faculty_id(cursor, user_id):
 @app.route('/api/faculty/my-subjects', methods=['GET'])
 @faculty_required
 def get_my_subjects():
-    """Logged-in faculty ko assign kiye gaye subjects (semester + division + batch ke saath),
-    har subject ke liye student count aur average attendance % ke saath.
-    Saath me un sabhi semester+batch combos ke real divisions (students table se) bhi bhejta hai,
-    taaki "All divisions" wale assignments ke liye bhi division-filter dropdown me asli divisions dikh sakein."""
+    """Subjects assigned to the logged-in faculty (with semester + division + batch),
+    with the student count and average attendance % for each subject.
+    Also returns the real divisions (from the students table) of all those semester+batch combos,
+    so that the division-filter dropdown can show the actual divisions for "All divisions" assignments too."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -65,15 +117,20 @@ def get_my_subjects():
         for row in subjects:
             row['avg_attendance'] = row['avg_attendance'] if row['avg_attendance'] is not None else 0
 
-        # Faculty ke assigned semester+batch combos ke real divisions (students table se) — duplicate-free
-        sem_year_pairs = {(row['semester'], row['academic_year']) for row in subjects}
+        # Each subject gets its available_divisions: an assignment with a specific division -> only that one division;
+        # an "All divisions" assignment (division NULL) -> all the real divisions of that semester+batch (from the students table).
+        # The top-level `divisions` is the union of all of these, so the dropdown doesn't list divisions not assigned to the faculty.
+        real_div_cache = {}
         divisions = set()
-        for semester, academic_year in sem_year_pairs:
-            cursor.execute("""
-                SELECT DISTINCT division FROM students
-                WHERE semester = %s AND academic_year = %s AND division IS NOT NULL
-            """, (semester, academic_year))
-            divisions.update(r['division'] for r in cursor.fetchall())
+        for row in subjects:
+            if row['division']:
+                row['available_divisions'] = [row['division']]
+            else:
+                key = (row['semester'], row['academic_year'])
+                if key not in real_div_cache:
+                    real_div_cache[key] = _real_divisions(cursor, row['semester'], row['academic_year'])
+                row['available_divisions'] = real_div_cache[key]
+            divisions.update(row['available_divisions'])
 
         return jsonify({"subjects": subjects, "divisions": sorted(divisions), "faculty_id": faculty_id}), 200
     except Exception as e:
@@ -84,7 +141,7 @@ def get_my_subjects():
 
 
 # ============================================================
-# DASHBOARD (aaj ka summary — subjects, aaj ki lectures, pending attendance, ungraded submissions)
+# DASHBOARD (today's summary — subjects, today's lectures, pending attendance, ungraded submissions)
 # ============================================================
 @app.route('/api/faculty/dashboard-summary', methods=['GET'])
 @faculty_required
@@ -103,13 +160,14 @@ def get_faculty_dashboard_summary():
         today_day = day_abbr[datetime.now().weekday()]
 
         cursor.execute("""
-            SELECT t.id, t.semester, t.division, t.room_no,
+            SELECT t.id, t.semester, t.division, t.room_no, t.session_type,
                    TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
                    TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
                    t.subject_id, sub.subject_name,
                    EXISTS (
                        SELECT 1 FROM attendance a
                        WHERE a.faculty_id = %s AND a.subject_id = t.subject_id AND a.attendance_date = CURDATE()
+                         AND a.session_type = t.session_type
                    ) AS attendance_marked
             FROM timetable t
             JOIN subjects sub ON sub.id = t.subject_id
@@ -117,12 +175,44 @@ def get_faculty_dashboard_summary():
             ORDER BY t.start_time
         """, (faculty_id, faculty_id, today_day))
         lectures_today = cursor.fetchall()
+        today_date = datetime.now().date()
         for l in lectures_today:
             l['attendance_marked'] = bool(l['attendance_marked'])
+            holiday = get_holiday_for_slot(cursor, today_date, l['semester'], l['division'])
+            cancelled = None if holiday else get_cancelled_override(cursor, l['id'], today_date)
+            substituted = None if (holiday or cancelled) else get_substitute_override(cursor, l['id'], today_date)
+            l['session_status'] = ('holiday' if holiday else ('cancelled' if cancelled
+                                   else ('substituted' if substituted else 'held')))
+            l['status_note'] = (holiday['name'] if holiday else (cancelled['reason'] if cancelled
+                                else (substituted['substitute_name'] if substituted else None)))
+            l['is_substitute'] = False
+
+        # Lectures of OTHER faculty that this faculty is substituting today
+        sub_slots = get_substitute_slots_between(cursor, faculty_id, today_date, today_date)
+        if sub_slots:
+            cursor.execute("""
+                SELECT subject_id, session_type FROM attendance
+                WHERE faculty_id = %s AND attendance_date = CURDATE()
+            """, (faculty_id,))
+            marked_today = {(r['subject_id'], r['session_type']) for r in cursor.fetchall()}
+            for sl in sub_slots:
+                holiday = get_holiday_for_slot(cursor, today_date, sl['semester'], sl['division'])
+                lectures_today.append({
+                    "id": sl['timetable_id'], "semester": sl['semester'], "division": sl['division'],
+                    "room_no": sl['room_no'], "session_type": sl['session_type'],
+                    "start_time": sl['start_time'], "end_time": sl['end_time'],
+                    "subject_id": sl['subject_id'], "subject_name": sl['subject_name'],
+                    "attendance_marked": (sl['subject_id'], sl['session_type']) in marked_today,
+                    "session_status": 'holiday' if holiday else 'held',
+                    "status_note": holiday['name'] if holiday else None,
+                    "is_substitute": True, "substitute_for": sl['original_faculty_name']
+                })
+        lectures_today.sort(key=lambda x: x['start_time'])
 
         now_time = datetime.now().strftime('%H:%M')
-        lectures_left_today = sum(1 for l in lectures_today if l['end_time'] > now_time)
-        attendance_pending_today = sum(1 for l in lectures_today if not l['attendance_marked'] and l['start_time'] <= now_time)
+        active_today = [l for l in lectures_today if l['session_status'] == 'held']
+        lectures_left_today = sum(1 for l in active_today if l['end_time'] > now_time)
+        attendance_pending_today = sum(1 for l in active_today if not l['attendance_marked'] and l['start_time'] <= now_time)
 
         cursor.execute("""
             SELECT COUNT(*) AS cnt
@@ -147,14 +237,139 @@ def get_faculty_dashboard_summary():
 
 
 # ============================================================
+# DASHBOARD — "Attendance pending" card: list of dates in the last N days
+# whose scheduled lectures have already happened but attendance is not yet marked
+# ============================================================
+ATTENDANCE_PENDING_WINDOW_DAYS = 14
+
+@app.route('/api/faculty/attendance-pending-days', methods=['GET'])
+@faculty_required
+def get_faculty_attendance_pending_days():
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        cursor.execute("""
+            SELECT t.id AS timetable_id, t.day_of_week, t.semester, t.division, t.room_no, t.session_type,
+                   TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
+                   TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
+                   t.subject_id, sub.subject_name
+            FROM timetable t
+            JOIN subjects sub ON sub.id = t.subject_id
+            WHERE t.faculty_id = %s
+        """, (faculty_id,))
+        timetable_rows = cursor.fetchall()
+
+        by_day = {}
+        for row in timetable_rows:
+            by_day.setdefault(row['day_of_week'], []).append(row)
+
+        day_abbr = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        today = datetime.now().date()
+        now_time = datetime.now().strftime('%H:%M')
+
+        pending_days = []
+        total_pending = 0
+
+        start_date = today - timedelta(days=ATTENDANCE_PENDING_WINDOW_DAYS - 1)
+        cursor.execute("""
+            SELECT subject_id, attendance_date, session_type
+            FROM attendance
+            WHERE faculty_id = %s AND attendance_date BETWEEN %s AND %s
+        """, (faculty_id, start_date, today))
+        marked_attendance_set = {
+            (r['subject_id'], r['attendance_date'].isoformat() if hasattr(r['attendance_date'], 'isoformat') else str(r['attendance_date']), r['session_type'])
+            for r in cursor.fetchall()
+        }
+
+        for offset in range(ATTENDANCE_PENDING_WINDOW_DAYS - 1, -1, -1):
+            d = today - timedelta(days=offset)
+            d_str = d.isoformat()
+            rows_today = by_day.get(day_abbr[d.weekday()], [])
+            if not rows_today:
+                continue
+
+            day_pending = []
+            for row in rows_today:
+                if d == today and row['start_time'] > now_time:
+                    continue  # today's lecture hasn't happened yet
+                # Holiday / cancelled slots were never held -> never "pending"
+                if get_holiday_for_slot(cursor, d, row['semester'], row['division']):
+                    continue
+                if get_cancelled_override(cursor, row['timetable_id'], d):
+                    continue
+                if get_substitute_override(cursor, row['timetable_id'], d):
+                    continue   # someone else takes this lecture - it is his/her attendance to mark
+                if (row['subject_id'], d_str, row['session_type']) not in marked_attendance_set:
+                    day_pending.append({
+                        "timetable_id": row['timetable_id'],
+                        "subject_id": row['subject_id'],
+                        "subject_name": row['subject_name'],
+                        "session_type": row['session_type'],
+                        "semester": row['semester'],
+                        "division": row['division'],
+                        "start_time": row['start_time'],
+                        "end_time": row['end_time'],
+                        "room_no": row['room_no']
+                    })
+
+            if day_pending:
+                pending_days.append({
+                    "date": d_str,
+                    "day_name": day_abbr[d.weekday()],
+                    "pending_count": len(day_pending),
+                    "lectures": day_pending
+                })
+                total_pending += len(day_pending)
+
+        # Lectures of other faculty that this faculty is substituting and has not marked yet
+        by_date = {pd['date']: pd for pd in pending_days}
+        for sl in get_substitute_slots_between(cursor, faculty_id, start_date, today):
+            d = datetime.strptime(sl['session_date'], '%Y-%m-%d').date()
+            if d == today and sl['start_time'] > now_time:
+                continue
+            if get_holiday_for_slot(cursor, d, sl['semester'], sl['division']):
+                continue
+            if (sl['subject_id'], sl['session_date'], sl['session_type']) in marked_attendance_set:
+                continue
+            entry = by_date.get(sl['session_date'])
+            if not entry:
+                entry = {"date": sl['session_date'], "day_name": day_abbr[d.weekday()],
+                         "pending_count": 0, "lectures": []}
+                by_date[sl['session_date']] = entry
+                pending_days.append(entry)
+            entry['lectures'].append({
+                "timetable_id": sl['timetable_id'], "subject_id": sl['subject_id'],
+                "subject_name": sl['subject_name'], "session_type": sl['session_type'],
+                "semester": sl['semester'], "division": sl['division'],
+                "start_time": sl['start_time'], "end_time": sl['end_time'], "room_no": sl['room_no'],
+                "is_substitute": True, "substitute_for": sl['original_faculty_name']
+            })
+            entry['pending_count'] += 1
+            total_pending += 1
+
+        pending_days.sort(key=lambda x: x['date'], reverse=True)  # most recent pending day on top
+
+        return jsonify({"pending_days": pending_days, "total_pending_lectures": total_pending}), 200
+    except Exception as e:
+        return jsonify({"message": "Pending attendance days could not be loaded", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============================================================
 # STUDENTS (class list for one assigned subject)
 # ============================================================
 @app.route('/api/faculty/students', methods=['GET'])
 @faculty_required
 def get_faculty_students():
-    """Query param: assignment_id (faculty_subjects.id, jo /my-subjects response me milta hai).
-    Us subject+semester+division+batch ke students, unki is subject me attendance % aur average marks % ke saath.
-    assignment_id ko faculty_id se match karke check karte hain ki yeh faculty isi subject ko padhata hai."""
+    """Query param: assignment_id (faculty_subjects.id, returned in the /my-subjects response).
+    The students of that subject+semester+division+batch, with their attendance % and average marks % in this subject.
+    assignment_id is matched against faculty_id to check that this faculty actually teaches this subject."""
     assignment_id = request.args.get('assignment_id')
     chosen_division = request.args.get('division') or None
     if not assignment_id:
@@ -176,8 +391,8 @@ def get_faculty_students():
         if not assignment:
             return jsonify({"message": "This subject is not assigned to you"}), 403
 
-        # division NULL matlab is assignment ki koi specific division nahi hai -> us semester+batch ke sabhi students
-        # (ya, agar faculty ne upar Division filter se ek specific division chuni hai, to sirf usi division ke students)
+        # division NULL means this assignment has no specific division -> all students of that semester+batch
+        # (or, if the faculty picked a specific division in the Division filter above, only the students of that division)
         if assignment['division']:
             division_clause = "AND st.division = %s"
             division_param = (assignment['division'],)
@@ -226,9 +441,145 @@ def get_faculty_students():
         conn.close()
 
 
+@app.route('/api/faculty/student-attendance', methods=['GET'])
+@faculty_required
+def get_faculty_student_attendance():
+    """Day-wise attendance of ONE student in ONE subject (which day present, which day absent).
+    Query params: assignment_id (faculty_subjects.id — checked against this faculty), student_id.
+    The student must belong to that assignment's class (semester + batch, and division if the assignment has one),
+    so a faculty cannot look up a student outside the classes he/she teaches."""
+    assignment_id = request.args.get('assignment_id')
+    student_id = request.args.get('student_id', type=int)
+    if not assignment_id or not student_id:
+        return jsonify({"message": "assignment_id and student_id are required"}), 400
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
+        if not assignment:
+            return jsonify({"message": "This subject is not assigned to you"}), 403
+
+        student_sql = """
+            SELECT st.id AS student_id, u.login_id AS enrollment, u.name, st.semester, st.division, st.academic_year
+            FROM students st
+            JOIN users u ON u.id = st.user_id
+            WHERE st.id = %s AND st.semester = %s AND st.academic_year = %s
+        """
+        student_params = [student_id, assignment['semester'], assignment['academic_year']]
+        if assignment['division']:
+            student_sql += " AND st.division = %s"
+            student_params.append(assignment['division'])
+        cursor.execute(student_sql, tuple(student_params))
+        student = cursor.fetchone()
+        if not student:
+            return jsonify({"message": "This student is not in your class"}), 403
+
+        cursor.execute("SELECT subject_code, subject_name FROM subjects WHERE id = %s", (assignment['subject_id'],))
+        subject = cursor.fetchone() or {}
+
+        cursor.execute("""
+            SELECT attendance_date, session_type, status
+            FROM attendance
+            WHERE student_id = %s AND subject_id = %s
+            ORDER BY attendance_date, session_type
+        """, (student_id, assignment['subject_id']))
+        records = []
+        for r in cursor.fetchall():
+            d = r['attendance_date']
+            records.append({
+                "date": d.isoformat() if hasattr(d, 'isoformat') else str(d),
+                "session_type": r['session_type'],
+                "status": r['status']
+            })
+
+        present = sum(1 for r in records if r['status'] == 'present')
+        total = len(records)
+        return jsonify({
+            "student": student,
+            "subject": {"subject_code": subject.get('subject_code'), "subject_name": subject.get('subject_name')},
+            "summary": {
+                "present": present,
+                "absent": total - present,
+                "total": total,
+                "percentage": round(present * 100 / total) if total else 0
+            },
+            "records": records
+        }), 200
+    except Exception as e:
+        return jsonify({"message": "Student attendance could not be loaded", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _session_division_block(cursor, faculty_id, subject_id, semester, session_type, divisions):
+    """HARD rule: if the timetable has this session type (Lecture / Lab) for this faculty + subject + semester but
+    NONE of its slots is for a division in `divisions`, that division must not be marked at all
+    (e.g. Lab is only in the timetable for Division B -> Division A cannot be marked, not even as an 'Extra session').
+    Returns an error message, or None when it is fine (also None when the timetable has no such slot at all —
+    then the normal 'Extra session' confirmation still applies)."""
+    cursor.execute("""
+        SELECT t.division FROM timetable t
+        WHERE t.faculty_id = %s AND t.subject_id = %s AND t.semester = %s AND t.session_type = %s
+    """, (faculty_id, subject_id, semester, session_type))
+    rows = cursor.fetchall()
+    if not rows:
+        return None
+    covered = set()
+    covers_all = False
+    for r in rows:
+        divs = split_divisions(r['division'])
+        if not divs:
+            covers_all = True   # a slot with no division is for every division
+        covered.update(divs)
+    if covers_all:
+        return None
+    missing = [d for d in sorted({x for x in divisions if x}) if d not in covered]
+    if not missing:
+        return None
+    return (f"{session_type} for this subject is in the timetable only for Division {', '.join(sorted(covered))} — "
+            f"Division {', '.join(missing)} cannot be marked")
+
+
+def _all_divisions_scope(cursor, faculty_id, subject_id, semester, session_type, date_obj):
+    """For an "All divisions" assignment when NO Division filter is chosen: which divisions does the timetable
+    really put this session (Lecture / Lab) on? Returns a sorted list of divisions the student list / the save must be
+    limited to, or [] when there is no limit (no timetable rows at all, or a slot that is for every division).
+      1) If the timetable has this session type on that WEEKDAY -> only the divisions of those slots
+         (e.g. Lab is on Tuesday for Division B -> only Division B students, Division A is never listed or saved).
+      2) Otherwise (a day with no slot, i.e. an Extra session) -> the divisions the timetable has this session type
+         for on any weekday."""
+    cursor.execute("""
+        SELECT t.division, t.day_of_week FROM timetable t
+        WHERE t.faculty_id = %s AND t.subject_id = %s AND t.semester = %s AND t.session_type = %s
+    """, (faculty_id, subject_id, semester, session_type))
+    rows = cursor.fetchall()
+    if not rows:
+        return []
+    day = DAY_ABBR[date_obj.weekday()]
+
+    def _divs(slot_rows):
+        out = set()
+        for r in slot_rows:
+            d = split_divisions(r['division'])
+            if not d:
+                return None   # a slot with no division is for every division -> no limit
+            out.update(d)
+        return out
+
+    day_rows = [r for r in rows if r['day_of_week'] == day]
+    scope = _divs(day_rows) if day_rows else _divs(rows)
+    return sorted(scope) if scope else []
+
+
 def _get_faculty_assignment(cursor, faculty_id, assignment_id):
-    """assignment_id ko faculty_id se match karke uska subject/semester/division/batch nikaalta hai.
-    Yeh check karta hai ki logged-in faculty hi is subject ko padhata hai (kisi aur ka attendance mark na ho)."""
+    """Matches assignment_id against faculty_id and fetches its subject/semester/division/batch.
+    This checks that the logged-in faculty really teaches this subject (so nobody can mark another faculty's attendance)."""
     cursor.execute("""
         SELECT subject_id, semester, division, academic_year
         FROM faculty_subjects
@@ -243,14 +594,18 @@ def _get_faculty_assignment(cursor, faculty_id, assignment_id):
 @app.route('/api/faculty/attendance', methods=['GET'])
 @faculty_required
 def get_faculty_attendance():
-    """Query params: assignment_id, date, division (optional — sirf tab use hota hai jab assignment "All divisions" ho,
-    upar wale Division filter se aata hai).
-    Us subject+semester+division+batch ke students, diye gaye date ka unka status (present/absent/None=not marked) ke saath."""
+    """Query params: assignment_id, date, division (optional — used only when the assignment is "All divisions",
+    it comes from the Division filter above).
+    The students of that subject+semester+division+batch, with their status on the given date (present/absent/None=not marked)."""
     assignment_id = request.args.get('assignment_id')
+    timetable_id = request.args.get('timetable_id')   # set when this faculty is the SUBSTITUTE for that slot
     date = request.args.get('date')
     chosen_division = request.args.get('division') or None
-    if not assignment_id or not date:
-        return jsonify({"message": "assignment_id and date are required"}), 400
+    session_type = request.args.get('session_type') or 'Lecture'
+    if (not assignment_id and not timetable_id) or not date:
+        return jsonify({"message": "assignment_id (or timetable_id) and date are required"}), 400
+    if session_type not in ('Lecture', 'Lab'):
+        return jsonify({"message": "session_type must be Lecture or Lab"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -259,16 +614,49 @@ def get_faculty_attendance():
         if not faculty_id:
             return jsonify({"message": "Faculty record not found"}), 404
 
-        assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
-        if not assignment:
-            return jsonify({"message": "This subject is not assigned to you"}), 403
+        is_sub = False
+        if timetable_id:
+            try:
+                date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({"message": "Invalid date"}), 400
+            target = get_substitute_target(cursor, faculty_id, timetable_id, date_obj)
+            if not target:
+                return jsonify({"message": "You are not the substitute for this lecture on that date"}), 403
+            year_row = _get_academic_year_for_date_semester(cursor, date, target['semester'])
+            if not year_row:
+                return jsonify({"message": f"This date is outside Sem {target['semester']}'s date range"}), 400
+            assignment = {"subject_id": target['subject_id'], "semester": target['semester'],
+                          "division": target['division'] or '', "academic_year": year_row['year_label']}
+            session_type = target['session_type']
+            is_sub = True
+        else:
+            assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
+            if not assignment:
+                return jsonify({"message": "This subject is not assigned to you"}), 403
 
-        if assignment['division']:
+        # "All divisions" assignment + Division filter on "All divisions": do NOT list every division blindly —
+        # only the division(s) the timetable has this Lecture / Lab for on that day (e.g. only B, never A).
+        auto_divs = []
+        if not is_sub and not assignment['division'] and not chosen_division:
+            try:
+                auto_divs = _all_divisions_scope(cursor, faculty_id, assignment['subject_id'], assignment['semester'],
+                                                 session_type, datetime.strptime(date, '%Y-%m-%d').date())
+            except ValueError:
+                auto_divs = []
+
+        if assignment['division'] and is_sub:
+            division_clause = "AND FIND_IN_SET(st.division, %s) > 0"   # the slot's division can be 'A,B'
+            division_param = (assignment['division'],)
+        elif assignment['division']:
             division_clause = "AND st.division = %s"
             division_param = (assignment['division'],)
         elif chosen_division:
             division_clause = "AND st.division = %s"
             division_param = (chosen_division,)
+        elif auto_divs:
+            division_clause = "AND st.division IN (" + ",".join(["%s"] * len(auto_divs)) + ")"
+            division_param = tuple(auto_divs)
         else:
             division_clause = ""
             division_param = ()
@@ -285,16 +673,52 @@ def get_faculty_attendance():
             FROM students st
             JOIN users u ON u.id = st.user_id
             LEFT JOIN attendance a
-                ON a.student_id = st.id AND a.subject_id = %s AND a.attendance_date = %s
+                ON a.student_id = st.id AND a.subject_id = %s AND a.attendance_date = %s AND a.session_type = %s
             WHERE st.semester = %s AND st.academic_year = %s {division_clause}
             ORDER BY u.login_id
-        """, (assignment['subject_id'], date,
+        """, (assignment['subject_id'], date, session_type,
               assignment['semester'], assignment['academic_year']) + division_param)
         students = cursor.fetchall()
 
+        # Timetable division check: e.g. Lab is only for Division B -> Division A's list is not given out at all
+        blocked_message = None
+        if not is_sub:
+            check_divs = [assignment['division'] or chosen_division] if (assignment['division'] or chosen_division) \
+                else sorted({st_row['division'] for st_row in students if st_row['division']})
+            blocked_message = _session_division_block(cursor, faculty_id, assignment['subject_id'], assignment['semester'],
+                                                      session_type, check_divs)
+        if blocked_message:
+            return jsonify({
+                "subject_id": assignment['subject_id'],
+                "students": [],
+                "blocked_message": blocked_message,
+                "scheduled": False,
+                "extra": False,
+                "substitute": False,
+                "session_type": session_type
+            }), 200
+
+        # Is this date/type in the timetable, or already confirmed as an Extra session? (info only)
+        scheduled, extra = True, False
+        if not is_sub:
+            try:
+                date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+                eff_div = assignment['division'] or chosen_division or ''
+                scheduled = has_scheduled_slot(cursor, faculty_id, assignment['subject_id'], assignment['semester'],
+                                               eff_div, session_type, date_obj)
+                extra = (not scheduled) and bool(get_extra_session(cursor, faculty_id, assignment['subject_id'],
+                                                                   assignment['semester'], eff_div, session_type, date_obj))
+            except ValueError:
+                pass
+
         return jsonify({
             "subject_id": assignment['subject_id'],
-            "students": students
+            "students": students,
+            "class_divisions": auto_divs,
+            "scheduled": scheduled,
+            "extra": extra,
+            "substitute": is_sub,
+            "session_type": session_type
         }), 200
     except Exception as e:
         return jsonify({"message": "Attendance could not be loaded", "error": str(e)}), 500
@@ -307,15 +731,19 @@ def get_faculty_attendance():
 @faculty_required
 def save_faculty_attendance():
     """Body: { assignment_id, date, records: [{student_id, status}] }.
-    Bulk mark/update — poori class ka ek din ka attendance ek saath save hota hai.
-    assignment_id ko faculty_id se match karke check karte hain (koi aur faculty ka subject nahi mark kar sakta)."""
+    Bulk mark/update — the whole class's attendance for one day is saved in one go.
+    assignment_id is matched against faculty_id (nobody can mark another faculty's subject)."""
     data = request.get_json() or {}
     assignment_id = data.get('assignment_id')
+    timetable_id = data.get('timetable_id')   # set when this faculty is the SUBSTITUTE for that slot
     date = data.get('date')
     records = data.get('records') or []   # [{student_id, status}]
+    session_type = data.get('session_type') or 'Lecture'
 
-    if not assignment_id or not date or not records:
-        return jsonify({"message": "assignment_id, date and records are required"}), 400
+    if (not assignment_id and not timetable_id) or not date or not records:
+        return jsonify({"message": "assignment_id (or timetable_id), date and records are required"}), 400
+    if session_type not in ('Lecture', 'Lab'):
+        return jsonify({"message": "session_type must be Lecture or Lab"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -324,26 +752,157 @@ def save_faculty_attendance():
         if not faculty_id:
             return jsonify({"message": "Faculty record not found"}), 404
 
-        assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
-        if not assignment:
-            return jsonify({"message": "This subject is not assigned to you"}), 403
+        is_sub = False
+        if timetable_id:
+            # Substitute faculty marking another faculty's slot: allowed only on that date, only for that slot
+            try:
+                date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+            except ValueError:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": "Invalid date"}), 400
+            target = get_substitute_target(cursor, faculty_id, timetable_id, date_obj)
+            if not target:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": "You are not the substitute for this lecture on that date"}), 403
+            sub_year_row = _get_academic_year_for_date_semester(cursor, date, target['semester'])
+            if not sub_year_row:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": f"This date is outside Sem {target['semester']}'s date range — ask Admin to set this semester's start/end date"}), 400
+            holiday = get_holiday_for_slot(cursor, date_obj, target['semester'], target['division'])
+            if holiday:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": f"{date_obj.isoformat()} is a holiday ({holiday['name']}) — attendance cannot be marked"}), 409
+            assignment = {"subject_id": target['subject_id'], "semester": target['semester'],
+                          "division": target['division'] or '', "academic_year": sub_year_row['year_label']}
+            session_type = target['session_type']
+            is_sub = True
+        else:
+            assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
+            if not assignment:
+                return jsonify({"message": "This subject is not assigned to you"}), 403
 
-        if not _get_academic_year_for_date_semester(cursor, date, assignment['semester']):
-            cursor.close()
-            conn.close()
-            return jsonify({"message": f"This date is outside Sem {assignment['semester']}'s date range — ask Admin to set this semester's start/end date"}), 400
+            # Division check: an assignment with its own division can only be saved for THAT division; an
+            # "All divisions" assignment needs the chosen division to be real for this semester + batch.
+            chosen = (data.get('division') or '').strip()
+            if assignment['division'] and chosen and chosen != assignment['division']:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": f"This subject is assigned to you for Division {assignment['division']} only — Division {chosen} cannot be marked"}), 400
+            resolved_div, div_err = _resolve_division(cursor, assignment, chosen or None)
+            if div_err:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": div_err}), 400
+
+            if not _get_academic_year_for_date_semester(cursor, date, assignment['semester']):
+                cursor.close()
+                conn.close()
+                return jsonify({"message": f"This date is outside Sem {assignment['semester']}'s date range — ask Admin to set this semester's start/end date"}), 400
+
+            try:
+                date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+            except ValueError:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": "Invalid date"}), 400
 
         subject_id = assignment['subject_id']
+
+        # Division check (server side): every student in `records` must really belong to this class —
+        # same semester + batch, and the division being marked (an assignment's own division, the substitute slot's
+        # division(s), or the Division chosen for an "All divisions" assignment). Nobody else's students get saved.
+        eff_div = assignment['division'] or (data.get('division') or '').strip()
+        # "All divisions" + no Division chosen: the save is limited to the division(s) the timetable has this session for
+        auto_divs = []
+        if not is_sub and not eff_div:
+            auto_divs = _all_divisions_scope(cursor, faculty_id, assignment['subject_id'], assignment['semester'],
+                                             session_type, date_obj)
+        wanted_ids = []
+        for r in records:
+            try:
+                sid = int(r.get('student_id'))
+            except (TypeError, ValueError):
+                continue
+            if sid not in wanted_ids:
+                wanted_ids.append(sid)
+        if not wanted_ids:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "No valid students to save"}), 400
+        placeholders = ','.join(['%s'] * len(wanted_ids))
+        class_sql = f"SELECT st.id, st.division FROM students st WHERE st.id IN ({placeholders}) AND st.semester = %s AND st.academic_year = %s"
+        class_params = list(wanted_ids) + [assignment['semester'], assignment['academic_year']]
+        if is_sub and assignment['division']:
+            class_sql += " AND FIND_IN_SET(st.division, %s) > 0"   # the slot's division can be 'A,B'
+            class_params.append(assignment['division'])
+        elif eff_div:
+            class_sql += " AND st.division = %s"
+            class_params.append(eff_div)
+        elif auto_divs:
+            class_sql += " AND st.division IN (" + ",".join(["%s"] * len(auto_divs)) + ")"
+            class_params.extend(auto_divs)
+        cursor.execute(class_sql, tuple(class_params))
+        class_rows = cursor.fetchall()
+        if len(class_rows) != len(wanted_ids):
+            cursor.close()
+            conn.close()
+            where = (f"Division {eff_div}" if eff_div
+                     else (f"Division {', '.join(auto_divs)}" if auto_divs else f"Sem {assignment['semester']}"))
+            return jsonify({"message": f"Some of these students do not belong to {where} ({assignment['academic_year']}) — reload the list and try again"}), 400
+
+        # Holiday / cancelled / substituted check — for the division(s) actually being marked (not the assignment's
+        # blank division), so Division B's holiday or cancellation is checked for B and A's cancellation never blocks B.
+        if not is_sub:
+            divisions_marked = [eff_div] if eff_div else (sorted({row['division'] for row in class_rows if row['division']}) or [''])
+            for div_marked in divisions_marked:
+                block_reason = get_session_block_reason(cursor, faculty_id, subject_id, assignment['semester'],
+                                                        div_marked, session_type, date_obj)
+                if block_reason:
+                    cursor.close()
+                    conn.close()
+                    return jsonify({"message": block_reason}), 409
+
+        # Timetable division check (hard): if this session type is in the timetable only for other division(s)
+        # (e.g. Lab only for Division B), the division being marked cannot be saved — no Extra-session option.
+        if not is_sub:
+            division_msg = _session_division_block(cursor, faculty_id, subject_id, assignment['semester'], session_type,
+                                                   [eff_div] if eff_div else sorted({row['division'] for row in class_rows if row['division']}))
+            if division_msg:
+                cursor.close()
+                conn.close()
+                return jsonify({"message": division_msg}), 409
+
+        # The timetable is only a plan. If this weekday/session type is NOT in the timetable, attendance is
+        # saved only when the faculty confirms it as an Extra session (or it was already confirmed earlier).
+        is_extra = False
+        if not is_sub:
+            if not has_scheduled_slot(cursor, faculty_id, subject_id, assignment['semester'], eff_div, session_type, date_obj):
+                already_extra = get_extra_session(cursor, faculty_id, subject_id, assignment['semester'], eff_div, session_type, date_obj)
+                if not (data.get('is_extra') or already_extra):
+                    cursor.close()
+                    conn.close()
+                    return jsonify({
+                        "message": f"{session_type} for this subject is not in your timetable on {date_obj.strftime('%A')} ({date_obj.isoformat()}).",
+                        "needs_extra_confirm": True
+                    }), 409
+                is_extra = True
+
         for r in records:
             student_id = r.get('student_id')
             status = r.get('status')
             if not student_id or status not in ('present', 'absent'):
                 continue
             cursor.execute("""
-                INSERT INTO attendance (student_id, subject_id, faculty_id, attendance_date, status)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO attendance (student_id, subject_id, faculty_id, attendance_date, session_type, status)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status), faculty_id = VALUES(faculty_id)
-            """, (student_id, subject_id, faculty_id, date, status))
+            """, (student_id, subject_id, faculty_id, date, session_type, status))
+        if is_extra:
+            record_extra_session(cursor, faculty_id, subject_id, assignment['semester'], eff_div, session_type, date_obj)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -358,14 +917,14 @@ def save_faculty_attendance():
 
 # ============================================================
 # MARKS ENTRY (request-based workflow)
-# Faculty submit karta hai -> PENDING request banta hai
-# Admin (admin_routes.py) accept/reject/publish karta hai
-# Jab tak koi active request (pending/approved/published) hai, faculty dobara submit nahi kar sakta
-# Sirf 'rejected' hone par dobara edit/submit allowed hai
+# Faculty submits -> a PENDING request is created
+# Admin (admin_routes.py) accepts/rejects/publishes it
+# As long as an active request (pending/approved/published) exists, the faculty cannot submit again
+# Editing/submitting again is allowed only after a 'rejected' request
 # ============================================================
 def _get_latest_marks_request(cursor, faculty_id, subject_id, exam_type, semester, division, academic_year):
-    """Is subject+exam+division ki sabse latest request (agar koi ho) — status decide karta hai ki
-    faculty abhi edit kar sakta hai ya nahi."""
+    """The latest request (if any) for this subject+exam+division — its status decides
+    whether the faculty can edit right now."""
     cursor.execute("""
         SELECT id, status, max_marks, submitted_at, reviewed_at, remarks
         FROM marks_requests
@@ -380,8 +939,8 @@ def _get_latest_marks_request(cursor, faculty_id, subject_id, exam_type, semeste
 @app.route('/api/faculty/marks/requests', methods=['GET'])
 @faculty_required
 def get_my_marks_requests():
-    """Faculty ki apni saari marks requests (har subject/exam), latest status ke saath —
-    Marks Entry screen ke top pe 'My Submissions' list ke liye."""
+    """All of the faculty's own marks requests (every subject/exam), with their latest status —
+    for the 'My Submissions' list at the top of the Marks Entry screen."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -413,7 +972,7 @@ def get_my_marks_requests():
 @faculty_required
 def get_faculty_marks():
     """Query params: assignment_id, exam_type.
-    Us subject+semester+division+batch ke students, latest request ka status aur marks (agar ho) ke saath."""
+    The students of that subject+semester+division+batch, with the latest request's status and marks (if any)."""
     assignment_id = request.args.get('assignment_id')
     exam_type = request.args.get('exam_type')
     chosen_division = request.args.get('division') or None
@@ -434,9 +993,11 @@ def get_faculty_marks():
         subject_id = assignment['subject_id']
         semester = assignment['semester']
         academic_year = assignment['academic_year']
-        # assignment ki apni division ho to wahi use karo; warna (assignment "All divisions" hai) to
-        # upar Division filter se chuni gayi division use karo — Students/Attendance tabs jaisa hi behaviour
-        division = assignment['division'] or chosen_division
+        # If the assignment has its own division, use that; otherwise (the assignment is "All divisions")
+        # use the division picked in the Division filter above — same behaviour as the Students/Attendance tabs
+        division, division_error = _resolve_division(cursor, assignment, chosen_division)
+        if division_error:
+            return jsonify({"message": division_error}), 400
 
         latest_request = _get_latest_marks_request(
             cursor, faculty_id, subject_id, exam_type, semester, division, academic_year
@@ -487,8 +1048,8 @@ def get_faculty_marks():
 @faculty_required
 def save_faculty_marks():
     """Body: { assignment_id, exam_type, max_marks, records: [{student_id, marks_obtained}] }.
-    Naya PENDING request banata hai. Agar is subject+exam ki koi request pehle se pending/approved/published
-    hai to reject ho jaata hai — pehle admin ka decision aana chahiye (rejected ke baad hi dobara submit ho sakta hai)."""
+    Creates a new PENDING request. If a request for this subject+exam is already pending/approved/published,
+    it is rejected — the admin's decision must come first (a resubmission is possible only after a rejection)."""
     data = request.get_json() or {}
     assignment_id = data.get('assignment_id')
     exam_type = data.get('exam_type')
@@ -512,9 +1073,13 @@ def save_faculty_marks():
 
         subject_id = assignment['subject_id']
         semester = assignment['semester']
-        # assignment ki apni division ho to wahi use karo; warna (assignment "All divisions" hai) to
-        # upar Division filter se chuni gayi division use karo — taaki har division ki request alag se track ho
-        division = assignment['division'] or chosen_division
+        # If the assignment has its own division, use that; otherwise (the assignment is "All divisions")
+        # use the division picked in the Division filter above — so each division's request is tracked separately
+        division, division_error = _resolve_division(cursor, assignment, chosen_division)
+        if division_error:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": division_error}), 400
         academic_year = assignment['academic_year']
 
         latest_request = _get_latest_marks_request(
@@ -539,7 +1104,7 @@ def save_faculty_marks():
                 continue
             try:
                 if float(marks_obtained) > float(max_marks):
-                    continue   # max marks se zyada marks ignore karo
+                    continue   # ignore marks above the max marks
             except (TypeError, ValueError):
                 continue
 
@@ -561,15 +1126,15 @@ def save_faculty_marks():
 
 
 # ============================================================
-# FEES ENTRY (faculty ki assigned class ke fee records — sirf status paid/unpaid toggle kar sakte hain;
-# fee item banana/edit karna, payment link, due date — sab Admin ke haath me hi rehta hai)
+# FEES ENTRY (fee records of the faculty's assigned class — they can only toggle the paid/unpaid status;
+# creating/editing fee items, payment links and due dates all stay with Admin)
 # ============================================================
 @app.route('/api/faculty/fees', methods=['GET'])
 @faculty_required
 def get_faculty_fees():
     """Query params: semester, academic_year, division (optional).
-    Sirf woh fee records dikhata hai jo Admin ne pehle se bana rakhe hain us class ke liye —
-    agar Admin ne abhi tak us semester+batch ke liye fee setup nahi kiya, toh list khaali aayegi."""
+    Shows only the fee records that Admin has already created for that class —
+    if Admin hasn't set up fees for that semester+batch yet, the list will be empty."""
     semester = request.args.get('semester')
     academic_year = request.args.get('academic_year')
     division = request.args.get('division') or None
@@ -583,18 +1148,13 @@ def get_faculty_fees():
         if not faculty_id:
             return jsonify({"message": "Faculty record not found"}), 404
 
-        # Faculty isi semester+batch(+division) ko padhata hai ya nahi, check karo
-        cursor.execute("""
-            SELECT id FROM faculty_subjects
-            WHERE faculty_id = %s AND semester = %s AND academic_year = %s
-              AND (division IS NULL OR division = %s)
-            LIMIT 1
-        """, (faculty_id, semester, academic_year, division))
-        if not cursor.fetchone():
+        # Check whether the faculty teaches this semester+batch(+division).
+        # Even when "All divisions" is chosen, only records of the faculty's assigned divisions are returned.
+        allowed, division_clause, division_param = _class_division_scope(
+            cursor, faculty_id, semester, academic_year, division
+        )
+        if not allowed:
             return jsonify({"message": "This class is not assigned to you"}), 403
-
-        division_clause = "AND st.division = %s" if division else ""
-        division_param = (division,) if division else ()
 
         cursor.execute(f"""
             SELECT
@@ -631,7 +1191,7 @@ def get_faculty_fees():
 @faculty_required
 def save_faculty_fees():
     """Body: { semester, academic_year, division, updates: [{fee_id, status}] }.
-    Bulk status update — faculty sirf apni assigned class ke fee records ka status (paid/unpaid) badal sakta hai."""
+    Bulk status update — the faculty can change the status (paid/unpaid) only of fee records of their assigned class."""
     data = request.get_json() or {}
     semester = data.get('semester')
     academic_year = data.get('academic_year')
@@ -648,17 +1208,11 @@ def save_faculty_fees():
         if not faculty_id:
             return jsonify({"message": "Faculty record not found"}), 404
 
-        cursor.execute("""
-            SELECT id FROM faculty_subjects
-            WHERE faculty_id = %s AND semester = %s AND academic_year = %s
-              AND (division IS NULL OR division = %s)
-            LIMIT 1
-        """, (faculty_id, semester, academic_year, division))
-        if not cursor.fetchone():
+        allowed, division_clause, division_param = _class_division_scope(
+            cursor, faculty_id, semester, academic_year, division
+        )
+        if not allowed:
             return jsonify({"message": "This class is not assigned to you"}), 403
-
-        division_clause = "AND st.division = %s" if division else ""
-        division_param = (division,) if division else ()
 
         updated = 0
         for u in updates:
@@ -666,7 +1220,7 @@ def save_faculty_fees():
             status = u.get('status')
             if not fee_id or status not in ('paid', 'unpaid'):
                 continue
-            # fee_id sirf isi semester+batch(+division) ke student ka hona chahiye — is join se verify karte hain
+            # fee_id must belong to a student of this semester+batch(+division) only — verified with this join
             cursor.execute(f"""
                 UPDATE fees f
                 JOIN students st ON st.id = f.student_id
@@ -686,17 +1240,17 @@ def save_faculty_fees():
 
 
 # ============================================================
-# MATERIALS (faculty apne assigned subject ke study materials upload/list/edit/delete karta hai;
-# `notes` table hi Admin ke saath shared hai — faculty_id se track hota hai kisne upload kiya,
-# taaki har faculty sirf apna khud ka upload edit/delete kar sake)
+# MATERIALS (the faculty uploads/lists/edits/deletes study materials of their assigned subjects;
+# the `notes` table is shared with Admin — faculty_id tracks who uploaded it,
+# so each faculty can edit/delete only their own uploads)
 # ============================================================
 @app.route('/api/faculty/materials', methods=['GET'])
 @faculty_required
 def get_faculty_materials():
-    """Query params: assignment_id, division (optional — sirf tab use hota hai jab assignment
-    'All divisions' ho, upar wale Division filter se aata hai).
-    Us subject+semester+batch ke saare materials (Admin ya kisi bhi faculty ke upload kiye hue) —
-    'can_manage' flag batata hai ki yeh material khud is faculty ne upload kiya hai ya nahi."""
+    """Query params: assignment_id, division (optional — used only when the assignment is
+    'All divisions', it comes from the Division filter above).
+    All materials of that subject+semester+batch (uploaded by Admin or any faculty) —
+    the 'can_manage' flag says whether this faculty uploaded the material themselves."""
     assignment_id = request.args.get('assignment_id')
     chosen_division = request.args.get('division') or None
     if not assignment_id:
@@ -713,7 +1267,9 @@ def get_faculty_materials():
         if not assignment:
             return jsonify({"message": "This subject is not assigned to you"}), 403
 
-        division = assignment['division'] or chosen_division
+        division, division_error = _resolve_division(cursor, assignment, chosen_division)
+        if division_error:
+            return jsonify({"message": division_error}), 400
         if division:
             division_clause = "AND (n.division IS NULL OR n.division = %s)"
             division_param = (division,)
@@ -749,7 +1305,7 @@ def get_faculty_materials():
 @faculty_required
 def upload_faculty_material():
     """multipart/form-data: assignment_id, title, description (optional), division (optional —
-    'All divisions' assignment ke liye upar chuni gayi division), file."""
+    the division chosen above for an 'All divisions' assignment), file."""
     assignment_id = request.form.get('assignment_id')
     title = request.form.get('title')
     description = request.form.get('description') or None
@@ -759,8 +1315,8 @@ def upload_faculty_material():
     if not assignment_id or not title or not file or file.filename == '':
         return jsonify({"message": "Subject, title and file are required"}), 400
 
-    if not _allowed_note_file(file.filename):
-        return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
+    if not _allowed_note_file(file):
+        return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -776,11 +1332,15 @@ def upload_faculty_material():
         conn.close()
         return jsonify({"message": "This subject is not assigned to you"}), 403
 
-    division = assignment['division'] or chosen_division
+    division, division_error = _resolve_division(cursor, assignment, chosen_division)
+    if division_error:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": division_error}), 400
 
     original_name = secure_filename(file.filename)
     file_ext = original_name.rsplit('.', 1)[1].lower()
-    unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # disk pe collision se bachne ke liye unique naam
+    unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # unique name to avoid collisions on disk
     save_path = os.path.join(NOTES_UPLOAD_FOLDER, unique_name)
 
     file.save(save_path)
@@ -801,7 +1361,7 @@ def upload_faculty_material():
         cursor.close()
         conn.close()
         if os.path.exists(save_path):
-            os.remove(save_path)   # DB save fail hua to orphan file disk pe mat chodo
+            os.remove(save_path)   # if the DB save failed, don't leave an orphan file on disk
         return jsonify({"message": "Material could not be saved", "error": str(e)}), 500
 
     cursor.close()
@@ -812,8 +1372,8 @@ def upload_faculty_material():
 @app.route('/api/faculty/materials/<int:note_id>', methods=['PUT'])
 @faculty_required
 def update_faculty_material(note_id):
-    """Sirf details edit hoti hain (title/description) — file replace nahi hoti.
-    Sirf woh faculty edit kar sakta hai jisne khud yeh material upload kiya tha."""
+    """Only the details (title/description) can be edited — the file cannot be replaced.
+    Only the faculty who uploaded this material can edit it."""
     data = request.get_json() or {}
     title = data.get('title')
     description = data.get('description') or None
@@ -876,7 +1436,7 @@ def delete_faculty_material(note_id):
 
     file_path = os.path.join(NOTES_UPLOAD_FOLDER, note['file_path'])
     if os.path.exists(file_path):
-        os.remove(file_path)   # DB record ke saath actual file bhi delete karo
+        os.remove(file_path)   # delete the actual file along with the DB record
 
     return jsonify({"message": "Material deleted"}), 200
 
@@ -903,13 +1463,13 @@ def download_faculty_material(note_id):
 
 
 # ============================================================
-# ASSIGNMENTS (apni assigned subjects ki assignments — Admin ke `assignments` table se shared.
-# Add/Edit/Delete sirf khud banayi hui assignment pe milta hai; aur ek baar us assignment par
-# koi submission aa jaaye to details edit karna band ho jaata hai — sirf submissions/marks review ho sakti hai.)
+# ASSIGNMENTS (assignments of their assigned subjects — shared with Admin's `assignments` table.
+# Add/Edit/Delete is allowed only on assignments they created themselves; and once any
+# submission arrives for an assignment, editing its details is locked — only submissions/marks can be reviewed.)
 # ============================================================
 def _get_visible_faculty_assignment(cursor, faculty_id, assignment_id):
-    """Assignment tabhi milegi jab woh is faculty ki assigned subject+semester+batch ke scope me ho
-    (chahe assignment kisi bhi faculty ne banayi ho usi subject/class ke liye)."""
+    """An assignment is returned only if it is within this faculty's assigned subject+semester+batch scope
+    (no matter which faculty created the assignment for that same subject/class)."""
     cursor.execute("""
         SELECT a.*
         FROM assignments a
@@ -929,8 +1489,8 @@ def _get_visible_faculty_assignment(cursor, faculty_id, assignment_id):
 @app.route('/api/faculty/assignments', methods=['GET'])
 @faculty_required
 def get_faculty_assignments():
-    """Query params: semester, subject_id, division, academic_year, search (title) — sab optional.
-    Sirf woh assignments dikhti hain jo is faculty ki assigned subject+semester+batch ke scope me ho."""
+    """Query params: semester, subject_id, division, academic_year, search (title) — all optional.
+    Shows only assignments within this faculty's assigned subject+semester+batch scope."""
     semester = request.args.get('semester')
     subject_id = request.args.get('subject_id')
     division = request.args.get('division')
@@ -999,7 +1559,7 @@ def get_faculty_assignments():
 @faculty_required
 def add_faculty_assignment():
     """multipart/form-data: assignment_id (faculty_subjects.id), title, description (optional),
-    due_date (optional), division (optional — sirf tab use hota hai jab assignment "All divisions" ho),
+    due_date (optional), division (optional — used only when the assignment is "All divisions"),
     file (optional, PDF/DOC/DOCX/PPT/PPTX)."""
     assignment_id = request.form.get('assignment_id')
     title = request.form.get('title')
@@ -1025,7 +1585,11 @@ def add_faculty_assignment():
         conn.close()
         return jsonify({"message": "This subject is not assigned to you"}), 403
 
-    division = assignment['division'] or chosen_division
+    division, division_error = _resolve_division(cursor, assignment, chosen_division)
+    if division_error:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": division_error}), 400
 
     unique_name = None
     original_name = None
@@ -1033,10 +1597,10 @@ def add_faculty_assignment():
     file_ext = None
 
     if file and file.filename:
-        if not _allowed_assignment_file(file.filename):
+        if not _allowed_assignment_file(file):
             cursor.close()
             conn.close()
-            return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
+            return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{file_ext}"
@@ -1072,8 +1636,8 @@ def add_faculty_assignment():
 @app.route('/api/faculty/assignments/<int:assignment_id>', methods=['PUT'])
 @faculty_required
 def update_faculty_assignment(assignment_id):
-    """Sirf title/due_date/description edit hote hain (subject/division/semester nahi) —
-    aur sirf tab jab (a) yeh assignment khud faculty ne banayi ho, (b) abhi tak koi submission na aayi ho."""
+    """Only title/due_date/description can be edited (not subject/division/semester) —
+    and only when (a) the faculty created this assignment themselves and (b) no submission has arrived yet."""
     data = request.get_json() or {}
     title = data.get('title')
     due_date = data.get('due_date') or None
@@ -1115,8 +1679,8 @@ def update_faculty_assignment(assignment_id):
 @app.route('/api/faculty/assignments/<int:assignment_id>', methods=['DELETE'])
 @faculty_required
 def delete_faculty_assignment(assignment_id):
-    """Sirf woh faculty delete kar sakta hai jisne khud yeh assignment banayi thi.
-    Delete hone par uski attachment file, saath hi sab student submissions (aur unki files) bhi hat jaati hain."""
+    """Only the faculty who created this assignment can delete it.
+    On delete, its attachment file and all student submissions (and their files) are removed too."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -1160,7 +1724,7 @@ def delete_faculty_assignment(assignment_id):
 @app.route('/api/faculty/assignments/<int:assignment_id>/download', methods=['GET'])
 @faculty_required
 def download_faculty_assignment(assignment_id):
-    """Assignment ka attachment (question paper) download karta hai."""
+    """Downloads the assignment's attachment (question paper)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     faculty_id = _get_faculty_id(cursor, request.user['user_id'])
@@ -1187,7 +1751,7 @@ def download_faculty_assignment(assignment_id):
 @app.route('/api/faculty/assignments/<int:assignment_id>/submissions', methods=['GET'])
 @faculty_required
 def get_faculty_assignment_submissions(assignment_id):
-    """Assignment ke semester+division ke sab eligible students, saath me unka submission status/marks (agar submit kiya ho)."""
+    """All eligible students of the assignment's semester+division, with their submission status/marks (if submitted)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -1212,7 +1776,7 @@ def get_faculty_assignment_submissions(assignment_id):
         if assignment['division']:
             query += " AND s.division = %s"
             params.append(assignment['division'])
-        query += " ORDER BY u.name ASC"
+        query += " ORDER BY u.login_id ASC"
 
         cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
@@ -1231,8 +1795,8 @@ def get_faculty_assignment_submissions(assignment_id):
 @app.route('/api/faculty/assignments/<int:assignment_id>/submissions/<int:student_id>', methods=['PUT'])
 @faculty_required
 def upsert_faculty_submission(assignment_id, student_id):
-    """Faculty manually ek student ka submission status set karta hai — Submitted/Late/Pending, saath me marks.
-    Sirf woh faculty kar sakta hai jisne khud yeh assignment banayi thi."""
+    """The faculty manually sets a student's submission status — Submitted/Late/Pending, along with marks.
+    Only the faculty who created this assignment can do this."""
     data = request.get_json() or {}
     submitted = data.get('submitted', True)
     submitted_at = data.get('submitted_at')
@@ -1291,7 +1855,7 @@ def upsert_faculty_submission(assignment_id, student_id):
 @app.route('/api/faculty/assignments/submissions/<int:submission_id>/download', methods=['GET'])
 @faculty_required
 def download_faculty_submission(submission_id):
-    """Ek student ki submitted file download karta hai (sirf agar assignment is faculty ke scope me ho)."""
+    """Downloads a student's submitted file (only if the assignment is within this faculty's scope)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     faculty_id = _get_faculty_id(cursor, request.user['user_id'])
@@ -1327,13 +1891,13 @@ def download_faculty_submission(submission_id):
 
 
 # ============================================================
-# TIMETABLE (apni khud ki weekly schedule — read-only; Admin hi is table ko manage karta hai)
+# TIMETABLE (their own weekly schedule — read-only; only Admin manages this table)
 # ============================================================
 @app.route('/api/faculty/timetable', methods=['GET'])
 @faculty_required
 def get_faculty_timetable():
-    """Read-only: college ki poori regular weekly timetable (sab semester/division/batch) —
-    faculty sirf dekh sakta hai, add/edit/delete sirf Admin karta hai."""
+    """Read-only: the college's full regular weekly timetable (all semesters/divisions/batches) —
+    faculty can only view it; add/edit/delete is done by Admin only."""
     academic_year = request.args.get('academic_year')
 
     conn = get_db()
@@ -1344,7 +1908,7 @@ def get_faculty_timetable():
             return jsonify({"message": "Faculty record not found"}), 404
 
         query = """
-            SELECT t.id, t.semester, t.division, t.academic_year, t.day_of_week, t.room_no,
+            SELECT t.id, t.semester, t.division, t.academic_year, t.day_of_week, t.room_no, t.session_type,
                    TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
                    TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
                    t.subject_id, sub.subject_name, sub.subject_code,
@@ -1377,8 +1941,8 @@ def get_faculty_timetable():
 @app.route('/api/faculty/exam-timetable', methods=['GET'])
 @faculty_required
 def get_faculty_exam_timetable():
-    """Read-only: Mid-Sem / Remedial exam timetable (sab semester/division/batch) —
-    faculty sirf dekh sakta hai, add/edit/delete sirf Admin karta hai."""
+    """Read-only: Mid-Sem / Remedial exam timetable (all semesters/divisions/batches) —
+    faculty can only view it; add/edit/delete is done by Admin only."""
     exam_type = request.args.get('exam_type')
     academic_year = request.args.get('academic_year')
 
@@ -1422,9 +1986,9 @@ def get_faculty_exam_timetable():
 
 
 # ============================================================
-# NOTICES (faculty ke liye read — Admin broadcast + apni personal notices — aur
-# apni assigned class ko khud notice post karna. Edit/Delete/Pin sirf khud ki post ki
-# hui notice pe milta hai; class/subject edit pe change nahi hoti, sirf naya post karte waqt.)
+# NOTICES (faculty can read — Admin broadcasts + their own personal notices — and
+# post notices to their own assigned class. Edit/Delete/Pin is allowed only on notices they posted
+# themselves; class/subject cannot be changed on edit, only when posting a new one.)
 # ============================================================
 @app.route('/api/faculty/notices', methods=['GET'])
 @faculty_required
@@ -1436,6 +2000,8 @@ def get_faculty_notices():
         cursor.execute("""
             SELECT id, title, content, category, is_pinned, created_at, target_user_id,
                    semester, division, posted_by, file_name, file_size, file_type,
+                   (SELECT u.name FROM users u WHERE u.id = notices.posted_by) AS posted_by_name,
+                   (SELECT u.role FROM users u WHERE u.id = notices.posted_by) AS posted_by_role,
                    (SELECT COUNT(*) FROM notice_reads nr
                     WHERE nr.notice_id = notices.id AND nr.user_id <> notices.posted_by) AS seen_count,
                    (SELECT MAX(nr.seen_at) FROM notice_reads nr
@@ -1445,6 +2011,8 @@ def get_faculty_notices():
             WHERE (target_role IN ('all','faculty') AND target_user_id IS NULL)
                OR target_user_id = %s
                OR posted_by = %s
+               OR (target_user_id IS NULL
+                   AND posted_by IN (SELECT id FROM users WHERE role = 'faculty'))   -- notices from other faculty are visible to all faculty
             ORDER BY is_pinned DESC, created_at DESC
             LIMIT 50
         """, (user_id, user_id))
@@ -1456,7 +2024,7 @@ def get_faculty_notices():
                 n['admin_seen'] = n['admin_seen_at'] is not None
                 n['admin_seen_at'] = n['admin_seen_at'].isoformat() if n['admin_seen_at'] else None
             else:
-                del n['seen_count']   # seen count sirf usi faculty ko dikhta hai jisne notice post ki
+                del n['seen_count']   # the seen count is shown only to the faculty who posted the notice
                 del n['admin_seen_at']
             del n['target_user_id']
             del n['posted_by']
@@ -1471,8 +2039,8 @@ def get_faculty_notices():
 @app.route('/api/faculty/notices/unread-count', methods=['GET'])
 @faculty_required
 def get_faculty_notices_unread_count():
-    """Sidebar ke 'Notices' item pe dot dikhane/hatane ke liye — kitni notices hain jo is
-    faculty ko dikhti hain (broadcast + personal + khud ki post ki hui) par abhi tak dekhi nahi."""
+    """To show/hide the dot on the sidebar 'Notices' item — how many notices are visible to this
+    faculty (broadcast + personal + their own + posted by other faculty) but not seen yet."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -1484,6 +2052,8 @@ def get_faculty_notices_unread_count():
                 (n.target_role IN ('all','faculty') AND n.target_user_id IS NULL)
                 OR n.target_user_id = %s
                 OR n.posted_by = %s
+                OR (n.target_user_id IS NULL
+                    AND n.posted_by IN (SELECT id FROM users WHERE role = 'faculty'))
             )
             AND NOT EXISTS (
                 SELECT 1 FROM notice_reads nr WHERE nr.notice_id = n.id AND nr.user_id = %s
@@ -1500,8 +2070,8 @@ def get_faculty_notices_unread_count():
 @app.route('/api/faculty/notices/mark-read', methods=['POST'])
 @faculty_required
 def mark_faculty_notices_read():
-    """Notices tab khulte hi call hota hai — jitni bhi notices is faculty ko dikhti hain,
-    sabko 'seen' mark kar deta hai, taaki sidebar ka dot hat jaaye."""
+    """Called as soon as the Notices tab opens — marks every notice visible to this faculty
+    as 'seen', so the sidebar dot disappears."""
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -1513,6 +2083,8 @@ def mark_faculty_notices_read():
             WHERE (n.target_role IN ('all','faculty') AND n.target_user_id IS NULL)
                OR n.target_user_id = %s
                OR n.posted_by = %s
+               OR (n.target_user_id IS NULL
+                   AND n.posted_by IN (SELECT id FROM users WHERE role = 'faculty'))
         """, (user_id, user_id, user_id))
         conn.commit()
         return jsonify({"message": "Marked as read"}), 200
@@ -1527,9 +2099,9 @@ def mark_faculty_notices_read():
 @app.route('/api/faculty/notices', methods=['POST'])
 @faculty_required
 def add_faculty_notice():
-    """multipart/form-data: assignment_id (faculty_subjects.id — jis class ko notice bhejni hai),
-    title, content (optional), category (optional), division (optional — sirf tab jab assignment
-    "All divisions" ho), file (optional, PDF/DOC/DOCX/PPT/PPTX/JPG/PNG). Hamesha students ko jaati hai."""
+    """multipart/form-data: assignment_id (faculty_subjects.id — the class the notice is being sent to),
+    title, content (optional), category (optional), division (optional — only when the assignment is
+    "All divisions"), file (optional, PDF/DOC/DOCX/PPT/PPTX/JPG/PNG). Always goes to students."""
     assignment_id = request.form.get('assignment_id')
     title = request.form.get('title')
     content = request.form.get('content') or None
@@ -1554,14 +2126,18 @@ def add_faculty_notice():
         conn.close()
         return jsonify({"message": "This subject is not assigned to you"}), 403
 
-    division = assignment['division'] or chosen_division
+    division, division_error = _resolve_division(cursor, assignment, chosen_division)
+    if division_error:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": division_error}), 400
 
     file_path = file_name = file_size = file_type = None
     if file and file.filename:
-        if not _allowed_notice_file(file.filename):
+        if not _allowed_notice_file(file):
             cursor.close()
             conn.close()
-            return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
+            return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{file_ext}"
@@ -1582,8 +2158,8 @@ def add_faculty_notice():
             request.user['user_id'], file_path, file_name, file_size, file_type
         ))
         new_notice_id = cursor.lastrowid
-        # Jisne notice banayi usi ke liye turant "seen" mark kar do — apni khud ki post ke liye
-        # unread dot nahi dikhna chahiye
+        # Immediately mark it "seen" for whoever created the notice — their own post
+        # should not show an unread dot
         cursor.execute(
             "INSERT IGNORE INTO notice_reads (notice_id, user_id) VALUES (%s, %s)",
             (new_notice_id, request.user['user_id'])
@@ -1605,8 +2181,8 @@ def add_faculty_notice():
 @app.route('/api/faculty/notices/<int:notice_id>', methods=['PUT'])
 @faculty_required
 def update_faculty_notice(notice_id):
-    """Sirf title/content/category edit hote hain (class/division/attachment nahi) —
-    aur sirf tab jab yeh notice khud faculty ne post ki ho."""
+    """Only title/content/category can be edited (not class/division/attachment) —
+    and only when this faculty posted the notice themselves."""
     data = request.get_json() or {}
     title = data.get('title')
     content = data.get('content') or None
@@ -1640,15 +2216,15 @@ def update_faculty_notice(notice_id):
 @app.route('/api/faculty/notices/<int:notice_id>/reads', methods=['GET'])
 @faculty_required
 def get_faculty_notice_reads(notice_id):
-    """Apni post ki hui notice kis student ne dekh li (naam, enrollment, kab dekha) + us class ke
-    total students. Sirf notice post karne wali faculty hi dekh sakti hai."""
+    """Which students have seen a notice the faculty posted (name, enrollment, when seen) + the total
+    students of that class. Only the faculty who posted the notice can see this."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
         user_id = request.user['user_id']
         cursor.execute("SELECT * FROM notices WHERE id = %s AND posted_by = %s", (notice_id, user_id))
         notice = cursor.fetchone()
-        # 404 (403 nahi) — kyunki frontend 403 pe login page pe bhej deta hai
+        # 404 (not 403) — because the frontend sends the user to the login page on a 403
         if not notice:
             return jsonify({"message": "Notice not found"}), 404
 
@@ -1678,7 +2254,9 @@ def get_faculty_notice_reads(notice_id):
         cursor.execute(q, tuple(p))
         target_total = cursor.fetchone()['c']
         cursor.execute("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'")
-        target_total += cursor.fetchone()['c']   # admin bhi seen list me aata hai
+        target_total += cursor.fetchone()['c']   # admin shows up in the seen list too
+        cursor.execute("SELECT COUNT(*) AS c FROM users WHERE role = 'faculty' AND id <> %s", (user_id,))
+        target_total += cursor.fetchone()['c']   # other faculty too (notices posted by other faculty are visible to all faculty)
 
         return jsonify({
             "notice_id": notice_id,
@@ -1757,8 +2335,8 @@ def delete_faculty_notice(notice_id):
 @app.route('/api/faculty/notices/<int:notice_id>/download', methods=['GET'])
 @faculty_required
 def download_faculty_notice(notice_id):
-    """Kisi bhi notice ka attachment download karta hai jo is faculty ko dikhti hai
-    (Admin broadcast, personal, ya khud ki post ki hui)."""
+    """Downloads the attachment of any notice visible to this faculty
+    (Admin broadcast, personal, or posted by themselves)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -1771,6 +2349,8 @@ def download_faculty_notice(notice_id):
                   (target_role IN ('all','faculty') AND target_user_id IS NULL)
                   OR target_user_id = %s
                   OR posted_by = %s
+                  OR (target_user_id IS NULL
+                      AND posted_by IN (SELECT id FROM users WHERE role = 'faculty'))
               )
         """, (notice_id, user_id, user_id))
         notice = cursor.fetchone()
@@ -1798,7 +2378,7 @@ def get_faculty_profile():
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
-        """SELECT u.name, u.login_id AS faculty_id, f.department, f.email, f.short_name
+        """SELECT u.name, u.login_id AS faculty_id, f.department, f.email, f.short_name, f.whatsapp_number
            FROM users u JOIN faculty f ON f.user_id = u.id
            WHERE u.id = %s""",
         (user_id,)
@@ -1814,20 +2394,23 @@ def get_faculty_profile():
 @app.route('/api/faculty/profile', methods=['PUT'])
 @faculty_required
 def update_faculty_profile():
-    """Faculty can edit their own full name + short name — Faculty ID and Department stay under Admin's control."""
+    """Faculty can edit their own full name + short name + WhatsApp number — Faculty ID and Department stay under Admin's control."""
     data = request.get_json()
     name = data.get('name')
     short_name = data.get('short_name')
+    whatsapp_number = data.get('whatsapp_number')
     if not name or not name.strip():
         return jsonify({"message": "Name cannot be empty"}), 400
+    if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+        return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
 
     user_id = request.user['user_id']
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET name = %s WHERE id = %s", (name.strip(), user_id))
     cursor.execute(
-        "UPDATE faculty SET short_name = %s WHERE user_id = %s",
-        (short_name.strip() if short_name else None, user_id)
+        "UPDATE faculty SET short_name = %s, whatsapp_number = %s WHERE user_id = %s",
+        (short_name.strip() if short_name else None, whatsapp_number.strip() if whatsapp_number else None, user_id)
     )
     conn.commit()
     cursor.close()
@@ -1850,7 +2433,7 @@ def faculty_change_password():
     user_id = request.user['user_id']
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+    cursor.execute("SELECT password_hash, login_id, role FROM users WHERE id = %s", (user_id,))
     user = cursor.fetchone()
 
     if not user or not bcrypt.checkpw(current_password.encode('utf-8'), user['password_hash'].encode('utf-8')):
@@ -1858,8 +2441,17 @@ def faculty_change_password():
         conn.close()
         return jsonify({"message": "Current password is incorrect"}), 401
 
+    if current_password == new_password:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "New password must be different from the current password"}), 400
+    if is_default_password(user['role'], user['login_id'], new_password):
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Please choose a password that is not the default one"}), 400
+
     new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
+    cursor.execute("UPDATE users SET password_hash = %s, must_change_password = FALSE WHERE id = %s", (new_hash, user_id))
     conn.commit()
     cursor.close()
     conn.close()
@@ -1867,22 +2459,28 @@ def faculty_change_password():
 
 
 # ============================================================
-# ASK STUDENTHUB — halka data-driven assistant (koi external AI nahi).
-# Dashboard card + floating chat popup dono isi endpoint ko call karte hain.
-# Keyword se sawal pehchan ke seedha DB se real jawab deta hai —
+# ASK STUDENTHUB — a lightweight data-driven assistant (no external AI).
+# The dashboard card and the floating chat popup both call this endpoint.
+# It recognises the question by keyword and answers directly from the DB with real data —
 # supported: "low attendance list", "pending submissions", "attendance %", "class list".
 # ============================================================
 @app.route('/api/faculty/assistant', methods=['POST'])
 @faculty_required
+@logged_assistant
 def faculty_assistant():
     data = request.get_json() or {}
     message = (data.get('message') or '').strip().lower()
     if not message:
-        return jsonify({"reply": "Kuch pooch to sahi! 🙂"}), 200
+        return jsonify({"reply": "Go ahead, ask me something! 🙂"}), 200
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
+        # ---- 1) FAQ table first ----
+        faq_reply = find_faq_answer(cursor, message)
+        if faq_reply:
+            return jsonify({"reply": faq_reply}), 200
+
         faculty_id = _get_faculty_id(cursor, request.user['user_id'])
         if not faculty_id:
             return jsonify({"reply": "Faculty record not found."}), 200
@@ -1920,7 +2518,7 @@ def faculty_assistant():
                 """, tuple(params))
                 for r in cursor.fetchall():
                     lines.append(f"• {r['name']} ({r['enrollment']}) — {sub['subject_name']}: {r['pct']}%")
-            reply = ("Low attendance (<75%) wale students:\n" + "\n".join(lines[:15])) if lines \
+            reply = ("Students with low attendance (<75%):\n" + "\n".join(lines[:15])) if lines \
                 else "All students have attendance 75% or above 👍"
             return jsonify({"reply": reply}), 200
 
@@ -1982,12 +2580,1531 @@ def faculty_assistant():
                 lines.append(f"• {sub['subject_name']} (Sem {sub['semester']}, Div {sub['division'] or 'All'}): {c} students")
             return jsonify({"reply": "\n".join(lines)}), 200
 
-        return jsonify({
-            "reply": "I can currently answer these kinds of questions: \"low attendance list\", "
-                     "\"pending submissions\", \"attendance %\", or \"class list\"."
-        }), 200
+        help_text = ("I can currently answer these kinds of questions: \"low attendance list\", "
+                     "\"pending submissions\", \"attendance %\", or \"class list\".")
+        reply = get_fallback_reply(cursor, message, request.user['user_id'], 'faculty', help_text)
+        return jsonify({"reply": reply}), 200
     except Exception as e:
         return jsonify({"reply": "Something went wrong, please try again."}), 200
     finally:
         cursor.close()
         conn.close()
+
+
+
+@app.route('/api/faculty/chat-history', methods=['GET'])
+@faculty_required
+def faculty_chat_history():
+    """This user's own previous chat with the assistant (last 50 exchanges)."""
+    return jsonify(get_user_chat_history(request.user['user_id'])), 200
+
+
+# ============================================================
+# REPORTS — Attendance Report (Excel / PDF)
+# The faculty can only pick a subject that is assigned to them (semester + batch + division are checked
+# against faculty_subjects), and can filter the students by attendance % before downloading.
+# ============================================================
+_ATT_LOW_LIMIT = 75     # GTU eligibility: below this % is shown in red
+
+
+def _subject_division_scope(cursor, faculty_id, subject_id, semester, academic_year, division):
+    """Same idea as _class_division_scope, but for ONE subject: the faculty can only download the report of a
+    subject+semester+batch assigned to them, and only for their assigned divisions.
+    Returns (allowed, sql_clause, params)."""
+    cursor.execute("""
+        SELECT division FROM faculty_subjects
+        WHERE faculty_id = %s AND subject_id = %s AND semester = %s AND academic_year = %s
+    """, (faculty_id, subject_id, semester, academic_year))
+    rows = cursor.fetchall()
+    if not rows:
+        return False, "", ()
+    assigned = {r['division'] for r in rows if r['division']}
+    all_divisions = any(not r['division'] for r in rows)   # an "All divisions" assignment (NULL / empty)
+    if all_divisions:
+        if division:
+            return True, "AND st.division = %s", (division,)
+        return True, "", ()
+    if division:
+        if division not in assigned:
+            return False, "", ()
+        return True, "AND st.division = %s", (division,)
+    ordered = tuple(sorted(assigned))
+    placeholders = ",".join(["%s"] * len(ordered))
+    return True, f"AND st.division IN ({placeholders})", ordered
+
+
+def _att_filter_label(min_pct, max_pct, max_exclusive):
+    def num(v):
+        return f"{v:g}"
+    if min_pct is None and max_pct is None:
+        return "All students"
+    if min_pct is not None and max_pct is not None:
+        return f"{num(min_pct)}% to {num(max_pct)}%"
+    if min_pct is not None:
+        return f"{num(min_pct)}% and above"
+    return f"Below {num(max_pct)}%" if max_exclusive else f"Up to {num(max_pct)}%"
+
+
+def _build_attendance_xlsx(meta, rows):
+    """meta: dict of title info. rows: list of dicts (enrollment, name, division, present, total, pct)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance"
+
+    ws.append(["Attendance Report"])
+    ws['A1'].font = Font(bold=True, size=14)
+    ws.append(["Subject", meta['subject']])
+    ws.append(["Semester", meta['semester']])
+    ws.append(["Batch", meta['batch']])
+    ws.append(["Division", meta['division']])
+    ws.append(["Attendance filter", meta['filter']])
+    ws.append(["Students", len(rows)])
+    ws.append(["Generated on", meta['generated']])
+    for r in range(2, 9):
+        ws.cell(row=r, column=1).font = Font(bold=True)
+    ws.append([])
+
+    headers = ["Sr No.", "Enrollment", "Name", "Division", "Present", "Total Sessions", "Attendance %"]
+    ws.append(headers)
+    header_row = ws.max_row
+    for cell in ws[header_row]:
+        cell.font = Font(bold=True)
+
+    for i, r in enumerate(rows, start=1):
+        pct = r['pct'] if r['pct'] is not None else 'N/A'
+        ws.append([i, r['enrollment'], r['name'], r['division'] or '', r['present'], r['total'], pct])
+        if r['pct'] is not None and r['pct'] < _ATT_LOW_LIMIT:
+            ws.cell(row=ws.max_row, column=7).font = Font(color="C00000", bold=True)
+
+    widths = [8, 16, 30, 10, 10, 15, 14]
+    for idx, w in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+    ws.column_dimensions['B'].width = 24   # also holds the title-block values (subject name etc.)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _build_attendance_pdf(meta, rows):
+    """Needs the 'reportlab' package. Raises ImportError if it is not installed."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="Attendance Report")
+    styles = getSampleStyleSheet()
+    story = [Paragraph("Attendance Report", styles['Title'])]
+    info = (
+        f"<b>Subject:</b> {escape(meta['subject'])}<br/>"
+        f"<b>Semester:</b> {escape(str(meta['semester']))} &nbsp;&nbsp; "
+        f"<b>Batch:</b> {escape(str(meta['batch']))} &nbsp;&nbsp; "
+        f"<b>Division:</b> {escape(str(meta['division']))}<br/>"
+        f"<b>Attendance filter:</b> {escape(meta['filter'])} &nbsp;&nbsp; "
+        f"<b>Students:</b> {len(rows)}<br/>"
+        f"<b>Generated on:</b> {escape(meta['generated'])}"
+    )
+    story.append(Paragraph(info, styles['Normal']))
+    story.append(Spacer(1, 8 * mm))
+
+    data = [["Sr", "Enrollment", "Name", "Div", "Present", "Total", "Attendance %"]]
+    low_rows = []
+    for i, r in enumerate(rows, start=1):
+        pct = f"{r['pct']:.1f}%" if r['pct'] is not None else "N/A"
+        data.append([str(i), r['enrollment'], r['name'], r['division'] or '', str(r['present']), str(r['total']), pct])
+        if r['pct'] is not None and r['pct'] < _ATT_LOW_LIMIT:
+            low_rows.append(i)
+
+    if len(data) == 1:
+        story.append(Paragraph("No students match the selected filters.", styles['Normal']))
+    else:
+        table = Table(data, repeatRows=1,
+                      colWidths=[10 * mm, 32 * mm, 62 * mm, 12 * mm, 18 * mm, 16 * mm, 30 * mm])
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+            ('ALIGN', (3, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        for i in low_rows:
+            style.append(('TEXTCOLOR', (6, i), (6, i), colors.HexColor('#c00000')))
+            style.append(('FONTNAME', (6, i), (6, i), 'Helvetica-Bold'))
+        table.setStyle(TableStyle(style))
+        story.append(table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+@app.route('/api/faculty/reports/attendance', methods=['GET'])
+@faculty_required
+def faculty_attendance_report():
+    """Query params: subject_id, semester, academic_year (all required), division (optional),
+    format ('xlsx' default | 'pdf'), min_percent / max_percent (optional, inclusive),
+    max_exclusive=1 (optional: max_percent is then 'below', not 'up to')."""
+    subject_id = request.args.get('subject_id', type=int)
+    semester = request.args.get('semester', type=int)
+    academic_year = (request.args.get('academic_year') or '').strip()
+    division = (request.args.get('division') or '').strip()
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+    min_pct = request.args.get('min_percent', type=float)
+    max_pct = request.args.get('max_percent', type=float)
+    max_exclusive = request.args.get('max_exclusive') in ('1', 'true')
+
+    if not subject_id or not semester or not academic_year:
+        return jsonify({"message": "Batch, semester and subject are required"}), 400
+    if fmt not in ('xlsx', 'pdf'):
+        return jsonify({"message": "format must be xlsx or pdf"}), 400
+    for v in (min_pct, max_pct):
+        if v is not None and not (0 <= v <= 100):
+            return jsonify({"message": "Percentage must be between 0 and 100"}), 400
+    if min_pct is not None and max_pct is not None and min_pct > max_pct:
+        return jsonify({"message": "'From %' cannot be greater than 'To %'"}), 400
+
+    if fmt == 'pdf':
+        try:
+            import reportlab   # noqa: F401  (only checking that it is installed)
+        except ImportError:
+            return jsonify({"message": "PDF export needs the 'reportlab' package on the server. Run: pip install reportlab"}), 500
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        allowed, div_clause, div_params = _subject_division_scope(
+            cursor, faculty_id, subject_id, semester, academic_year, division)
+        if not allowed:
+            return jsonify({"message": "This subject / division is not assigned to you for the selected semester and batch"}), 403
+
+        cursor.execute("SELECT subject_code, subject_name FROM subjects WHERE id = %s", (subject_id,))
+        subject = cursor.fetchone()
+        if not subject:
+            return jsonify({"message": "Subject not found"}), 404
+
+        cursor.execute(f"""
+            SELECT st.id AS student_id, u.login_id AS enrollment, u.name, st.division,
+                   COALESCE(SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END), 0) AS present_count,
+                   COUNT(a.id) AS total_count
+            FROM students st
+            JOIN users u ON u.id = st.user_id
+            LEFT JOIN attendance a ON a.student_id = st.id AND a.subject_id = %s
+            WHERE st.semester = %s AND st.academic_year = %s {div_clause}
+            GROUP BY st.id, u.login_id, u.name, st.division
+            ORDER BY st.division, u.login_id
+        """, (subject_id, semester, academic_year) + tuple(div_params))
+        students = cursor.fetchall()
+    except Exception as e:
+        return jsonify({"message": "Report could not be generated", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    rows = []
+    for s in students:
+        present = int(s['present_count'])
+        total = int(s['total_count'])
+        pct = round(present * 100 / total, 1) if total else None
+        # A percentage filter can only judge students who have attendance records
+        if min_pct is not None or max_pct is not None:
+            if pct is None:
+                continue
+            if min_pct is not None and pct < min_pct:
+                continue
+            if max_pct is not None and ((max_exclusive and pct >= max_pct) or (not max_exclusive and pct > max_pct)):
+                continue
+        rows.append({"enrollment": s['enrollment'], "name": s['name'], "division": s['division'],
+                     "present": present, "total": total, "pct": pct})
+
+    meta = {
+        "subject": f"{subject['subject_name']} ({subject['subject_code']})" if subject['subject_code'] else subject['subject_name'],
+        "semester": semester,
+        "batch": academic_year,
+        "division": division or "All",
+        "filter": _att_filter_label(min_pct, max_pct, max_exclusive),
+        "generated": datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+    base = secure_filename(f"attendance_{subject['subject_name']}_sem{semester}_{academic_year}" + (f"_div{division}" if division else "")) or "attendance_report"
+
+    if fmt == 'pdf':
+        buffer = _build_attendance_pdf(meta, rows)
+        return send_file(buffer, as_attachment=True, download_name=base + ".pdf", mimetype='application/pdf')
+    buffer = _build_attendance_xlsx(meta, rows)
+    return send_file(buffer, as_attachment=True, download_name=base + ".xlsx",
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+# ============================================================
+# REPORTS — Assignment Report (Excel / PDF)
+# Two forms: "summary" (default) = one row per student with totals, "detail" = one specific assignment,
+# every student with Submitted Yes/No, date, On-time/Late and marks.
+# Scope is the same as the Attendance Report: only the faculty's own subject+semester+batch(+divisions).
+# "Late" = submission date is after the assignment's due date (same rule as the Assignments screen).
+# There is no "total marks" column in `assignments`, so marks are shown as plain numbers.
+# ============================================================
+_ASG_RED = "C00000"
+_ASG_RED_FILL = "FDECEA"
+
+
+def _asg_pct(submitted, total):
+    return round(submitted * 100 / total, 1) if total else None
+
+
+def _asg_fmt_marks(v):
+    if v is None:
+        return "-"
+    f = float(v)
+    return str(int(f)) if f == int(f) else f"{f:.1f}"
+
+
+def _asg_fmt_date(d):
+    return d.strftime('%d-%m-%Y') if d else "-"
+
+
+def _asg_summary_line(rows, mode):
+    """Numbers for the line above the table. Submission-level counts (student x assignment pairs).
+    Average marks = average over the submissions that have marks."""
+    if mode == 'detail':
+        submitted = sum(1 for r in rows if r['submitted'])
+        pending = len(rows) - submitted
+        late = sum(1 for r in rows if r['late'])
+        marks = [r['marks'] for r in rows if r['marks'] is not None]
+    else:
+        submitted = sum(r['submitted'] for r in rows)
+        pending = sum(r['pending'] for r in rows)
+        late = sum(r['late'] for r in rows)
+        marks = None
+    if mode == 'detail':
+        avg = (sum(marks) / len(marks)) if marks else None
+    else:
+        graded = sum(r['graded'] for r in rows)
+        avg = (sum(r['marks_sum'] for r in rows if r['marks_sum'] is not None) / graded) if graded else None
+    return {"students": len(rows), "submitted": submitted, "pending": pending, "late": late,
+            "avg": _asg_fmt_marks(round(avg, 1)) if avg is not None else "-"}
+
+
+def _asg_headers_and_cells(mode):
+    if mode == 'detail':
+        return ["Sr No.", "Enrollment", "Name", "Division", "Submitted", "Submission Date", "Status", "Marks"]
+    return ["Sr No.", "Enrollment", "Name", "Division", "Total Assignments", "Submitted", "Pending", "Late",
+            "Submission %", "Total Marks"]
+
+
+def _asg_row_values(mode, i, r):
+    if mode == 'detail':
+        status = "Not submitted" if not r['submitted'] else ("Late" if r['late'] else "On time")
+        return [i, r['enrollment'], r['name'], r['division'] or '', "Yes" if r['submitted'] else "No",
+                _asg_fmt_date(r['submitted_at']), status, _asg_fmt_marks(r['marks'])]
+    pct = f"{r['pct']:.1f}%" if r['pct'] is not None else "N/A"
+    return [i, r['enrollment'], r['name'], r['division'] or '', r['total'], r['submitted'], r['pending'],
+            r['late'], pct, _asg_fmt_marks(r['marks_sum'])]
+
+
+def _asg_is_red(mode, r):
+    """Detail: the whole row is red when the student is Late or Not submitted.
+    Summary: only the Pending / Late numbers that are above zero are red (otherwise nearly every row would be red)."""
+    if mode == 'detail':
+        return (not r['submitted']) or r['late']
+    return False
+
+
+def _build_assignment_xlsx(meta, rows, mode, line):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Assignments"
+
+    ws.append(["Assignment Report" + (" - Assignment-wise Detail" if mode == 'detail' else " - Student-wise Summary")])
+    ws['A1'].font = Font(bold=True, size=14)
+    info = [
+        ("Subject", meta['subject']),
+        ("Semester", meta['semester']),
+        ("Batch", meta['batch']),
+        ("Division", meta['division']),
+        ("Assignment", meta['assignment']),
+        ("Status filter", meta['status']),
+        ("Generated on", meta['generated']),
+    ]
+    for k, v in info:
+        ws.append([k, v])
+    for r in range(2, 2 + len(info)):
+        ws.cell(row=r, column=1).font = Font(bold=True)
+    ws.append([])
+    ws.append(["Summary",
+               f"Total students: {line['students']}", f"Submitted: {line['submitted']}",
+               f"Pending: {line['pending']}", f"Late: {line['late']}", f"Average marks: {line['avg']}"])
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
+    ws.append([])
+
+    headers = _asg_headers_and_cells(mode)
+    ws.append(headers)
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+
+    red_font = Font(color=_ASG_RED, bold=True)
+    red_fill = PatternFill("solid", start_color=_ASG_RED_FILL, end_color=_ASG_RED_FILL)
+    for i, r in enumerate(rows, start=1):
+        vals = _asg_row_values(mode, i, r)
+        if vals[-1] != "-":
+            vals[-1] = float(vals[-1]) if "." in str(vals[-1]) else int(vals[-1])   # marks as a real number in Excel
+        ws.append(vals)
+        row_no = ws.max_row
+        if _asg_is_red(mode, r):
+            for c in ws[row_no]:
+                c.font = red_font
+                c.fill = red_fill
+        elif mode == 'summary':
+            if r['pending'] > 0:
+                ws.cell(row=row_no, column=7).font = red_font
+            if r['late'] > 0:
+                ws.cell(row=row_no, column=8).font = red_font
+
+    widths = [8, 24, 30, 10, 16, 16, 14, 14, 14, 14] if mode == 'summary' else [8, 24, 30, 10, 12, 18, 16, 10]
+    for idx, w in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _build_assignment_pdf(meta, rows, mode, line):
+    """Needs the 'reportlab' package. Raises ImportError if it is not installed."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    title = "Assignment Report - " + ("Assignment-wise Detail" if mode == 'detail' else "Student-wise Summary")
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="Assignment Report")
+    styles = getSampleStyleSheet()
+    story = [Paragraph(title, styles['Title'])]
+    info = (
+        f"<b>Subject:</b> {escape(meta['subject'])}<br/>"
+        f"<b>Semester:</b> {escape(str(meta['semester']))} &nbsp;&nbsp; "
+        f"<b>Batch:</b> {escape(str(meta['batch']))} &nbsp;&nbsp; "
+        f"<b>Division:</b> {escape(str(meta['division']))}<br/>"
+        f"<b>Assignment:</b> {escape(meta['assignment'])} &nbsp;&nbsp; "
+        f"<b>Status filter:</b> {escape(meta['status'])}<br/>"
+        f"<b>Generated on:</b> {escape(meta['generated'])}<br/><br/>"
+        f"<b>Total students:</b> {line['students']} &nbsp;&nbsp; <b>Submitted:</b> {line['submitted']} &nbsp;&nbsp; "
+        f"<b>Pending:</b> {line['pending']} &nbsp;&nbsp; <b>Late:</b> {line['late']} &nbsp;&nbsp; "
+        f"<b>Average marks:</b> {escape(str(line['avg']))}"
+    )
+    story.append(Paragraph(info, styles['Normal']))
+    story.append(Spacer(1, 6 * mm))
+
+    if mode == 'detail':
+        header = ["Sr", "Enrollment", "Name", "Div", "Submitted", "Date", "Status", "Marks"]
+        col_w = [10, 34, 70, 14, 24, 30, 30, 22]
+    else:
+        header = ["Sr", "Enrollment", "Name", "Div", "Total", "Submitted", "Pending", "Late", "Submission %", "Marks"]
+        col_w = [10, 32, 66, 12, 16, 22, 20, 16, 28, 22]
+    data = [header]
+    red_rows, red_cells = [], []
+    for i, r in enumerate(rows, start=1):
+        data.append([str(x) for x in _asg_row_values(mode, i, r)])
+        if _asg_is_red(mode, r):
+            red_rows.append(i)
+        elif mode == 'summary':
+            if r['pending'] > 0:
+                red_cells.append((6, i))
+            if r['late'] > 0:
+                red_cells.append((7, i))
+
+    if len(data) == 1:
+        story.append(Paragraph("No students match the selected filters.", styles['Normal']))
+    else:
+        table = Table(data, repeatRows=1, colWidths=[w * mm for w in col_w])
+        red = colors.HexColor('#' + _ASG_RED)
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+            ('ALIGN', (3, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        for i in red_rows:
+            style.append(('BACKGROUND', (0, i), (-1, i), colors.HexColor('#' + _ASG_RED_FILL)))
+            style.append(('TEXTCOLOR', (0, i), (-1, i), red))
+            style.append(('FONTNAME', (0, i), (-1, i), 'Helvetica-Bold'))
+        for col, i in red_cells:
+            style.append(('TEXTCOLOR', (col, i), (col, i), red))
+            style.append(('FONTNAME', (col, i), (col, i), 'Helvetica-Bold'))
+        table.setStyle(TableStyle(style))
+        story.append(table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+_ASG_STATUS_LABELS = {
+    'all': 'All',
+    'submitted': 'Submitted (on time + late)',
+    'pending': 'Not submitted',
+    'late': 'Late',
+}
+
+
+@app.route('/api/faculty/reports/assignments', methods=['GET'])
+@faculty_required
+def faculty_assignment_report():
+    """Query params: subject_id, semester, academic_year (required), division (optional),
+    assignment_id (optional; empty = all assignments of the subject), report ('summary' default | 'detail' —
+    detail needs one assignment_id), status ('all' default | 'submitted' | 'pending' | 'late'),
+    format ('xlsx' default | 'pdf').
+
+    Status in the detail form filters the student rows directly. In the summary form it picks students:
+    submitted = has submitted every assignment, pending = at least one not submitted, late = at least one late."""
+    subject_id = request.args.get('subject_id', type=int)
+    semester = request.args.get('semester', type=int)
+    academic_year = (request.args.get('academic_year') or '').strip()
+    division = (request.args.get('division') or '').strip()
+    assignment_id = request.args.get('assignment_id', type=int)
+    mode = (request.args.get('report') or 'summary').strip().lower()
+    status = (request.args.get('status') or 'all').strip().lower()
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+
+    if not subject_id or not semester or not academic_year:
+        return jsonify({"message": "Batch, semester and subject are required"}), 400
+    if fmt not in ('xlsx', 'pdf'):
+        return jsonify({"message": "format must be xlsx or pdf"}), 400
+    if mode not in ('summary', 'detail'):
+        return jsonify({"message": "report must be summary or detail"}), 400
+    if status not in _ASG_STATUS_LABELS:
+        return jsonify({"message": "status must be all, submitted, pending or late"}), 400
+    if mode == 'detail' and not assignment_id:
+        return jsonify({"message": "Select one assignment for the assignment-wise detail report"}), 400
+
+    if fmt == 'pdf':
+        try:
+            import reportlab   # noqa: F401  (only checking that it is installed)
+        except ImportError:
+            return jsonify({"message": "PDF export needs the 'reportlab' package on the server. Run: pip install reportlab"}), 500
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        allowed, div_clause, div_params = _subject_division_scope(
+            cursor, faculty_id, subject_id, semester, academic_year, division)
+        if not allowed:
+            return jsonify({"message": "This subject / division is not assigned to you for the selected semester and batch"}), 403
+
+        cursor.execute("SELECT subject_code, subject_name FROM subjects WHERE id = %s", (subject_id,))
+        subject = cursor.fetchone()
+        if not subject:
+            return jsonify({"message": "Subject not found"}), 404
+
+        assignment = None
+        if assignment_id:
+            cursor.execute("""
+                SELECT id, title, division, due_date FROM assignments
+                WHERE id = %s AND subject_id = %s AND semester = %s AND academic_year = %s
+            """, (assignment_id, subject_id, semester, academic_year))
+            assignment = cursor.fetchone()
+            if not assignment:
+                return jsonify({"message": "Assignment not found for the selected subject, semester and batch"}), 404
+
+        # One submission row per (assignment, student) — duplicates, if any, are collapsed so nothing is counted twice
+        subs = """(SELECT assignment_id, student_id, MIN(submitted_at) AS submitted_at, MAX(marks_obtained) AS marks_obtained
+                   FROM assignment_submissions GROUP BY assignment_id, student_id)"""
+
+        if mode == 'detail':
+            extra = ""
+            extra_params = ()
+            if assignment['division']:
+                extra = "AND st.division = %s"
+                extra_params = (assignment['division'],)
+            cursor.execute(f"""
+                SELECT u.login_id AS enrollment, u.name, st.division,
+                       asub.submitted_at, asub.marks_obtained
+                FROM students st
+                JOIN users u ON u.id = st.user_id
+                LEFT JOIN {subs} asub ON asub.student_id = st.id AND asub.assignment_id = %s
+                WHERE st.semester = %s AND st.academic_year = %s {div_clause} {extra}
+                ORDER BY st.division, u.login_id
+            """, (assignment_id, semester, academic_year) + tuple(div_params) + extra_params)
+            students = cursor.fetchall()
+        else:
+            asg_filter = "AND a.id = %s" if assignment_id else ""
+            asg_params = (assignment_id,) if assignment_id else ()
+            cursor.execute(f"""
+                SELECT u.login_id AS enrollment, u.name, st.division,
+                       COUNT(a.id) AS total_count,
+                       COUNT(asub.assignment_id) AS submitted_count,
+                       COALESCE(SUM(CASE WHEN asub.assignment_id IS NOT NULL AND a.due_date IS NOT NULL
+                                              AND DATE(asub.submitted_at) > a.due_date THEN 1 ELSE 0 END), 0) AS late_count,
+                       COUNT(asub.marks_obtained) AS graded_count,
+                       SUM(asub.marks_obtained) AS marks_sum
+                FROM students st
+                JOIN users u ON u.id = st.user_id
+                LEFT JOIN assignments a
+                       ON a.subject_id = %s AND a.semester = st.semester AND a.academic_year = st.academic_year
+                      AND (a.division IS NULL OR a.division = st.division) {asg_filter}
+                LEFT JOIN {subs} asub ON asub.assignment_id = a.id AND asub.student_id = st.id
+                WHERE st.semester = %s AND st.academic_year = %s {div_clause}
+                GROUP BY st.id, u.login_id, u.name, st.division
+                ORDER BY st.division, u.login_id
+            """, (subject_id,) + asg_params + (semester, academic_year) + tuple(div_params))
+            students = cursor.fetchall()
+    except Exception as e:
+        return jsonify({"message": "Report could not be generated", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    rows = []
+    if mode == 'detail':
+        due = assignment['due_date']
+        for s in students:
+            sub_at = s['submitted_at']
+            submitted = sub_at is not None
+            late = bool(submitted and due and sub_at.date() > due)
+            if status == 'submitted' and not submitted:
+                continue
+            if status == 'pending' and submitted:
+                continue
+            if status == 'late' and not late:
+                continue
+            marks = float(s['marks_obtained']) if s['marks_obtained'] is not None else None
+            rows.append({"enrollment": s['enrollment'], "name": s['name'], "division": s['division'],
+                         "submitted": submitted, "submitted_at": sub_at, "late": late, "marks": marks})
+    else:
+        for s in students:
+            total = int(s['total_count'])
+            submitted = int(s['submitted_count'])
+            pending = total - submitted
+            late = int(s['late_count'])
+            if status == 'submitted' and not (total > 0 and pending == 0):
+                continue
+            if status == 'pending' and pending == 0:
+                continue
+            if status == 'late' and late == 0:
+                continue
+            rows.append({"enrollment": s['enrollment'], "name": s['name'], "division": s['division'],
+                         "total": total, "submitted": submitted, "pending": pending, "late": late,
+                         "pct": _asg_pct(submitted, total), "graded": int(s['graded_count']),
+                         "marks_sum": float(s['marks_sum']) if s['marks_sum'] is not None else None})
+
+    line = _asg_summary_line(rows, mode)
+    meta = {
+        "subject": f"{subject['subject_name']} ({subject['subject_code']})" if subject['subject_code'] else subject['subject_name'],
+        "semester": semester,
+        "batch": academic_year,
+        "division": division or "All",
+        "assignment": assignment['title'] if assignment else "All assignments",
+        "status": _ASG_STATUS_LABELS[status],
+        "generated": datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+    base = secure_filename(
+        f"assignments_{mode}_{subject['subject_name']}_sem{semester}_{academic_year}" + (f"_div{division}" if division else "")
+    ) or "assignment_report"
+
+    if fmt == 'pdf':
+        buffer = _build_assignment_pdf(meta, rows, mode, line)
+        return send_file(buffer, as_attachment=True, download_name=base + ".pdf", mimetype='application/pdf')
+    buffer = _build_assignment_xlsx(meta, rows, mode, line)
+    return send_file(buffer, as_attachment=True, download_name=base + ".xlsx",
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+# ============================================================
+# REPORTS — Student Report (Excel / PDF)
+# Two forms: "summary" (default) = one row per student (attendance, assignments, marks, at-risk reason),
+# "detail" = one student: attendance (Lecture / Lab), every assignment, and every published exam mark.
+# Scope is the same as the other reports: only the faculty's own subject+semester+batch(+divisions).
+# Marks: only PUBLISHED marks of this subject are used (so marks the admin has not approved yet never appear).
+# At-risk = attendance below 75%  OR  any assignment still pending  OR  average marks % below the passing %.
+# ============================================================
+_STU_DEFAULT_PASS = 40
+_STU_EXAMS = ["Mid-Semester", "Remedial", "Internal", "Practical"]
+_STU_EXAM_SHORT = {"Mid-Semester": "Mid-Sem", "Remedial": "Remedial", "Internal": "Internal", "Practical": "Practical"}
+
+
+def _stu_passing_pct(cursor):
+    """Same rule as the student panel: system_settings 'passing_percentage', default 40."""
+    try:
+        cursor.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'passing_percentage'")
+        row = cursor.fetchone()
+        return float(row['setting_value']) if row and row['setting_value'] else _STU_DEFAULT_PASS
+    except Exception:
+        return _STU_DEFAULT_PASS
+
+
+def _stu_risk_reasons(att_pct, pending, avg_marks, passing):
+    reasons = []
+    if att_pct is not None and att_pct < _ATT_LOW_LIMIT:
+        reasons.append(f"Attendance below {_ATT_LOW_LIMIT}%")
+    if pending > 0:
+        reasons.append(f"{pending} assignment(s) pending")
+    if avg_marks is not None and avg_marks < passing:
+        reasons.append(f"Marks below {passing:g}%")
+    return reasons
+
+
+def _stu_exam_cell(pair):
+    if not pair:
+        return "-"
+    o, m = pair
+    if o is None:
+        return "-"
+    return f"{_asg_fmt_marks(o)}/{_asg_fmt_marks(m)}" if m else _asg_fmt_marks(o)
+
+
+def _stu_pct_text(v):
+    return f"{v:.1f}%" if v is not None else "N/A"
+
+
+def _stu_summary_line(rows):
+    atts = [r['att_pct'] for r in rows if r['att_pct'] is not None]
+    marks = [r['avg_marks'] for r in rows if r['avg_marks'] is not None]
+    return {
+        "students": len(rows),
+        "atrisk": sum(1 for r in rows if r['reasons']),
+        "avg_att": f"{sum(atts) / len(atts):.1f}%" if atts else "N/A",
+        "avg_marks": f"{sum(marks) / len(marks):.1f}%" if marks else "N/A",
+    }
+
+
+def _stu_summary_headers(parent):
+    h = ["Sr No.", "Enrollment", "Name", "Div", "Present/Total", "Attendance %", "Assignments (Submitted/Total)",
+         "Late", "Mid-Sem", "Remedial", "Internal", "Practical", "Avg Marks %", "At-risk Reason"]
+    return h + (["Parent Mobile"] if parent else [])
+
+
+def _stu_summary_values(i, r, parent):
+    v = [i, r['enrollment'], r['name'], r['division'] or '',
+         f"{r['att_present']}/{r['att_total']}", _stu_pct_text(r['att_pct']),
+         f"{r['asg_submitted']}/{r['asg_total']}", r['asg_late']]
+    v += [_stu_exam_cell(r['exams'].get(e)) for e in _STU_EXAMS]
+    v += [_stu_pct_text(r['avg_marks']), ", ".join(r['reasons']) if r['reasons'] else "-"]
+    if parent:
+        v.append(r['parent_mobile'] or "-")
+    return v
+
+
+def _stu_red_columns(r, passing):
+    """1-based column numbers of the summary table that are shown in red for this student."""
+    cols = []
+    if r['att_pct'] is not None and r['att_pct'] < _ATT_LOW_LIMIT:
+        cols.append(6)
+    if r['asg_pending'] > 0:
+        cols.append(7)
+    if r['asg_late'] > 0:
+        cols.append(8)
+    if r['avg_marks'] is not None and r['avg_marks'] < passing:
+        cols.append(13)
+    if r['reasons']:
+        cols.append(14)
+    return cols
+
+
+def _build_student_summary_xlsx(meta, rows, line, passing, parent):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Students"
+    ws.append(["Student Report - Class Summary"])
+    ws['A1'].font = Font(bold=True, size=14)
+    info = [("Subject", meta['subject']), ("Semester", meta['semester']), ("Batch", meta['batch']),
+            ("Division", meta['division']), ("Students filter", meta['filter']),
+            ("Passing marks %", f"{passing:g}%"), ("Generated on", meta['generated'])]
+    for k, v in info:
+        ws.append([k, v])
+    for r in range(2, 2 + len(info)):
+        ws.cell(row=r, column=1).font = Font(bold=True)
+    ws.append([])
+    ws.append(["Summary", f"Total students: {line['students']}", f"At-risk: {line['atrisk']}",
+               f"Average attendance: {line['avg_att']}", f"Average marks: {line['avg_marks']}"])
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
+    ws.append([])
+    ws.append(_stu_summary_headers(parent))
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+
+    red = Font(color="C00000", bold=True)
+    for i, r in enumerate(rows, start=1):
+        ws.append(_stu_summary_values(i, r, parent))
+        for col in _stu_red_columns(r, passing):
+            ws.cell(row=ws.max_row, column=col).font = red
+
+    widths = [8, 24, 30, 6, 14, 14, 18, 7, 11, 11, 11, 11, 13, 36, 16]
+    for idx, w in enumerate(widths[:len(_stu_summary_headers(parent))], start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _build_student_summary_pdf(meta, rows, line, passing, parent):
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=10 * mm, rightMargin=10 * mm,
+                            topMargin=12 * mm, bottomMargin=12 * mm, title="Student Report")
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle('cell', parent=styles['Normal'], fontSize=7.5, leading=9)
+    story = [Paragraph("Student Report - Class Summary", styles['Title'])]
+    info = (
+        f"<b>Subject:</b> {escape(meta['subject'])}<br/>"
+        f"<b>Semester:</b> {escape(str(meta['semester']))} &nbsp;&nbsp; <b>Batch:</b> {escape(str(meta['batch']))} &nbsp;&nbsp; "
+        f"<b>Division:</b> {escape(str(meta['division']))} &nbsp;&nbsp; <b>Students filter:</b> {escape(meta['filter'])} &nbsp;&nbsp; "
+        f"<b>Passing marks:</b> {passing:g}%<br/>"
+        f"<b>Generated on:</b> {escape(meta['generated'])}<br/><br/>"
+        f"<b>Total students:</b> {line['students']} &nbsp;&nbsp; <b>At-risk:</b> {line['atrisk']} &nbsp;&nbsp; "
+        f"<b>Average attendance:</b> {line['avg_att']} &nbsp;&nbsp; <b>Average marks:</b> {line['avg_marks']}"
+    )
+    story.append(Paragraph(info, styles['Normal']))
+    story.append(Spacer(1, 5 * mm))
+
+    headers = ["Sr", "Enrollment", "Name", "Div", "Present / Total", "Att %", "Assign. (Sub/Total)", "Late",
+               "Mid-Sem", "Remedial", "Internal", "Practical", "Avg Marks %", "At-risk Reason"]
+    widths = [7, 22, 36, 8, 15, 13, 18, 10, 16, 17, 15, 17, 14, 38]
+    if parent:
+        headers.append("Parent Mobile")
+        widths.append(22)
+    total_w = sum(widths)
+    avail = 277.0
+    if total_w > avail:
+        widths = [w * avail / total_w for w in widths]
+
+    data = [[Paragraph(f"<b>{escape(h)}</b>", ParagraphStyle('h', parent=cell, fontSize=6.8, leading=8, textColor=colors.white)) for h in headers]]
+    red_cells = []
+    for i, r in enumerate(rows, start=1):
+        vals = [str(x) for x in _stu_summary_values(i, r, parent)]
+        vals[2] = Paragraph(escape(vals[2]), cell)
+        vals[13] = Paragraph(escape(vals[13]), cell)
+        data.append(vals)
+        for col in _stu_red_columns(r, passing):
+            red_cells.append((col - 1, i))
+            if col == 14:
+                data[i][13] = Paragraph(f'<font color="#C00000"><b>{escape(r["reasons"] and ", ".join(r["reasons"]) or "-")}</b></font>', cell)
+
+    if len(data) == 1:
+        story.append(Paragraph("No students match the selected filters.", styles['Normal']))
+    else:
+        table = Table(data, repeatRows=1, colWidths=[w * mm for w in widths])
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+            ('FONTSIZE', (0, 0), (-1, -1), 7.5),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+            ('ALIGN', (3, 0), (12, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        for col, i in red_cells:
+            if col != 13:
+                style.append(('TEXTCOLOR', (col, i), (col, i), colors.HexColor('#C00000')))
+                style.append(('FONTNAME', (col, i), (col, i), 'Helvetica-Bold'))
+        table.setStyle(TableStyle(style))
+        story.append(table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+def _stu_detail_tables(d, passing):
+    """Shared by the Excel and the PDF detail builders. Returns the three tables as
+    (title, headers, rows, red_row_indexes) so both formats show exactly the same thing."""
+    att_rows, att_red = [], []
+    for label, p, t, pct in d['att']:
+        att_rows.append([label, p, t, _stu_pct_text(pct)])
+        if pct is not None and pct < _ATT_LOW_LIMIT:
+            att_red.append(len(att_rows) - 1)
+
+    asg_rows, asg_red = [], []
+    for i, a in enumerate(d['assignments'], start=1):
+        status = "Not submitted" if not a['submitted'] else ("Late" if a['late'] else "On time")
+        asg_rows.append([i, a['title'], _asg_fmt_date(a['due_date']), status, _asg_fmt_date(a['submitted_at']),
+                         _asg_fmt_marks(a['marks'])])
+        if status != "On time":
+            asg_red.append(len(asg_rows) - 1)
+
+    mk_rows, mk_red = [], []
+    for m in d['marks']:
+        result = "-" if m['pct'] is None else ("Pass" if m['pct'] >= passing else "Fail")
+        mk_rows.append([m['exam'], _asg_fmt_marks(m['obtained']), _asg_fmt_marks(m['max']), _stu_pct_text(m['pct']), result])
+        if result == "Fail":
+            mk_red.append(len(mk_rows) - 1)
+
+    return [
+        ("Attendance", ["Session", "Present", "Total", "Attendance %"], att_rows, att_red),
+        ("Assignments", ["Sr", "Title", "Due Date", "Status", "Submission Date", "Marks"], asg_rows, asg_red),
+        ("Marks (published)", ["Exam", "Obtained", "Max", "Percentage", "Result"], mk_rows, mk_red),
+    ]
+
+
+def _stu_detail_info(meta, d, parent):
+    info = [("Student", d['name']), ("Enrollment", d['enrollment']), ("Division", d['division'] or '-'),
+            ("Subject", meta['subject']), ("Semester", meta['semester']), ("Batch", meta['batch'])]
+    if parent:
+        info.append(("Parent Mobile", d['parent_mobile'] or '-'))
+    info.append(("At-risk", ", ".join(d['reasons']) if d['reasons'] else "No"))
+    info.append(("Generated on", meta['generated']))
+    return info
+
+
+def _build_student_detail_xlsx(meta, d, passing, parent):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Student"
+    ws.append(["Student Report - Single Student Detail"])
+    ws['A1'].font = Font(bold=True, size=14)
+    info = _stu_detail_info(meta, d, parent)
+    for k, v in info:
+        ws.append([k, v])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+        if k == "At-risk" and d['reasons']:
+            ws.cell(row=ws.max_row, column=2).font = Font(color="C00000", bold=True)
+
+    red = Font(color="C00000", bold=True)
+    for title, headers, rows, red_idx in _stu_detail_tables(d, passing):
+        ws.append([])
+        ws.append([title])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=12)
+        ws.append(headers)
+        for c in ws[ws.max_row]:
+            c.font = Font(bold=True)
+        if not rows:
+            ws.append(["No records"])
+            continue
+        for idx, row in enumerate(rows):
+            ws.append(row)
+            if idx in red_idx:
+                for c in ws[ws.max_row]:
+                    if c.value is not None:
+                        c.font = red
+
+    for idx, w in enumerate([22, 34, 16, 16, 18, 10], start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _build_student_detail_pdf(meta, d, passing, parent):
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="Student Report")
+    styles = getSampleStyleSheet()
+    story = [Paragraph("Student Report - Single Student Detail", styles['Title'])]
+    lines = []
+    for k, v in _stu_detail_info(meta, d, parent):
+        text = f"<b>{escape(k)}:</b> {escape(str(v))}"
+        if k == "At-risk" and d['reasons']:
+            text = f'<b>{escape(k)}:</b> <font color="#C00000"><b>{escape(str(v))}</b></font>'
+        lines.append(text)
+    story.append(Paragraph("<br/>".join(lines), styles['Normal']))
+
+    widths_by_title = {
+        "Attendance": [50, 30, 30, 40],
+        "Assignments": [10, 60, 26, 28, 30, 18],
+        "Marks (published)": [50, 28, 28, 30, 26],
+    }
+    for title, headers, rows, red_idx in _stu_detail_tables(d, passing):
+        story.append(Spacer(1, 6 * mm))
+        story.append(Paragraph(f"<b>{escape(title)}</b>", styles['Heading3']))
+        if not rows:
+            story.append(Paragraph("No records.", styles['Normal']))
+            continue
+        data = [headers]
+        for ri, row in enumerate(rows):
+            out = []
+            for j, c in enumerate(row):
+                if headers[j] == "Title":
+                    txt = escape(str(c))
+                    if ri in red_idx:
+                        txt = f'<font color="#C00000"><b>{txt}</b></font>'
+                    out.append(Paragraph(txt, styles['Normal']))
+                else:
+                    out.append(str(c))
+            data.append(out)
+        table = Table(data, repeatRows=1, colWidths=[w * mm for w in widths_by_title[title]])
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        for i in red_idx:
+            style.append(('TEXTCOLOR', (0, i + 1), (-1, i + 1), colors.HexColor('#C00000')))
+            style.append(('FONTNAME', (0, i + 1), (-1, i + 1), 'Helvetica-Bold'))
+        table.setStyle(TableStyle(style))
+        story.append(table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+_STU_FILTER_LABELS = {'all': 'All students', 'atrisk': 'At-risk students only', 'one': 'One student'}
+
+
+@app.route('/api/faculty/reports/students', methods=['GET'])
+@faculty_required
+def faculty_student_report():
+    """Query params: subject_id, semester, academic_year (required), division (optional),
+    report ('summary' default | 'detail' — detail needs student_id), student_id (optional for summary),
+    at_risk=1 (summary only: keep only at-risk students), include_parent=1 (adds the parent's mobile),
+    format ('xlsx' default | 'pdf')."""
+    subject_id = request.args.get('subject_id', type=int)
+    semester = request.args.get('semester', type=int)
+    academic_year = (request.args.get('academic_year') or '').strip()
+    division = (request.args.get('division') or '').strip()
+    student_id = request.args.get('student_id', type=int)
+    mode = (request.args.get('report') or 'summary').strip().lower()
+    at_risk = request.args.get('at_risk') in ('1', 'true')
+    parent = request.args.get('include_parent') in ('1', 'true')
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+
+    if not subject_id or not semester or not academic_year:
+        return jsonify({"message": "Batch, semester and subject are required"}), 400
+    if fmt not in ('xlsx', 'pdf'):
+        return jsonify({"message": "format must be xlsx or pdf"}), 400
+    if mode not in ('summary', 'detail'):
+        return jsonify({"message": "report must be summary or detail"}), 400
+    if mode == 'detail' and not student_id:
+        return jsonify({"message": "Select one student for the single student detail report"}), 400
+
+    if fmt == 'pdf':
+        try:
+            import reportlab   # noqa: F401  (only checking that it is installed)
+        except ImportError:
+            return jsonify({"message": "PDF export needs the 'reportlab' package on the server. Run: pip install reportlab"}), 500
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        allowed, div_clause, div_params = _subject_division_scope(
+            cursor, faculty_id, subject_id, semester, academic_year, division)
+        if not allowed:
+            return jsonify({"message": "This subject / division is not assigned to you for the selected semester and batch"}), 403
+
+        cursor.execute("SELECT subject_code, subject_name FROM subjects WHERE id = %s", (subject_id,))
+        subject = cursor.fetchone()
+        if not subject:
+            return jsonify({"message": "Subject not found"}), 404
+
+        passing = _stu_passing_pct(cursor)
+
+        stu_clause = "AND st.id = %s" if student_id else ""
+        stu_params = (student_id,) if student_id else ()
+        cursor.execute(f"""
+            SELECT st.id AS student_id, u.login_id AS enrollment, u.name, st.division,
+                   st.father_mobile, st.mother_mobile
+            FROM students st
+            JOIN users u ON u.id = st.user_id
+            WHERE st.semester = %s AND st.academic_year = %s {div_clause} {stu_clause}
+            ORDER BY st.division, u.login_id
+        """, (semester, academic_year) + tuple(div_params) + stu_params)
+        students = cursor.fetchall()
+        if student_id and not students:
+            return jsonify({"message": "This student is not in your assigned class for the selected semester and batch"}), 404
+
+        ids = [s['student_id'] for s in students]
+        att_map, asg_map, marks_map = {}, {}, {}
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            cursor.execute(f"""
+                SELECT student_id,
+                       SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present_count,
+                       COUNT(*) AS total_count
+                FROM attendance
+                WHERE subject_id = %s AND student_id IN ({ph})
+                GROUP BY student_id
+            """, (subject_id,) + tuple(ids))
+            att_map = {r['student_id']: r for r in cursor.fetchall()}
+
+            subs = """(SELECT assignment_id, student_id, MIN(submitted_at) AS submitted_at, MAX(marks_obtained) AS marks_obtained
+                       FROM assignment_submissions GROUP BY assignment_id, student_id)"""
+            cursor.execute(f"""
+                SELECT st.id AS student_id, COUNT(a.id) AS total_count, COUNT(asub.assignment_id) AS submitted_count,
+                       COALESCE(SUM(CASE WHEN asub.assignment_id IS NOT NULL AND a.due_date IS NOT NULL
+                                              AND DATE(asub.submitted_at) > a.due_date THEN 1 ELSE 0 END), 0) AS late_count
+                FROM students st
+                LEFT JOIN assignments a
+                       ON a.subject_id = %s AND a.semester = st.semester AND a.academic_year = st.academic_year
+                      AND (a.division IS NULL OR a.division = st.division)
+                LEFT JOIN {subs} asub ON asub.assignment_id = a.id AND asub.student_id = st.id
+                WHERE st.id IN ({ph})
+                GROUP BY st.id
+            """, (subject_id,) + tuple(ids))
+            asg_map = {r['student_id']: r for r in cursor.fetchall()}
+
+            # published marks only; if an exam type has several rows the latest one wins
+            cursor.execute(f"""
+                SELECT student_id, exam_type, marks_obtained, max_marks
+                FROM marks
+                WHERE subject_id = %s AND published = 1 AND student_id IN ({ph})
+                ORDER BY id ASC
+            """, (subject_id,) + tuple(ids))
+            for m in cursor.fetchall():
+                marks_map.setdefault(m['student_id'], {})[m['exam_type']] = (
+                    float(m['marks_obtained']) if m['marks_obtained'] is not None else None,
+                    float(m['max_marks']) if m['max_marks'] is not None else None)
+
+        detail = None
+        if mode == 'detail':
+            s = students[0]
+            cursor.execute("""
+                SELECT session_type,
+                       SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present_count, COUNT(*) AS total_count
+                FROM attendance WHERE student_id = %s AND subject_id = %s GROUP BY session_type
+            """, (s['student_id'], subject_id))
+            att_by_type = {r['session_type']: r for r in cursor.fetchall()}
+            cursor.execute("""
+                SELECT a.title, a.due_date, asub.submitted_at, asub.marks_obtained
+                FROM assignments a
+                LEFT JOIN (SELECT assignment_id, student_id, MIN(submitted_at) AS submitted_at, MAX(marks_obtained) AS marks_obtained
+                           FROM assignment_submissions GROUP BY assignment_id, student_id) asub
+                       ON asub.assignment_id = a.id AND asub.student_id = %s
+                WHERE a.subject_id = %s AND a.semester = %s AND a.academic_year = %s
+                  AND (a.division IS NULL OR a.division = %s)
+                ORDER BY a.due_date ASC, a.id ASC
+            """, (s['student_id'], subject_id, semester, academic_year, s['division']))
+            asg_rows = cursor.fetchall()
+    except Exception as e:
+        return jsonify({"message": "Report could not be generated", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    rows = []
+    for s in students:
+        att = att_map.get(s['student_id'])
+        present = int(att['present_count']) if att else 0
+        total = int(att['total_count']) if att else 0
+        att_pct = round(present * 100 / total, 1) if total else None
+        asg = asg_map.get(s['student_id'])
+        a_total = int(asg['total_count']) if asg else 0
+        a_sub = int(asg['submitted_count']) if asg else 0
+        a_late = int(asg['late_count']) if asg else 0
+        exams = marks_map.get(s['student_id'], {})
+        pcts = [o * 100 / m for (o, m) in exams.values() if o is not None and m]
+        avg_marks = round(sum(pcts) / len(pcts), 1) if pcts else None
+        reasons = _stu_risk_reasons(att_pct, a_total - a_sub, avg_marks, passing)
+        rows.append({"student_id": s['student_id'], "enrollment": s['enrollment'], "name": s['name'],
+                     "division": s['division'], "parent_mobile": s['father_mobile'] or s['mother_mobile'],
+                     "att_present": present, "att_total": total, "att_pct": att_pct,
+                     "asg_total": a_total, "asg_submitted": a_sub, "asg_pending": a_total - a_sub, "asg_late": a_late,
+                     "exams": exams, "avg_marks": avg_marks, "reasons": reasons})
+
+    if mode == 'summary' and at_risk:
+        rows = [r for r in rows if r['reasons']]
+
+    meta = {
+        "subject": f"{subject['subject_name']} ({subject['subject_code']})" if subject['subject_code'] else subject['subject_name'],
+        "semester": semester,
+        "batch": academic_year,
+        "division": division or "All",
+        "filter": _STU_FILTER_LABELS['atrisk' if at_risk else ('one' if student_id else 'all')],
+        "generated": datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+    base = secure_filename(
+        f"students_{mode}_{subject['subject_name']}_sem{semester}_{academic_year}" + (f"_div{division}" if division else "")
+    ) or "student_report"
+
+    if mode == 'detail':
+        r = rows[0]
+        att_list = []
+        for label in ("Lecture", "Lab"):
+            t = att_by_type.get(label)
+            if t and int(t['total_count']):
+                p, tt = int(t['present_count']), int(t['total_count'])
+                att_list.append((label, p, tt, round(p * 100 / tt, 1)))
+        att_list.append(("Overall", r['att_present'], r['att_total'], r['att_pct']))
+        due_assignments = []
+        for a in asg_rows:
+            sub_at = a['submitted_at']
+            due = a['due_date']
+            due_assignments.append({
+                "title": a['title'], "due_date": due, "submitted": sub_at is not None, "submitted_at": sub_at,
+                "late": bool(sub_at is not None and due and sub_at.date() > due),
+                "marks": float(a['marks_obtained']) if a['marks_obtained'] is not None else None})
+        mark_list = []
+        known = [e for e in _STU_EXAMS if e in r['exams']] + [e for e in r['exams'] if e not in _STU_EXAMS]
+        for e in known:
+            o, m = r['exams'][e]
+            mark_list.append({"exam": e, "obtained": o, "max": m, "pct": round(o * 100 / m, 1) if (o is not None and m) else None})
+        d = {"name": r['name'], "enrollment": r['enrollment'], "division": r['division'],
+             "parent_mobile": r['parent_mobile'], "reasons": r['reasons'],
+             "att": att_list, "assignments": due_assignments, "marks": mark_list}
+        if fmt == 'pdf':
+            buffer = _build_student_detail_pdf(meta, d, passing, parent)
+            return send_file(buffer, as_attachment=True, download_name=base + ".pdf", mimetype='application/pdf')
+        buffer = _build_student_detail_xlsx(meta, d, passing, parent)
+        return send_file(buffer, as_attachment=True, download_name=base + ".xlsx",
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    line = _stu_summary_line(rows)
+    if fmt == 'pdf':
+        buffer = _build_student_summary_pdf(meta, rows, line, passing, parent)
+        return send_file(buffer, as_attachment=True, download_name=base + ".pdf", mimetype='application/pdf')
+    buffer = _build_student_summary_xlsx(meta, rows, line, passing, parent)
+    return send_file(buffer, as_attachment=True, download_name=base + ".xlsx",
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+# ============================================================
+# REPORTS — Marks Report (Excel / PDF)
+# Two forms: ONE exam type chosen = exam-wise marks sheet (obtained / max / % / Pass-Fail),
+# "All exams" (default) = one row per student with every exam type in its own column + average % and result.
+# Only PUBLISHED marks of this subject are used. A student with no marks yet shows "-" and is neither
+# Pass nor Fail (and is left out of the pass %). Pass = percentage >= passing % (system_settings, default 40).
+# In the "All exams" form the result is judged on the average % of the student's exam types.
+# ============================================================
+_MK_RESULT_LABELS = {'all': 'All', 'pass': 'Pass only', 'fail': 'Fail only'}
+_MK_BUCKETS = [("Below 40%", 0, 40), ("40% - 60%", 40, 60), ("60% - 80%", 60, 80), ("80% and above", 80, 1000)]
+
+
+def _mk_pct(o, m):
+    return round(o * 100 / m, 1) if (o is not None and m) else None
+
+
+def _mk_result(pct, passing):
+    if pct is None:
+        return "-"
+    return "Pass" if pct >= passing else "Fail"
+
+
+def _mk_summary_line(rows):
+    """rows already carry 'pct' (the percentage that decides the result) and 'result'."""
+    pcts = [r['pct'] for r in rows if r['pct'] is not None]
+    passed = sum(1 for r in rows if r['result'] == "Pass")
+    failed = sum(1 for r in rows if r['result'] == "Fail")
+    buckets = [(label, sum(1 for p in pcts if lo <= p < hi)) for label, lo, hi in _MK_BUCKETS]
+    return {
+        "students": len(rows), "entered": len(pcts), "pass": passed, "fail": failed,
+        "pass_pct": f"{passed * 100 / len(pcts):.1f}%" if pcts else "N/A",
+        "avg": f"{sum(pcts) / len(pcts):.1f}%" if pcts else "N/A",
+        "high": f"{max(pcts):.1f}%" if pcts else "N/A",
+        "low": f"{min(pcts):.1f}%" if pcts else "N/A",
+        "buckets": buckets,
+    }
+
+
+def _mk_line_texts(line):
+    top = (f"Total students: {line['students']}   Marks entered: {line['entered']}   Pass: {line['pass']}   "
+           f"Fail: {line['fail']}   Pass %: {line['pass_pct']}")
+    mid = f"Average: {line['avg']}   Highest: {line['high']}   Lowest: {line['low']}"
+    dist = "Distribution: " + "   ".join(f"{label}: {n}" for label, n in line['buckets'])
+    return top, mid, dist
+
+
+def _mk_headers(exam):
+    if exam:
+        return ["Sr No.", "Enrollment", "Name", "Div", "Marks Obtained", "Max Marks", "Percentage", "Result"]
+    return ["Sr No.", "Enrollment", "Name", "Div", "Mid-Sem", "Remedial", "Internal", "Practical", "Avg %", "Result"]
+
+
+def _mk_values(exam, i, r):
+    if exam:
+        o, m = r['exams'].get(exam, (None, None))
+        return [i, r['enrollment'], r['name'], r['division'] or '',
+                _asg_fmt_marks(o), _asg_fmt_marks(m), _stu_pct_text(r['pct']), r['result']]
+    return [i, r['enrollment'], r['name'], r['division'] or ''] + \
+           [_stu_exam_cell(r['exams'].get(e)) for e in _STU_EXAMS] + [_stu_pct_text(r['pct']), r['result']]
+
+
+def _mk_red_columns(exam, r, passing):
+    """1-based columns shown in red. Exam-wise: the whole row when the student failed.
+    All exams: the Avg % and Result cells of a failed student, plus any single exam below the passing %."""
+    ncols = len(_mk_headers(exam))
+    if exam:
+        return list(range(1, ncols + 1)) if r['result'] == "Fail" else []
+    cols = []
+    for idx, e in enumerate(_STU_EXAMS):
+        o, m = r['exams'].get(e, (None, None))
+        p = _mk_pct(o, m)
+        if p is not None and p < passing:
+            cols.append(5 + idx)
+    if r['result'] == "Fail":
+        cols += [ncols - 1, ncols]
+    return cols
+
+
+def _build_marks_xlsx(meta, rows, line, passing, exam):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Marks"
+    ws.append(["Marks Report - " + (f"{exam} Marks Sheet" if exam else "All Exams")])
+    ws['A1'].font = Font(bold=True, size=14)
+    info = [("Subject", meta['subject']), ("Semester", meta['semester']), ("Batch", meta['batch']),
+            ("Division", meta['division']), ("Exam", meta['exam']), ("Result filter", meta['result']),
+            ("Passing marks %", f"{passing:g}%"), ("Generated on", meta['generated'])]
+    for k, v in info:
+        ws.append([k, v])
+    for r in range(2, 2 + len(info)):
+        ws.cell(row=r, column=1).font = Font(bold=True)
+    ws.append([])
+    for text in _mk_line_texts(line):
+        ws.append([text])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    ws.append([])
+    headers = _mk_headers(exam)
+    ws.append(headers)
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+
+    red = Font(color="C00000", bold=True)
+    for i, r in enumerate(rows, start=1):
+        vals = _mk_values(exam, i, r)
+        if exam:   # marks as real numbers in Excel
+            for pos in (4, 5):
+                if vals[pos] != "-":
+                    vals[pos] = float(vals[pos]) if "." in str(vals[pos]) else int(vals[pos])
+        ws.append(vals)
+        for col in _mk_red_columns(exam, r, passing):
+            ws.cell(row=ws.max_row, column=col).font = red
+
+    widths = [8, 24, 30, 6, 16, 12, 12, 10] if exam else [8, 24, 30, 6, 12, 12, 12, 12, 10, 10]
+    for idx, w in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _build_marks_pdf(meta, rows, line, passing, exam):
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="Marks Report")
+    styles = getSampleStyleSheet()
+    story = [Paragraph("Marks Report - " + (f"{escape(exam)} Marks Sheet" if exam else "All Exams"), styles['Title'])]
+    top, mid, dist = _mk_line_texts(line)
+    info = (
+        f"<b>Subject:</b> {escape(meta['subject'])}<br/>"
+        f"<b>Semester:</b> {escape(str(meta['semester']))} &nbsp;&nbsp; <b>Batch:</b> {escape(str(meta['batch']))} &nbsp;&nbsp; "
+        f"<b>Division:</b> {escape(str(meta['division']))} &nbsp;&nbsp; <b>Exam:</b> {escape(meta['exam'])} &nbsp;&nbsp; "
+        f"<b>Result filter:</b> {escape(meta['result'])} &nbsp;&nbsp; <b>Passing marks:</b> {passing:g}%<br/>"
+        f"<b>Generated on:</b> {escape(meta['generated'])}<br/><br/>"
+        f"<b>{escape(top).replace('   ', ' &nbsp;&nbsp;&nbsp; ')}</b><br/>"
+        f"<b>{escape(mid).replace('   ', ' &nbsp;&nbsp;&nbsp; ')}</b><br/>"
+        f"<b>{escape(dist).replace('   ', ' &nbsp;&nbsp;&nbsp; ')}</b>"
+    )
+    story.append(Paragraph(info, styles['Normal']))
+    story.append(Spacer(1, 5 * mm))
+
+    headers = _mk_headers(exam)
+    widths = [13, 34, 77, 12, 30, 24, 28, 24] if exam else [13, 32, 67, 12, 24, 24, 24, 24, 24, 22]
+    data = [headers]
+    red_cells = []
+    for i, r in enumerate(rows, start=1):
+        data.append([str(x) for x in _mk_values(exam, i, r)])
+        for col in _mk_red_columns(exam, r, passing):
+            red_cells.append((col - 1, i))
+
+    if len(data) == 1:
+        story.append(Paragraph("No students match the selected filters.", styles['Normal']))
+    else:
+        table = Table(data, repeatRows=1, colWidths=[w * mm for w in widths])
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+            ('ALIGN', (3, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        for col, i in red_cells:
+            style.append(('TEXTCOLOR', (col, i), (col, i), colors.HexColor('#C00000')))
+            style.append(('FONTNAME', (col, i), (col, i), 'Helvetica-Bold'))
+        table.setStyle(TableStyle(style))
+        story.append(table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+@app.route('/api/faculty/reports/marks', methods=['GET'])
+@faculty_required
+def faculty_marks_report():
+    """Query params: subject_id, semester, academic_year (required), division (optional),
+    exam_type (optional: Mid-Semester | Remedial | Internal | Practical; empty = all exams),
+    result ('all' default | 'pass' | 'fail'), format ('xlsx' default | 'pdf')."""
+    subject_id = request.args.get('subject_id', type=int)
+    semester = request.args.get('semester', type=int)
+    academic_year = (request.args.get('academic_year') or '').strip()
+    division = (request.args.get('division') or '').strip()
+    exam = (request.args.get('exam_type') or '').strip()
+    result_filter = (request.args.get('result') or 'all').strip().lower()
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+
+    if not subject_id or not semester or not academic_year:
+        return jsonify({"message": "Batch, semester and subject are required"}), 400
+    if fmt not in ('xlsx', 'pdf'):
+        return jsonify({"message": "format must be xlsx or pdf"}), 400
+    if exam and exam not in _STU_EXAMS:
+        return jsonify({"message": "exam_type must be one of: " + ", ".join(_STU_EXAMS)}), 400
+    if result_filter not in _MK_RESULT_LABELS:
+        return jsonify({"message": "result must be all, pass or fail"}), 400
+
+    if fmt == 'pdf':
+        try:
+            import reportlab   # noqa: F401  (only checking that it is installed)
+        except ImportError:
+            return jsonify({"message": "PDF export needs the 'reportlab' package on the server. Run: pip install reportlab"}), 500
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        allowed, div_clause, div_params = _subject_division_scope(
+            cursor, faculty_id, subject_id, semester, academic_year, division)
+        if not allowed:
+            return jsonify({"message": "This subject / division is not assigned to you for the selected semester and batch"}), 403
+
+        cursor.execute("SELECT subject_code, subject_name FROM subjects WHERE id = %s", (subject_id,))
+        subject = cursor.fetchone()
+        if not subject:
+            return jsonify({"message": "Subject not found"}), 404
+
+        passing = _stu_passing_pct(cursor)
+
+        cursor.execute(f"""
+            SELECT st.id AS student_id, u.login_id AS enrollment, u.name, st.division
+            FROM students st
+            JOIN users u ON u.id = st.user_id
+            WHERE st.semester = %s AND st.academic_year = %s {div_clause}
+            ORDER BY st.division, u.login_id
+        """, (semester, academic_year) + tuple(div_params))
+        students = cursor.fetchall()
+
+        marks_map = {}
+        ids = [s['student_id'] for s in students]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            # published marks only; if an exam type has several rows the latest one wins
+            cursor.execute(f"""
+                SELECT student_id, exam_type, marks_obtained, max_marks
+                FROM marks
+                WHERE subject_id = %s AND published = 1 AND student_id IN ({ph})
+                ORDER BY id ASC
+            """, (subject_id,) + tuple(ids))
+            for m in cursor.fetchall():
+                marks_map.setdefault(m['student_id'], {})[m['exam_type']] = (
+                    float(m['marks_obtained']) if m['marks_obtained'] is not None else None,
+                    float(m['max_marks']) if m['max_marks'] is not None else None)
+    except Exception as e:
+        return jsonify({"message": "Report could not be generated", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    rows = []
+    for s in students:
+        exams = marks_map.get(s['student_id'], {})
+        if exam:
+            o, m = exams.get(exam, (None, None))
+            pct = _mk_pct(o, m)
+        else:
+            pcts = [o * 100 / m for (o, m) in exams.values() if o is not None and m]
+            pct = round(sum(pcts) / len(pcts), 1) if pcts else None
+        result = _mk_result(pct, passing)
+        if result_filter == 'pass' and result != "Pass":
+            continue
+        if result_filter == 'fail' and result != "Fail":
+            continue
+        rows.append({"enrollment": s['enrollment'], "name": s['name'], "division": s['division'],
+                     "exams": exams, "pct": pct, "result": result})
+
+    line = _mk_summary_line(rows)
+    meta = {
+        "subject": f"{subject['subject_name']} ({subject['subject_code']})" if subject['subject_code'] else subject['subject_name'],
+        "semester": semester,
+        "batch": academic_year,
+        "division": division or "All",
+        "exam": exam or "All exams",
+        "result": _MK_RESULT_LABELS[result_filter],
+        "generated": datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+    base = secure_filename(
+        f"marks_{exam or 'all_exams'}_{subject['subject_name']}_sem{semester}_{academic_year}" + (f"_div{division}" if division else "")
+    ) or "marks_report"
+
+    if fmt == 'pdf':
+        buffer = _build_marks_pdf(meta, rows, line, passing, exam)
+        return send_file(buffer, as_attachment=True, download_name=base + ".pdf", mimetype='application/pdf')
+    buffer = _build_marks_xlsx(meta, rows, line, passing, exam)
+    return send_file(buffer, as_attachment=True, download_name=base + ".xlsx",
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

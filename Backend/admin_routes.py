@@ -12,46 +12,81 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 from app import app
-from auth_middleware import admin_required
+from auth_middleware import admin_required, is_default_password
+from session_routes import get_admin_session_block_reason
+from chatbot_helper import find_faq_answer, get_fallback_reply, log_chat, logged_assistant, get_user_chat_history
 
-# Database backup files yahan save hote hain — project ke bahar (notes/assignments jaisa pattern)
+# Database backup files are saved here — outside the project (same pattern as notes/assignments)
 BACKUP_FOLDER = os.path.join(os.path.expanduser('~'), 'studenthub_uploads', 'db_backups')
 os.makedirs(BACKUP_FOLDER, exist_ok=True)
 
-# Notice attachments (agar admin file attach kare) yahan save hote hain — project ke bahar, notes ki tarah
+# Notice attachments (if the admin attaches a file) are saved here — outside the project, like notes
 NOTICE_UPLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'studenthub_uploads', 'notices')
 os.makedirs(NOTICE_UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_NOTICE_EXTENSIONS = {'pdf', 'doc', 'docx', 'ppt', 'pptx', 'jpg', 'jpeg', 'png'}
 
+def _is_valid_file_content(file_or_name, ext):
+    if hasattr(file_or_name, 'read') and hasattr(file_or_name, 'seek'):
+        header = file_or_name.read(16)
+        file_or_name.seek(0)
+        if ext == 'pdf' and not header.startswith(b'%PDF'):
+            return False
+        if ext in ('docx', 'pptx') and not header.startswith(b'PK\x03\x04'):
+            return False
+        if ext in ('doc', 'ppt') and not header.startswith(b'\xd0\xcf\x11\xe0'):
+            return False
+        if ext in ('jpg', 'jpeg') and not header.startswith(b'\xff\xd8\xff'):
+            return False
+        if ext == 'png' and not header.startswith(b'\x89PNG\r\n\x1a\n'):
+            return False
+    return True
 
-def _allowed_notice_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_NOTICE_EXTENSIONS
+def _allowed_notice_file(file_or_name):
+    filename = file_or_name.filename if hasattr(file_or_name, 'filename') else str(file_or_name)
+    if not ('.' in filename):
+        return False
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext not in ALLOWED_NOTICE_EXTENSIONS:
+        return False
+    return _is_valid_file_content(file_or_name, ext)
 
 
 LUNCH_BREAK_START = '13:30'
 LUNCH_BREAK_END = '14:00'
 
-# Notes files yahan save hote hain (Backend/uploads/notes/)
-# Notes files project folder ke BAHAR save hote hain (user ke home directory me) —
-# taaki VS Code Live Server jaisa koi bhi file-watcher tool inhe "file changed" samajh ke
-# poora page reload na kar de. Project folder ke andar rakhte to yehi problem aati.
+# Notes files are saved here (Backend/uploads/notes/)
+# Notes files are saved OUTSIDE the project folder (in the user's home directory) —
+# so that a file-watcher tool like VS Code Live Server doesn't treat them as "file changed"
+# and reload the whole page. Keeping them inside the project folder caused exactly this problem.
 NOTES_UPLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'studenthub_uploads', 'notes')
 os.makedirs(NOTES_UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_NOTE_EXTENSIONS = {'pdf', 'doc', 'docx', 'ppt', 'pptx'}
 
 
-def _allowed_note_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_NOTE_EXTENSIONS
+def _allowed_note_file(file_or_name):
+    filename = file_or_name.filename if hasattr(file_or_name, 'filename') else str(file_or_name)
+    if not ('.' in filename):
+        return False
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext not in ALLOWED_NOTE_EXTENSIONS:
+        return False
+    return _is_valid_file_content(file_or_name, ext)
 
 
-# Assignment attachments (question paper) aur student submissions dono yahan save hote hain — project ke bahar
+# Assignment attachments (question papers) and student submissions are both saved here — outside the project
 ASSIGNMENT_UPLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'studenthub_uploads', 'assignments')
 os.makedirs(ASSIGNMENT_UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_ASSIGNMENT_EXTENSIONS = {'pdf', 'doc', 'docx', 'ppt', 'pptx'}
 
 
-def _allowed_assignment_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_ASSIGNMENT_EXTENSIONS
+def _allowed_assignment_file(file_or_name):
+    filename = file_or_name.filename if hasattr(file_or_name, 'filename') else str(file_or_name)
+    if not ('.' in filename):
+        return False
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext not in ALLOWED_ASSIGNMENT_EXTENSIONS:
+        return False
+    return _is_valid_file_content(file_or_name, ext)
 
 
 # ============================================================
@@ -84,7 +119,7 @@ def dashboard_stats():
     cursor.execute("SELECT COUNT(*) AS c FROM marks_requests WHERE status='pending'")
     pending_marks_requests = cursor.fetchone()['c']
 
-    # Dashboard bar chart ke liye: semester-wise students
+    # For the dashboard bar chart: semester-wise students
     cursor.execute("SELECT semester, COUNT(*) AS c FROM students WHERE semester IS NOT NULL GROUP BY semester ORDER BY semester")
     students_by_semester = [{"semester": r['semester'], "count": r['c']} for r in cursor.fetchall()]
 
@@ -104,25 +139,31 @@ def dashboard_stats():
 
 
 # ============================================================
-# SYSTEM ASSISTANT — halka data-driven assistant (koi external AI nahi).
-# Admin dashboard ka card isi endpoint ko call karta hai. Keyword se sawal pehchan ke
-# seedha DB se real jawab deta hai — supported: "student <naam/enrollment>",
-# "faculty <naam/id>", "system summary", "pending marks requests", "report".
+# SYSTEM ASSISTANT — a lightweight data-driven assistant (no external AI).
+# The Admin dashboard card calls this endpoint. It recognises the question by keyword and
+# answers directly from the DB with real data — supported: "student <name/enrollment>",
+# "faculty <name/id>", "system summary", "pending marks requests", "report".
 # ============================================================
 _ASSISTANT_SKIP_TERMS = {'count', 'total', 'summary', 'list', 'overview', 'kitne', 'number', 'report'}
 
 @app.route('/api/admin/assistant', methods=['POST'])
 @admin_required
+@logged_assistant
 def admin_assistant():
     data = request.get_json() or {}
     raw = (data.get('message') or '').strip()
     message = raw.lower()
     if not message:
-        return jsonify({"reply": "Kuch pooch to sahi! 🙂"}), 200
+        return jsonify({"reply": "Go ahead, ask me something! 🙂"}), 200
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
+        # ---- 1) FAQ table first ----
+        faq_reply = find_faq_answer(cursor, raw)
+        if faq_reply:
+            return jsonify({"reply": faq_reply}), 200
+
         # ---- Student / Faculty lookup: "student rahul", "find faculty shah" ----
         m = re.match(r'^(?:find\s+|search\s+)?(student|faculty)s?\s+(.+)$', raw, re.IGNORECASE)
         if m and m.group(2).strip().lower() not in _ASSISTANT_SKIP_TERMS:
@@ -158,17 +199,22 @@ def admin_assistant():
             rows = cursor.fetchall()
             if not rows:
                 return jsonify({"reply": "No faculty found with that name or ID."}), 200
+            faculty_ids = [r['faculty_row_id'] for r in rows]
+            format_strings = ','.join(['%s'] * len(faculty_ids))
+            cursor.execute(f"""
+                SELECT fs.faculty_id, sub.subject_name, fs.semester, fs.division
+                FROM faculty_subjects fs JOIN subjects sub ON sub.id = fs.subject_id
+                WHERE fs.faculty_id IN ({format_strings}) ORDER BY fs.semester LIMIT 30
+            """, tuple(faculty_ids))
+            subs_by_fid = {}
+            for x in cursor.fetchall():
+                subs_by_fid.setdefault(x['faculty_id'], []).append(
+                    f"{x['subject_name']} (Sem {x['semester']}{', Div ' + x['division'] if x['division'] else ''})"
+                )
             lines = []
             for r in rows:
-                cursor.execute("""
-                    SELECT sub.subject_name, fs.semester, fs.division
-                    FROM faculty_subjects fs JOIN subjects sub ON sub.id = fs.subject_id
-                    WHERE fs.faculty_id = %s ORDER BY fs.semester LIMIT 6
-                """, (r['faculty_row_id'],))
-                subs = ", ".join(
-                    f"{x['subject_name']} (Sem {x['semester']}{', Div ' + x['division'] if x['division'] else ''})"
-                    for x in cursor.fetchall()
-                ) or "no subject assigned"
+                assigned = subs_by_fid.get(r['faculty_row_id'], [])
+                subs = ", ".join(assigned[:6]) or "no subject assigned"
                 lines.append(f"• {r['name']} ({r['faculty_id']}) — {r['department'] or '-'} · {r['email'] or 'no email'}\n   Subjects: {subs}")
             return jsonify({"reply": "\n".join(lines)}), 200
 
@@ -194,27 +240,29 @@ def admin_assistant():
 
         # ---- System summary ----
         if 'summary' in message or 'overview' in message or 'system' in message or 'status' in message:
-            counts = {}
-            for key, q in (
-                ('students', "SELECT COUNT(*) AS c FROM students"),
-                ('faculty', "SELECT COUNT(*) AS c FROM faculty"),
-                ('subjects', "SELECT COUNT(*) AS c FROM subjects"),
-                ('notices', "SELECT COUNT(*) AS c FROM notices WHERE created_at >= NOW() - INTERVAL 7 DAY"),
-                ('pending', "SELECT COUNT(*) AS c FROM marks_requests WHERE status = 'pending'"),
-            ):
-                cursor.execute(q)
-                counts[key] = cursor.fetchone()['c']
-            reply = (f"• Students: {counts['students']}\n• Faculty: {counts['faculty']}\n• Subjects: {counts['subjects']}\n"
-                     f"• Notices this week: {counts['notices']}\n• Pending marks requests: {counts['pending']}")
+            cursor.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM students) AS students,
+                    (SELECT COUNT(*) FROM faculty) AS faculty,
+                    (SELECT COUNT(*) FROM subjects) AS subjects,
+                    (SELECT COUNT(*) FROM notices WHERE created_at >= NOW() - INTERVAL 7 DAY) AS notices,
+                    (SELECT COUNT(*) FROM marks_requests WHERE status = 'pending') AS pending
+            """)
+            counts = cursor.fetchone() or {}
+            reply = (f"• Students: {counts.get('students', 0)}\n• Faculty: {counts.get('faculty', 0)}\n• Subjects: {counts.get('subjects', 0)}\n"
+                     f"• Notices this week: {counts.get('notices', 0)}\n• Pending marks requests: {counts.get('pending', 0)}")
             return jsonify({"reply": reply}), 200
 
         # ---- Reports ----
         if 'report' in message:
-            return jsonify({"reply": "Reports section (sidebar → Reports) me Student, Attendance, Assignment aur Login Activity ke Excel (.xlsx) reports download ho jate hain."}), 200
+            return jsonify({"reply": "In the Reports section (sidebar → Reports) you can download the Student, Attendance, Assignment and Login Activity reports as Excel (.xlsx) files."}), 200
 
-        return jsonify({"reply": "Main ye pooch sakta hoon:\n• student <naam ya enrollment>\n• faculty <naam ya ID>\n• system summary\n• pending marks requests\n• reports"}), 200
+        help_text = "I can answer these:\n• student <name or enrollment>\n• faculty <name or ID>\n• system summary\n• pending marks requests\n• reports"
+        reply = get_fallback_reply(cursor, raw, request.user['user_id'], 'admin', help_text)
+        return jsonify({"reply": reply}), 200
     except Exception as e:
-        return jsonify({"reply": "Something went wrong.", "error": str(e)}), 200
+        app.logger.exception("Admin assistant failed")
+        return jsonify({"reply": "Something went wrong. Please try again."}), 200
     finally:
         cursor.close()
         conn.close()
@@ -259,11 +307,11 @@ def get_students():
     semester = request.args.get('semester')
     academic_year = request.args.get('academic_year')
     division = request.args.get('division')
-    search = request.args.get('search')   # header search box: naam ya enrollment se match
+    search = request.args.get('search')   # header search box: match by name or enrollment
 
     query = """
         SELECT u.id, u.login_id AS enrollment, u.name, u.status,
-               s.email, s.mobile, s.department, s.semester, s.division, s.academic_year, s.gender,
+               s.email, s.mobile, s.whatsapp_number, s.department, s.semester, s.division, s.academic_year, s.gender,
                s.father_name, s.father_mobile, s.mother_name, s.mother_mobile, s.parent_email, s.parent_address
         FROM users u
         JOIN students s ON s.user_id = u.id
@@ -286,7 +334,13 @@ def get_students():
         query += " AND (u.name LIKE %s OR u.login_id LIKE %s)"
         like = f"%{search}%"
         params.extend([like, like])
-    query += " ORDER BY s.academic_year DESC, s.semester ASC, u.name ASC"
+    query += " ORDER BY s.academic_year DESC, s.semester ASC, u.login_id ASC"
+    page = request.args.get('page', type=int)
+    limit = request.args.get('limit', type=int)
+    if limit and limit > 0:
+        offset = (page - 1) * limit if page and page > 0 else 0
+        query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -300,11 +354,12 @@ def get_students():
 @app.route('/api/admin/students', methods=['POST'])
 @admin_required
 def add_student():
-    data = request.get_json()
+    data = request.get_json() or {}
     name = data.get('name')
     enrollment = data.get('enrollment')
     email = data.get('email')
     mobile = data.get('mobile')
+    whatsapp_number = (data.get('whatsapp_number') or '').strip() or None   # optional
     department = data.get('department')
     semester = data.get('semester')
     division = data.get('division')
@@ -320,6 +375,12 @@ def add_student():
 
     if not all([name, enrollment, department, semester, division]):
         return jsonify({"message": "Required fields missing"}), 400
+    if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+        return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
+    father_name = (father_name or '').strip() or None      # optional
+    father_mobile = (father_mobile or '').strip() or None  # optional
+    if father_mobile and (not father_mobile.isdigit() or len(father_mobile) != 10):
+        return jsonify({"message": "Father's mobile number must be 10 digits"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -330,23 +391,23 @@ def add_student():
         conn.close()
         return jsonify({"message": "Enrollment number already exists"}), 409
 
-    # Admin se add hue student ka default password enrollment number hi rakha
-    # — student login karke settings se change kar sakta hai.
+    # The default password of a student added by Admin is kept as the enrollment number
+    # — the student must change it on first login.
     default_password = str(enrollment)
     hashed_pw = bcrypt.hashpw(default_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
     try:
         cursor.execute(
-            "INSERT INTO users (login_id, password_hash, role, name, status) VALUES (%s, %s, 'student', %s, %s)",
+            "INSERT INTO users (login_id, password_hash, role, name, status, must_change_password) VALUES (%s, %s, 'student', %s, %s, TRUE)",
             (enrollment, hashed_pw, name, status)
         )
         user_id = cursor.lastrowid
 
         cursor.execute(
-            """INSERT INTO students (user_id, email, mobile, department, semester, division, academic_year, gender,
+            """INSERT INTO students (user_id, email, mobile, whatsapp_number, department, semester, division, academic_year, gender,
                                       father_name, father_mobile, mother_name, mother_mobile, parent_email, parent_address)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (user_id, email, mobile, department, semester, division, academic_year, gender,
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (user_id, email, mobile, whatsapp_number, department, semester, division, academic_year, gender,
              father_name, father_mobile, mother_name, mother_mobile, parent_email, parent_address)
         )
         conn.commit()
@@ -354,7 +415,8 @@ def add_student():
         conn.rollback()
         cursor.close()
         conn.close()
-        return jsonify({"message": "Failed to add student", "error": str(e)}), 500
+        app.logger.error("Failed to add student: %s", repr(e))
+        return jsonify({"message": "Failed to add student"}), 500
 
     cursor.close()
     conn.close()
@@ -374,14 +436,20 @@ def update_student(user_id):
         conn.close()
         return jsonify({"message": "Student not found"}), 404
 
+    whatsapp_number = (data.get('whatsapp_number') or '').strip() or None   # optional
+    if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
+
     try:
         cursor.execute("UPDATE users SET name = %s WHERE id = %s", (data.get('name'), user_id))
         cursor.execute(
-            """UPDATE students SET email=%s, mobile=%s, department=%s, semester=%s,
+            """UPDATE students SET email=%s, mobile=%s, whatsapp_number=%s, department=%s, semester=%s,
                division=%s, academic_year=%s, gender=%s,
                father_name=%s, father_mobile=%s, mother_name=%s, mother_mobile=%s,
                parent_email=%s, parent_address=%s WHERE user_id=%s""",
-            (data.get('email'), data.get('mobile'), data.get('department'), data.get('semester'),
+            (data.get('email'), data.get('mobile'), whatsapp_number, data.get('department'), data.get('semester'),
              data.get('division'), data.get('academic_year'), data.get('gender'),
              data.get('father_name'), data.get('father_mobile'), data.get('mother_name'), data.get('mother_mobile'),
              data.get('parent_email'), data.get('parent_address'), user_id)
@@ -434,10 +502,10 @@ def toggle_student_status(user_id):
 
 
 # ============================================================
-# Academic term helpers — har semester (1-6) ki apni start/end date
-# academic_years table me sem1_start..sem6_end columns me store hoti hai.
-# Semester 1,3,5 GTU ke Odd Term (Jul-Dec) me aate hain, 2,4,6 Even Term
-# (Jan-June) me — yeh sirf year_label derive karne ke kaam aata hai.
+# Academic term helpers — each semester (1-6) has its own start/end date,
+# stored in the academic_years table in the sem1_start..sem6_end columns.
+# Semesters 1,3,5 fall in GTU's Odd Term (Jul-Dec) and 2,4,6 in the Even Term
+# (Jan-June) — this is only used to derive the year_label.
 # ============================================================
 def _term_for_semester(semester):
     return 'odd' if int(semester) % 2 == 1 else 'even'
@@ -449,8 +517,8 @@ def _sem_columns(semester):
 
 
 def _get_academic_year_for_date_semester(cursor, date_str, semester):
-    """Diye gaye semester ki date-range me di gayi date fit baithti hai to
-    us academic_years row ko return karta hai, warna None."""
+    """If the given date fits inside the date range of the given semester,
+    returns that academic_years row, otherwise None."""
     start_col, end_col = _sem_columns(semester)
     cursor.execute(
         f"""SELECT id, year_label, {start_col} AS start_date, {end_col} AS end_date
@@ -464,9 +532,9 @@ def _get_academic_year_for_date_semester(cursor, date_str, semester):
 
 
 def _derive_year_label(start_date_str, semester):
-    """GTU convention: Odd semester (1,3,5 → Jul-Dec) ussi calendar year se
-    year_label banta hai (e.g. July 2026 -> '2026-27'); Even semester
-    (2,4,6 → Jan-June) pichle calendar year se judta hai (e.g. Jan 2027 -> '2026-27')."""
+    """GTU convention: an Odd semester (1,3,5 → Jul-Dec) takes its
+    year_label from the same calendar year (e.g. July 2026 -> '2026-27'); an Even semester
+    (2,4,6 → Jan-June) belongs to the previous calendar year (e.g. Jan 2027 -> '2026-27')."""
     year = int(start_date_str[:4])
     if _term_for_semester(semester) == 'odd':
         return f"{year}-{str(year + 1)[2:]}"
@@ -474,11 +542,11 @@ def _derive_year_label(start_date_str, semester):
 
 
 def _upsert_academic_year_semester_dates(cursor, semester, start_date, end_date):
-    """Promote Semester (ya Academic Management se manually) di gayi start/end
-    date ko academic_years table ke us semester ke column me save karta hai —
-    row already ho to update, warna year_label date se derive karke nayi row
-    bana deta hai. Dono jagah (Academic Management + Promote Semester) yehi
-    function use karte hain, isliye dono hamesha sync me rehte hain."""
+    """Saves the given start/end date (from Promote Semester, or manually from Academic Management)
+    into that semester's column in the academic_years table —
+    updates the row if it already exists, otherwise derives the year_label from the date
+    and creates a new row. Both places (Academic Management + Promote Semester) use this
+    same function, so the two always stay in sync."""
     year_label = _derive_year_label(start_date, semester)
     start_col, end_col = _sem_columns(semester)
 
@@ -508,10 +576,10 @@ def promote_students():
     doesn't exist. academic_year (batch) never changes here — only
     semester/status move.
 
-    Sem 6 se neeche promote karne ke liye naye semester ki Start Date aur
-    End Date dena zaroori hai — inhi se Academic Management ka academic_years
-    record bhi apne aap ban/update ho jaata hai (dono jagah same data).
-    Dates diye bina promotion hoti hi nahi.
+    To promote below Sem 6, the Start Date and End Date of the new semester
+    are required — the academic_years record of Academic Management is also
+    created/updated automatically from them (same data in both places).
+    Promotion does not happen without dates.
     """
     data = request.get_json()
     student_ids = data.get('student_ids')  # list of users.id
@@ -531,24 +599,24 @@ def promote_students():
     )
     rows = cursor.fetchall()
 
-    # Sem 6 wale sirf graduate hote hain (koi naya semester nahi), unke liye date zaroori nahi.
-    # Baaki kisi bhi student ko promote karna hai to date dena hi hoga.
+    # Sem 6 students only graduate (there is no new semester), so no date is needed for them.
+    # Any other student being promoted must have a date.
     needs_dates = any(int(r['semester']) < 6 for r in rows)
     if needs_dates:
         if not term_start_date or not term_end_date:
             cursor.close()
             conn.close()
-            return jsonify({"message": "Naye semester ki Start Date aur End Date dono dena zaroori hai"}), 400
+            return jsonify({"message": "Both the Start Date and End Date of the new semester are required"}), 400
         if term_start_date > term_end_date:
             cursor.close()
             conn.close()
-            return jsonify({"message": "Start date, end date se pehle honi chahiye"}), 400
+            return jsonify({"message": "Start date must be before the end date"}), 400
 
     promoted, graduated = [], []
     try:
-        # Ek hi Promote action ke saare non-graduating students same current-semester
-        # (isliye same target semester) ke hote hain — Student Management ki filter
-        # list hamesha ek hi Dept+Sem+Batch se populate hoti hai.
+        # All the non-graduating students of a single Promote action are in the same current semester
+        # (and therefore the same target semester) — the Student Management filter
+        # list is always populated from a single Dept+Sem+Batch.
         sem_dates_saved = set()
         for row in rows:
             uid = row['user_id']
@@ -589,10 +657,10 @@ def promote_students():
 @admin_required
 def get_faculty():
     academic_year = request.args.get('academic_year')
-    search = request.args.get('search')   # header search box: naam ya faculty ID se match
+    search = request.args.get('search')   # header search box: match by name or faculty ID
 
     query = """
-        SELECT u.id, u.login_id AS faculty_id, u.name, u.status, f.id AS faculty_row_id, f.email, f.department, f.short_name,
+        SELECT u.id, u.login_id AS faculty_id, u.name, u.status, f.id AS faculty_row_id, f.email, f.department, f.short_name, f.whatsapp_number,
                GROUP_CONCAT(DISTINCT CONCAT(sub.subject_code, '::', sub.subject_name, '::', fs.semester, '::', COALESCE(fs.division, 'All')) SEPARATOR '||') AS subjects_assigned,
                MIN(fs.semester) AS default_semester,
                MIN(fs.academic_year) AS default_academic_year,
@@ -605,7 +673,7 @@ def get_faculty():
     """
     params = []
     if academic_year:
-        # sirf wahi faculty dikhao jinki us batch (academic_year) me koi subject assignment hai
+        # show only the faculty who have a subject assignment in that batch (academic_year)
         query += " AND EXISTS (SELECT 1 FROM faculty_subjects fs2 WHERE fs2.faculty_id = f.id AND fs2.academic_year = %s)"
         params.append(academic_year)
     if search:
@@ -613,7 +681,7 @@ def get_faculty():
         like = f"%{search}%"
         params.extend([like, like])
     query += """
-        GROUP BY u.id, u.login_id, u.name, u.status, f.id, f.email, f.department, f.short_name
+        GROUP BY u.id, u.login_id, u.name, u.status, f.id, f.email, f.department, f.short_name, f.whatsapp_number
         ORDER BY u.id DESC
     """
 
@@ -635,9 +703,12 @@ def add_faculty():
     email = data.get('email')
     department = data.get('department')
     short_name = (data.get('short_name') or '').strip() or None   # optional
+    whatsapp_number = (data.get('whatsapp_number') or '').strip() or None   # optional
 
     if not all([name, faculty_login_id, department]):
         return jsonify({"message": "Required fields missing"}), 400
+    if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+        return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -648,20 +719,20 @@ def add_faculty():
         conn.close()
         return jsonify({"message": "Faculty ID already exists"}), 409
 
-    # Default password pattern: faculty#<number-part-of-id> — jaise faculty001@123 -> faculty#001
+    # Default password pattern: faculty#<number-part-of-id> — e.g. faculty001@123 -> faculty#001
     digits = ''.join(ch for ch in faculty_login_id if ch.isdigit())
     default_password = f"faculty#{digits}" if digits else "faculty#0000"
     hashed_pw = bcrypt.hashpw(default_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
     try:
         cursor.execute(
-            "INSERT INTO users (login_id, password_hash, role, name) VALUES (%s, %s, 'faculty', %s)",
+            "INSERT INTO users (login_id, password_hash, role, name, must_change_password) VALUES (%s, %s, 'faculty', %s, TRUE)",
             (faculty_login_id, hashed_pw, name)
         )
         user_id = cursor.lastrowid
         cursor.execute(
-            "INSERT INTO faculty (user_id, email, department, short_name) VALUES (%s, %s, %s, %s)",
-            (user_id, email, department, short_name)
+            "INSERT INTO faculty (user_id, email, department, short_name, whatsapp_number) VALUES (%s, %s, %s, %s, %s)",
+            (user_id, email, department, short_name, whatsapp_number)
         )
         faculty_row_id = cursor.lastrowid   # faculty.id (not users.id)
 
@@ -679,7 +750,7 @@ def add_faculty():
             )
         conn.commit()
     except Exception as e:
-        print("ADD FACULTY ERROR:", repr(e))   # terminal me exact error dikhane ke liye
+        print("ADD FACULTY ERROR:", repr(e))   # to show the exact error in the terminal
         conn.rollback()
         cursor.close()
         conn.close()
@@ -708,14 +779,25 @@ def update_faculty(user_id):
             "UPDATE faculty SET email=%s, department=%s WHERE user_id=%s",
             (data.get('email'), data.get('department'), user_id)
         )
-        # short_name optional hai — key aayi ho tabhi update karo (khali = clear)
+        # short_name is optional — update only if the key was sent (empty = clear)
         if 'short_name' in data:
             cursor.execute(
                 "UPDATE faculty SET short_name=%s WHERE user_id=%s",
                 ((data.get('short_name') or '').strip() or None, user_id)
             )
+        # whatsapp_number is optional — update only if the key was sent (empty = clear)
+        if 'whatsapp_number' in data:
+            whatsapp_number = (data.get('whatsapp_number') or '').strip() or None
+            if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+                cursor.close()
+                conn.close()
+                return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
+            cursor.execute(
+                "UPDATE faculty SET whatsapp_number=%s WHERE user_id=%s",
+                (whatsapp_number, user_id)
+            )
 
-        # Selected semester+batch ke liye subjects replace karo (dusre semesters/batches ke assignments untouched rehte hain)
+        # Replace subjects for the selected semester+batch (assignments of other semesters/batches stay untouched)
         semester = data.get('semester')
         subject_ids = data.get('subject_ids')
         academic_year = data.get('academic_year')
@@ -725,7 +807,7 @@ def update_faculty(user_id):
             faculty_row = cursor.fetchone()
             faculty_row_id = faculty_row['id']
 
-            # is semester+batch+division ke purane assignments hata do, phir naye checked subjects insert karo
+            # remove the old assignments of this semester+batch+division, then insert the newly checked subjects
             cursor.execute(
                 "DELETE FROM faculty_subjects WHERE faculty_id = %s AND semester = %s AND academic_year = %s AND division <=> %s",
                 (faculty_row_id, semester, academic_year, division)
@@ -753,7 +835,7 @@ def update_faculty(user_id):
 @app.route('/api/admin/faculty/<int:user_id>/subjects', methods=['GET'])
 @admin_required
 def get_faculty_subjects_for_semester(user_id):
-    """Edit form khulte/semester ya batch badalte waqt is faculty ke us semester+batch+division ke assigned subjects laata hai."""
+    """Fetches this faculty's assigned subjects for that semester+batch+division when the edit form opens or the semester/batch changes."""
     semester = request.args.get('semester')
     academic_year = request.args.get('academic_year')
     division = request.args.get('division') or None
@@ -826,6 +908,10 @@ def add_subject():
     semester = data.get('semester')
     credits = data.get('credits', 0)
     academic_year = data.get('academic_year')
+    subject_type = data.get('subject_type') or 'Theory'
+
+    if subject_type not in ('Theory', 'Lab', 'Theory + Lab'):
+        return jsonify({"message": "Invalid subject type"}), 400
 
     if not all([subject_code, subject_name, department, semester]):
         return jsonify({"message": "Required fields missing"}), 400
@@ -840,8 +926,8 @@ def add_subject():
 
     try:
         cursor.execute(
-            "INSERT INTO subjects (subject_code, subject_name, department, semester, credits, academic_year) VALUES (%s,%s,%s,%s,%s,%s)",
-            (subject_code, subject_name, department, semester, credits, academic_year)
+            "INSERT INTO subjects (subject_code, subject_name, department, semester, credits, academic_year, subject_type) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (subject_code, subject_name, department, semester, credits, academic_year, subject_type)
         )
         conn.commit()
     except Exception as e:
@@ -861,9 +947,14 @@ def update_subject(subject_id):
     data = request.get_json()
     conn = get_db()
     cursor = conn.cursor()
+    subject_type = data.get('subject_type') or 'Theory'
+    if subject_type not in ('Theory', 'Lab', 'Theory + Lab'):
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Invalid subject type"}), 400
     cursor.execute(
-        "UPDATE subjects SET subject_name=%s, department=%s, semester=%s, credits=%s, academic_year=%s WHERE id=%s",
-        (data.get('subject_name'), data.get('department'), data.get('semester'), data.get('credits'), data.get('academic_year'), subject_id)
+        "UPDATE subjects SET subject_name=%s, department=%s, semester=%s, credits=%s, academic_year=%s, subject_type=%s WHERE id=%s",
+        (data.get('subject_name'), data.get('department'), data.get('semester'), data.get('credits'), data.get('academic_year'), subject_type, subject_id)
     )
     conn.commit()
     affected = cursor.rowcount
@@ -894,12 +985,12 @@ def delete_subject(subject_id):
 # ============================================================
 
 def check_timetable_clash(cursor, day, start, end, faculty_id, room_no, semester, division_list, academic_year=None, exclude_id=None):
-    """Same din, overlapping time me faculty/room/division already busy to nahi — teeno check karta hai.
-    division_list ek list hai (e.g. ['A','B']) — combined-lecture (multi-division) ko sahi se handle karta hai:
-    sirf tabhi clash mana jayega jab divisions overlap karein (A,B wala slot sirf C se free hai, A ya B se clash karega).
-    Faculty/room clash HAMESHA check hota hai (batch alag ho tab bhi ek insaan/room do jagah nahi ho sakta),
-    lekin division clash sirf usi batch (academic_year) ke andar check hota hai — alag batch ka same Sem+Div
-    dar-asal students ka bilkul alag group hai."""
+    """Checks whether faculty/room/division is already busy at the same day in an overlapping time — checks all three.
+    division_list is a list (e.g. ['A','B']) — it handles a combined lecture (multi-division) correctly:
+    a clash is reported only when the divisions overlap (an A,B slot is free for C only, but clashes with A or B).
+    A faculty/room clash is ALWAYS checked (even across batches, one person/room cannot be in two places),
+    but a division clash is checked only within the same batch (academic_year) — the same Sem+Div
+    of a different batch is actually a completely different group of students."""
     exclude_clause = "AND id != %s" if exclude_id else ""
     exclude_param = (exclude_id,) if exclude_id else ()
 
@@ -915,15 +1006,15 @@ def check_timetable_clash(cursor, day, start, end, faculty_id, room_no, semester
 
     for row in overlapping_rows:
         if faculty_id_int is not None and row['faculty_id'] == faculty_id_int:
-            return "Ye faculty is din is time par pehle se busy hai"
+            return "This faculty is already busy at this time on this day"
 
         if room_no and row['room_no'] == room_no:
-            return "Ye room is din is time par pehle se book hai"
+            return "This room is already booked at this time on this day"
 
         if str(row['semester']) == str(semester) and str(row.get('academic_year') or '') == str(academic_year or ''):
             existing_division_set = set((row['division'] or '').split(','))
-            if new_division_set & existing_division_set:   # koi bhi common division ho to clash
-                return "In division(s) ka is din is time par pehle se koi aur subject schedule hai"
+            if new_division_set & existing_division_set:   # any common division means a clash
+                return "Another subject is already scheduled for these division(s) at this time on this day"
 
     return None
 
@@ -934,7 +1025,7 @@ def get_timetable():
     academic_year = request.args.get('academic_year')
 
     query = """
-        SELECT t.id, t.semester, t.division, t.academic_year, t.day_of_week, t.room_no,
+        SELECT t.id, t.semester, t.division, t.academic_year, t.day_of_week, t.room_no, t.session_type,
                TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
                TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
                t.subject_id, sub.subject_name, sub.subject_code,
@@ -966,7 +1057,7 @@ def get_timetable():
 @app.route('/api/admin/timetable/faculty-options', methods=['GET'])
 @admin_required
 def get_faculty_options_for_subject():
-    """Subject + semester ke hisaab se sirf wahi faculty dikhata hai jo woh subject padhate hain."""
+    """Shows only the faculty who teach that subject, according to subject + semester."""
     subject_id = request.args.get('subject_id')
     semester = request.args.get('semester')
 
@@ -990,7 +1081,7 @@ def get_faculty_options_for_subject():
 def add_timetable_slot():
     data = request.get_json()
     semester = data.get('semester')
-    division_list = data.get('divisions') or []   # e.g. ["A","B"] — ek se zyada divisions ka combined lecture
+    division_list = data.get('divisions') or []   # e.g. ["A","B"] — a combined lecture for more than one division
     subject_id = data.get('subject_id')
     faculty_id = data.get('faculty_id')
     day_of_week = data.get('day_of_week')
@@ -998,13 +1089,17 @@ def add_timetable_slot():
     end_time = data.get('end_time')
     room_no = data.get('room_no')
     academic_year = data.get('academic_year')
+    session_type = data.get('session_type') or 'Lecture'
+
+    if session_type not in ('Lecture', 'Lab'):
+        return jsonify({"message": "Invalid session type"}), 400
 
     if not all([semester, division_list, subject_id, faculty_id, day_of_week, start_time, end_time]):
-        return jsonify({"message": "Required fields missing (kam se kam ek division select karo)"}), 400
+        return jsonify({"message": "Required fields missing (select at least one division)"}), 400
     if start_time >= end_time:
-        return jsonify({"message": "Start time end time se pehle hona chahiye"}), 400
+        return jsonify({"message": "Start time must be before end time"}), 400
     if start_time < LUNCH_BREAK_END and end_time > LUNCH_BREAK_START:
-        return jsonify({"message": "1:30 PM - 2:00 PM lunch break ke liye reserved hai"}), 400
+        return jsonify({"message": "1:30 PM - 2:00 PM is reserved for the lunch break"}), 400
 
     division_str = ','.join(division_list)
 
@@ -1019,9 +1114,9 @@ def add_timetable_slot():
 
     try:
         cursor.execute("""
-            INSERT INTO timetable (department, semester, division, academic_year, day_of_week, start_time, end_time, subject_id, faculty_id, room_no)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, ('computer engineering', semester, division_str, academic_year, day_of_week, start_time, end_time, subject_id, faculty_id, room_no))
+            INSERT INTO timetable (department, semester, division, academic_year, day_of_week, start_time, end_time, subject_id, faculty_id, room_no, session_type)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, ('computer engineering', semester, division_str, academic_year, day_of_week, start_time, end_time, subject_id, faculty_id, room_no, session_type))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1047,13 +1142,17 @@ def update_timetable_slot(slot_id):
     end_time = data.get('end_time')
     room_no = data.get('room_no')
     academic_year = data.get('academic_year')
+    session_type = data.get('session_type') or 'Lecture'
+
+    if session_type not in ('Lecture', 'Lab'):
+        return jsonify({"message": "Invalid session type"}), 400
 
     if not all([semester, division_list, subject_id, faculty_id, day_of_week, start_time, end_time]):
-        return jsonify({"message": "Required fields missing (kam se kam ek division select karo)"}), 400
+        return jsonify({"message": "Required fields missing (select at least one division)"}), 400
     if start_time >= end_time:
-        return jsonify({"message": "Start time end time se pehle hona chahiye"}), 400
+        return jsonify({"message": "Start time must be before end time"}), 400
     if start_time < LUNCH_BREAK_END and end_time > LUNCH_BREAK_START:
-        return jsonify({"message": "1:30 PM - 2:00 PM lunch break ke liye reserved hai"}), 400
+        return jsonify({"message": "1:30 PM - 2:00 PM is reserved for the lunch break"}), 400
 
     division_str = ','.join(division_list)
 
@@ -1069,9 +1168,9 @@ def update_timetable_slot(slot_id):
     try:
         cursor.execute("""
             UPDATE timetable SET semester=%s, division=%s, academic_year=%s, subject_id=%s, faculty_id=%s,
-                   day_of_week=%s, start_time=%s, end_time=%s, room_no=%s
+                   day_of_week=%s, start_time=%s, end_time=%s, room_no=%s, session_type=%s
             WHERE id=%s
-        """, (semester, division_str, academic_year, subject_id, faculty_id, day_of_week, start_time, end_time, room_no, slot_id))
+        """, (semester, division_str, academic_year, subject_id, faculty_id, day_of_week, start_time, end_time, room_no, session_type, slot_id))
         conn.commit()
         affected = cursor.rowcount
     except Exception as e:
@@ -1103,7 +1202,7 @@ def delete_timetable_slot(slot_id):
 
 
 # ============================================================
-# EXAM TIMETABLE (Mid-Sem / Remedial — structured, regular timetable ki tarah)
+# EXAM TIMETABLE (Mid-Sem / Remedial — structured, like the regular timetable)
 # ============================================================
 @app.route('/api/admin/exam-timetable', methods=['GET'])
 @admin_required
@@ -1137,7 +1236,7 @@ def get_exam_timetable():
     except Exception as e:
         cursor.close()
         conn.close()
-        return jsonify({"message": "Exam timetable load nahi hui — kya 'exam_timetable' table DB me bani hai?", "error": str(e)}), 500
+        return jsonify({"message": "Exam timetable could not be loaded — is the 'exam_timetable' table created in the DB?", "error": str(e)}), 500
     for r in rows:
         if r['exam_date']:
             r['exam_date'] = r['exam_date'].isoformat()
@@ -1161,9 +1260,9 @@ def add_exam_timetable_slot():
     room_no = data.get('room_no')
 
     if exam_type not in ('Mid-Sem', 'Remedial'):
-        return jsonify({"message": "exam_type Mid-Sem ya Remedial hona chahiye"}), 400
+        return jsonify({"message": "exam_type must be Mid-Sem or Remedial"}), 400
     if not (semester and exam_date and start_time and end_time):
-        return jsonify({"message": "Semester, date, start aur end time zaroori hain"}), 400
+        return jsonify({"message": "Semester, date, start and end time are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -1192,9 +1291,9 @@ def update_exam_timetable_slot(slot_id):
     room_no = data.get('room_no')
 
     if exam_type not in ('Mid-Sem', 'Remedial'):
-        return jsonify({"message": "exam_type Mid-Sem ya Remedial hona chahiye"}), 400
+        return jsonify({"message": "exam_type must be Mid-Sem or Remedial"}), 400
     if not (semester and exam_date and start_time and end_time):
-        return jsonify({"message": "Semester, date, start aur end time zaroori hain"}), 400
+        return jsonify({"message": "Semester, date, start and end time are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -1234,15 +1333,18 @@ def delete_exam_timetable_slot(slot_id):
 @app.route('/api/admin/attendance', methods=['GET'])
 @admin_required
 def get_attendance_list():
-    """Ek ya ek se zyada divisions (combined attendance) ke sab students, saath me diye gaye subject+date ka unka status."""
+    """All students of one or more divisions (combined attendance), with their status for the given subject+date."""
     semester = request.args.get('semester')
     divisions = request.args.get('divisions')   # comma-separated, e.g. "A,B"
     academic_year = request.args.get('academic_year')
     subject_id = request.args.get('subject_id')
     date = request.args.get('date')
+    session_type = request.args.get('session_type') or 'Lecture'
 
     if not all([semester, divisions, subject_id, date]):
-        return jsonify({"message": "semester, divisions, subject_id, date sab zaroori hain"}), 400
+        return jsonify({"message": "semester, divisions, subject_id and date are all required"}), 400
+    if session_type not in ('Lecture', 'Lab'):
+        return jsonify({"message": "session_type must be Lecture or Lab"}), 400
 
     division_list = divisions.split(',')
     placeholders = ','.join(['%s'] * len(division_list))
@@ -1253,10 +1355,10 @@ def get_attendance_list():
         SELECT s.id AS student_id, u.login_id AS enrollment, u.name, s.semester, s.division, s.academic_year, a.status
         FROM students s
         JOIN users u ON u.id = s.user_id
-        LEFT JOIN attendance a ON a.student_id = s.id AND a.subject_id = %s AND a.attendance_date = %s
+        LEFT JOIN attendance a ON a.student_id = s.id AND a.subject_id = %s AND a.attendance_date = %s AND a.session_type = %s
         WHERE s.semester = %s AND s.division IN ({placeholders})
     """
-    params = [subject_id, date, semester] + division_list
+    params = [subject_id, date, session_type, semester] + division_list
     if academic_year:
         query += " AND s.academic_year = %s"
         params.append(academic_year)
@@ -1272,16 +1374,19 @@ def get_attendance_list():
 @app.route('/api/admin/attendance', methods=['POST'])
 @admin_required
 def save_attendance():
-    """Bulk mark/update — poori class ka ek din/subject ka attendance ek saath save hota hai.
-    Sirf tabhi save hota hai jab diya gaya date us subject ke semester ki apni
-    date-range ke andar ho (Academic Management / Promote Semester se set ki gayi)."""
+    """Bulk mark/update — the attendance of the whole class for one day/subject is saved in one go.
+    It is saved only if the given date falls inside that subject's semester
+    date range (set from Academic Management / Promote Semester)."""
     data = request.get_json()
     subject_id = data.get('subject_id')
     date = data.get('date')
     records = data.get('records') or []   # [{student_id, status}]
+    session_type = data.get('session_type') or 'Lecture'
 
     if not subject_id or not date or not records:
-        return jsonify({"message": "subject_id, date aur records zaroori hain"}), 400
+        return jsonify({"message": "subject_id, date and records are required"}), 400
+    if session_type not in ('Lecture', 'Lab'):
+        return jsonify({"message": "session_type must be Lecture or Lab"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -1291,12 +1396,31 @@ def save_attendance():
     if not subject:
         cursor.close()
         conn.close()
-        return jsonify({"message": "Subject nahi mila"}), 404
+        return jsonify({"message": "Subject not found"}), 404
 
     if not _get_academic_year_for_date_semester(cursor, date, subject['semester']):
         cursor.close()
         conn.close()
-        return jsonify({"message": f"Yeh date Sem {subject['semester']} ki date-range me nahi hai — pehle Academic Management me is semester ki start/end date set karo"}), 400
+        return jsonify({"message": f"This date is not within the date range of Sem {subject['semester']} — first set the start/end date of this semester in Academic Management"}), 400
+
+    # Holiday / cancelled lecture -> was never held, so attendance must not be saved (even by Admin)
+    try:
+        date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Invalid date"}), 400
+    student_ids = [r.get('student_id') for r in records if r.get('student_id')]
+    divisions = []
+    if student_ids:
+        id_placeholders = ','.join(['%s'] * len(student_ids))
+        cursor.execute(f"SELECT DISTINCT division FROM students WHERE id IN ({id_placeholders})", tuple(student_ids))
+        divisions = [row['division'] for row in cursor.fetchall()]
+    block_reason = get_admin_session_block_reason(cursor, subject_id, subject['semester'], divisions, session_type, date_obj)
+    if block_reason:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": block_reason}), 409
 
     try:
         for r in records:
@@ -1305,10 +1429,10 @@ def save_attendance():
             if not student_id or status not in ('present', 'absent'):
                 continue
             cursor.execute("""
-                INSERT INTO attendance (student_id, subject_id, attendance_date, status)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO attendance (student_id, subject_id, attendance_date, session_type, status)
+                VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status)
-            """, (student_id, subject_id, date, status))
+            """, (student_id, subject_id, date, session_type, status))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1324,15 +1448,15 @@ def save_attendance():
 @app.route('/api/admin/attendance/summary', methods=['GET'])
 @admin_required
 def get_attendance_summary():
-    """Har student ka overall attendance % — subject_id diya ho to sirf usi subject ka, 'ALL' ho to poore semester ka combined.
-    Ek se zyada divisions bhi ek saath (combined) le sakte hain."""
+    """Overall attendance % of each student — only for that subject if subject_id is given, or the combined figure for the whole semester if it is 'ALL'.
+    More than one division can also be taken together (combined)."""
     semester = request.args.get('semester')
     divisions = request.args.get('divisions')   # comma-separated, e.g. "A,B"
     academic_year = request.args.get('academic_year')
-    subject_id = request.args.get('subject_id')   # ID ya 'ALL'
+    subject_id = request.args.get('subject_id')   # ID or 'ALL'
 
     if not semester or not divisions:
-        return jsonify({"message": "semester aur divisions zaroori hain"}), 400
+        return jsonify({"message": "semester and divisions are required"}), 400
 
     division_list = divisions.split(',')
     placeholders = ','.join(['%s'] * len(division_list))
@@ -1370,15 +1494,15 @@ def get_attendance_summary():
 @app.route('/api/admin/attendance/calendar', methods=['GET'])
 @admin_required
 def get_attendance_calendar():
-    """Ek student ke ek mahine ka din-wise status — Subject filter specific ho to usi ka,
-    'ALL' ho to us din agar kisi bhi subject me absent mila to poora din 'absent' maana jata hai."""
+    """Day-wise status of one student for one month — for that subject if a specific Subject filter is chosen,
+    and if it is 'ALL', a day counts as 'absent' if the student was absent in any subject that day."""
     student_id = request.args.get('student_id')
-    subject_id = request.args.get('subject_id')   # ID ya 'ALL'
+    subject_id = request.args.get('subject_id')   # ID or 'ALL'
     year = request.args.get('year')
     month = request.args.get('month')
 
     if not all([student_id, year, month]):
-        return jsonify({"message": "student_id, year, month zaroori hain"}), 400
+        return jsonify({"message": "student_id, year and month are required"}), 400
 
     subject_clause = "AND subject_id = %s" if (subject_id and subject_id != 'ALL') else ""
     query = f"""
@@ -1447,7 +1571,7 @@ def get_notes():
 @app.route('/api/admin/notes', methods=['POST'])
 @admin_required
 def add_note():
-    """multipart/form-data — file ke saath aata hai (JSON nahi)."""
+    """multipart/form-data — it comes with a file (not JSON)."""
     title = request.form.get('title')
     subject_id = request.form.get('subject_id')
     semester = request.form.get('semester')
@@ -1457,14 +1581,14 @@ def add_note():
     file = request.files.get('file')
 
     if not title or not subject_id or not file or file.filename == '':
-        return jsonify({"message": "Title, subject aur file zaroori hain"}), 400
+        return jsonify({"message": "Title, subject and file are required"}), 400
 
     if not _allowed_note_file(file.filename):
-        return jsonify({"message": "Sirf PDF, DOC, DOCX, PPT, PPTX files allowed hain"}), 400
+        return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
 
     original_name = secure_filename(file.filename)
     file_ext = original_name.rsplit('.', 1)[1].lower()
-    unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # disk pe collision se bachne ke liye unique naam
+    unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # unique name to avoid collisions on disk
     save_path = os.path.join(NOTES_UPLOAD_FOLDER, unique_name)
 
     file.save(save_path)
@@ -1483,8 +1607,8 @@ def add_note():
         cursor.close()
         conn.close()
         if os.path.exists(save_path):
-            os.remove(save_path)   # DB save fail hua to orphan file disk pe mat chodo
-        return jsonify({"message": "Note save nahi hua", "error": str(e)}), 500
+            os.remove(save_path)   # if the DB save failed, don't leave an orphan file on disk
+        return jsonify({"message": "Note could not be saved", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -1494,7 +1618,7 @@ def add_note():
 @app.route('/api/admin/notes/<int:note_id>', methods=['PUT'])
 @admin_required
 def update_note(note_id):
-    """Sirf details edit hoti hain (title/subject/semester/division/description) — file replace nahi hoti."""
+    """Only the details (title/subject/semester/division/description) can be edited — the file cannot be replaced."""
     data = request.get_json()
     title = data.get('title')
     subject_id = data.get('subject_id')
@@ -1504,7 +1628,7 @@ def update_note(note_id):
     description = data.get('description') or None
 
     if not title or not subject_id:
-        return jsonify({"message": "Title aur subject zaroori hain"}), 400
+        return jsonify({"message": "Title and subject are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -1541,7 +1665,7 @@ def delete_note(note_id):
 
     file_path = os.path.join(NOTES_UPLOAD_FOLDER, note['file_path'])
     if os.path.exists(file_path):
-        os.remove(file_path)   # DB record ke saath actual file bhi delete karo
+        os.remove(file_path)   # delete the actual file along with the DB record
 
     return jsonify({"message": "Note deleted"}), 200
 
@@ -1599,8 +1723,8 @@ def get_assignments():
         query += " AND a.subject_id = %s"
         params.append(subject_id)
     if division:
-        # Us division ki assignments + "All divisions" wali (division NULL) — dono dikhengi,
-        # kyunki "All divisions" wali bhi is division ke students pe apply hoti hain
+        # Assignments of that division + the "All divisions" ones (division NULL) — both are shown,
+        # because "All divisions" assignments also apply to the students of this division
         query += " AND (a.division = %s OR a.division IS NULL)"
         params.append(division)
     if academic_year:
@@ -1624,7 +1748,7 @@ def get_assignments():
 @app.route('/api/admin/assignments', methods=['POST'])
 @admin_required
 def add_assignment():
-    """multipart/form-data — attachment file OPTIONAL hai (Notes ke ulat, yahan file na ho tab bhi assignment save ho sakti hai)."""
+    """multipart/form-data — the attachment file is OPTIONAL (unlike Notes, an assignment can be saved here even without a file)."""
     title = request.form.get('title')
     subject_id = request.form.get('subject_id')
     semester = request.form.get('semester')
@@ -1635,7 +1759,7 @@ def add_assignment():
     file = request.files.get('file')
 
     if not title or not subject_id:
-        return jsonify({"message": "Title aur subject zaroori hain"}), 400
+        return jsonify({"message": "Title and subject are required"}), 400
 
     unique_name = None
     original_name = None
@@ -1644,7 +1768,7 @@ def add_assignment():
 
     if file and file.filename:
         if not _allowed_assignment_file(file.filename):
-            return jsonify({"message": "Sirf PDF, DOC, DOCX, PPT, PPTX files allowed hain"}), 400
+            return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{file_ext}"
@@ -1668,7 +1792,7 @@ def add_assignment():
             save_path = os.path.join(ASSIGNMENT_UPLOAD_FOLDER, unique_name)
             if os.path.exists(save_path):
                 os.remove(save_path)
-        return jsonify({"message": "Assignment save nahi hui", "error": str(e)}), 500
+        return jsonify({"message": "Assignment could not be saved", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -1678,7 +1802,7 @@ def add_assignment():
 @app.route('/api/admin/assignments/<int:assignment_id>', methods=['PUT'])
 @admin_required
 def update_assignment(assignment_id):
-    """Sirf details edit hoti hain — attachment file replace nahi hoti (Notes wale pattern jaisa)."""
+    """Only the details can be edited — the attachment file cannot be replaced (same pattern as Notes)."""
     data = request.get_json()
     title = data.get('title')
     subject_id = data.get('subject_id')
@@ -1689,7 +1813,7 @@ def update_assignment(assignment_id):
     due_date = data.get('due_date') or None
 
     if not title or not subject_id:
-        return jsonify({"message": "Title aur subject zaroori hain"}), 400
+        return jsonify({"message": "Title and subject are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -1710,8 +1834,8 @@ def update_assignment(assignment_id):
 @app.route('/api/admin/assignments/<int:assignment_id>', methods=['DELETE'])
 @admin_required
 def delete_assignment(assignment_id):
-    """Assignment delete hone par uski attachment file, aur assignment_submissions (CASCADE se DB khud hata dega) — lekin
-    submissions ki actual files disk se bhi hatani padengi, isliye pehle unke paths le lo."""
+    """When an assignment is deleted, its attachment file and assignment_submissions (the DB removes these itself via CASCADE) go too — but
+    the actual files of the submissions must also be removed from disk, so get their paths first."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
 
@@ -1745,7 +1869,7 @@ def delete_assignment(assignment_id):
 @app.route('/api/admin/assignments/<int:assignment_id>/download', methods=['GET'])
 @admin_required
 def download_assignment(assignment_id):
-    """Assignment ka attachment (question paper) download karta hai."""
+    """Downloads the assignment's attachment (question paper)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT file_path, file_name FROM assignments WHERE id = %s", (assignment_id,))
@@ -1767,7 +1891,7 @@ def download_assignment(assignment_id):
 @app.route('/api/admin/assignments/<int:assignment_id>/submissions', methods=['GET'])
 @admin_required
 def get_assignment_submissions(assignment_id):
-    """Assignment ke semester+division ke sab eligible students, saath me unka submission status/marks (agar submit kiya ho)."""
+    """All eligible students of the assignment's semester+division, with their submission status/marks (if submitted)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
 
@@ -1796,7 +1920,7 @@ def get_assignment_submissions(assignment_id):
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
     for row in rows:
-        row['due_date'] = assignment['due_date']   # har row me due_date bhi bhej do, taaki frontend Late vs On-time calculate kar sake
+        row['due_date'] = assignment['due_date']   # also send due_date in every row, so the frontend can calculate Late vs On-time
     cursor.close()
     conn.close()
     return jsonify(rows), 200
@@ -1824,8 +1948,8 @@ def update_submission_marks(submission_id):
 @app.route('/api/admin/assignments/<int:assignment_id>/submissions/<int:student_id>', methods=['PUT'])
 @admin_required
 def upsert_submission(assignment_id, student_id):
-    """Admin/Faculty manually ek student ka submission status set karta hai — Submitted/Late/Pending, saath me marks.
-    Student panel se real upload aane se pehle bhi records manage karne ke liye (jaise offline/hardcopy submission)."""
+    """Admin/Faculty manually sets a student's submission status — Submitted/Late/Pending, along with marks.
+    Used to manage records even before real uploads arrive from the Student panel (e.g. offline/hardcopy submissions)."""
     data = request.get_json()
     submitted = data.get('submitted', True)
     submitted_at = data.get('submitted_at')   # 'YYYY-MM-DD'
@@ -1841,7 +1965,7 @@ def upsert_submission(assignment_id, student_id):
     existing = cursor.fetchone()
 
     if not submitted:
-        # "Pending" par wapas set karna hai — record hi hata do (agar tha)
+        # Setting it back to "Pending" — just remove the record (if there was one)
         if existing:
             cursor.execute("DELETE FROM assignment_submissions WHERE id = %s", (existing['id'],))
             conn.commit()
@@ -1851,7 +1975,7 @@ def upsert_submission(assignment_id, student_id):
 
     if not submitted_at:
         from datetime import date
-        submitted_at = date.today().isoformat()   # date nahi di to aaj ki date default
+        submitted_at = date.today().isoformat()   # if no date is given, default to today's date
 
     if existing:
         cursor.execute(
@@ -1872,7 +1996,7 @@ def upsert_submission(assignment_id, student_id):
 @app.route('/api/admin/assignments/submissions/<int:submission_id>/download', methods=['GET'])
 @admin_required
 def download_submission(submission_id):
-    """Ek student ki submitted file download karta hai."""
+    """Downloads a student's submitted file."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT file_path, file_name FROM assignment_submissions WHERE id = %s", (submission_id,))
@@ -1897,7 +2021,7 @@ def download_submission(submission_id):
 @app.route('/api/admin/marks/students', methods=['GET'])
 @admin_required
 def get_marks_students():
-    """Ek semester+division ke sab students, saath me diye gaye subject+exam ka unka already-entered marks (agar ho)."""
+    """All students of a semester+division, with their already-entered marks (if any) for the given subject+exam."""
     semester = request.args.get('semester')
     division = request.args.get('division')
     subject_id = request.args.get('subject_id')
@@ -1905,7 +2029,7 @@ def get_marks_students():
     academic_year = request.args.get('academic_year')
 
     if not all([semester, division, subject_id, exam_type, academic_year]):
-        return jsonify({"message": "semester, division, batch, subject_id, exam_type sab zaroori hain"}), 400
+        return jsonify({"message": "semester, division, batch, subject_id and exam_type are all required"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -1928,7 +2052,7 @@ def get_marks_students():
 @app.route('/api/admin/marks/bulk', methods=['POST'])
 @admin_required
 def save_marks_bulk():
-    """Poori class ke marks ek saath save/update karta hai — jaise Attendance ka bulk-save."""
+    """Saves/updates the marks of the whole class in one go — like Attendance's bulk-save."""
     data = request.get_json()
     semester = data.get('semester')
     subject_id = data.get('subject_id')
@@ -1938,7 +2062,7 @@ def save_marks_bulk():
     records = data.get('records') or []   # [{student_id, marks_obtained}]
 
     if not all([semester, subject_id, exam_type, max_marks, academic_year]) or not records:
-        return jsonify({"message": "Semester, subject, exam, batch, max marks aur records zaroori hain"}), 400
+        return jsonify({"message": "Semester, subject, exam, batch, max marks and records are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -1970,7 +2094,7 @@ def save_marks_bulk():
         conn.rollback()
         cursor.close()
         conn.close()
-        return jsonify({"message": "Marks save nahi hui", "error": str(e)}), 500
+        return jsonify({"message": "Marks could not be saved", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -1980,7 +2104,7 @@ def save_marks_bulk():
 @app.route('/api/admin/marks/publish', methods=['PUT'])
 @admin_required
 def toggle_marks_publish():
-    """Filter me jo semester+division+subject+exam currently dikh raha hai, uska poora result ek saath publish/unpublish karta hai."""
+    """Publishes/unpublishes the entire result of the semester+division+subject+exam currently shown in the filter in one go."""
     data = request.get_json()
     semester = data.get('semester')
     division = data.get('division')
@@ -1990,7 +2114,7 @@ def toggle_marks_publish():
     published = data.get('published', True)
 
     if not all([semester, division, subject_id, exam_type, academic_year]):
-        return jsonify({"message": "semester, division, batch, subject_id, exam_type zaroori hain"}), 400
+        return jsonify({"message": "semester, division, batch, subject_id and exam_type are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -2008,12 +2132,12 @@ def toggle_marks_publish():
 
 
 # ============================================================
-# MARKS REQUESTS (faculty submissions ka approval workflow)
-# pending -> approved (faculty ko notice) -> published (students+faculty ko dikhta hai)
-#         -> rejected (faculty ko notice, wapas edit kar sakta hai)
+# MARKS REQUESTS (approval workflow for faculty submissions)
+# pending -> approved (notice to faculty) -> published (visible to students+faculty)
+#         -> rejected (notice to faculty, who can edit again)
 # ============================================================
 def _notify_faculty(cursor, faculty_user_id, title, content):
-    """Faculty ke naam ek personal notice bhejta hai (target_user_id set) — Notices feed me dikhega."""
+    """Sends a personal notice to a faculty member (target_user_id set) — it will show in the Notices feed."""
     cursor.execute("""
         INSERT INTO notices (title, content, category, target_role, target_user_id, posted_by)
         VALUES (%s, %s, 'Academic', 'faculty', %s, %s)
@@ -2024,7 +2148,7 @@ def _notify_faculty(cursor, faculty_user_id, title, content):
 @admin_required
 def get_marks_requests():
     """Query param: status (pending/approved/rejected/published). Default: pending.
-    Sabhi requests ki list — faculty naam, subject, exam, division, kitne students, submit date ke saath."""
+    The list of all requests — with faculty name, subject, exam, division, number of students and submit date."""
     status = request.args.get('status', 'pending')
 
     conn = get_db()
@@ -2052,7 +2176,7 @@ def get_marks_requests():
 @app.route('/api/admin/marks/requests/<int:request_id>', methods=['GET'])
 @admin_required
 def get_marks_request_detail(request_id):
-    """Ek request ke andar har student ka marks — review karte waqt dikhane ke liye."""
+    """The marks of every student inside one request — to show while reviewing."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
@@ -2071,7 +2195,7 @@ def get_marks_request_detail(request_id):
     if not req:
         cursor.close()
         conn.close()
-        return jsonify({"message": "Request nahi mili"}), 404
+        return jsonify({"message": "Request not found"}), 404
 
     cursor.execute("""
         SELECT u.login_id AS enrollment, u.name, m.marks_obtained
@@ -2090,14 +2214,14 @@ def get_marks_request_detail(request_id):
 @app.route('/api/admin/marks/requests/<int:request_id>/decision', methods=['PUT'])
 @admin_required
 def decide_marks_request(request_id):
-    """Body: { decision: 'approved' | 'rejected', remarks (optional, rejected ke liye recommended) }.
-    Approve/Reject karte hi faculty ko personal notice chala jaata hai."""
+    """Body: { decision: 'approved' | 'rejected', remarks (optional, recommended for rejected) }.
+    As soon as it is approved/rejected, a personal notice goes to the faculty."""
     data = request.get_json() or {}
     decision = data.get('decision')
     remarks = data.get('remarks') or None
 
     if decision not in ('approved', 'rejected'):
-        return jsonify({"message": "decision 'approved' ya 'rejected' hona chahiye"}), 400
+        return jsonify({"message": "decision must be 'approved' or 'rejected'"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -2112,9 +2236,9 @@ def decide_marks_request(request_id):
         """, (request_id,))
         req = cursor.fetchone()
         if not req:
-            return jsonify({"message": "Request nahi mili"}), 404
+            return jsonify({"message": "Request not found"}), 404
         if req['status'] != 'pending':
-            return jsonify({"message": f"Yeh request already '{req['status']}' hai"}), 409
+            return jsonify({"message": f"This request is already '{req['status']}'"}), 409
 
         cursor.execute("""
             UPDATE marks_requests
@@ -2124,13 +2248,13 @@ def decide_marks_request(request_id):
 
         if decision == 'approved':
             title = f"Marks request accepted — {req['subject_name']} ({req['exam_type']})"
-            content = f"Aapki {req['subject_name']} ke {req['exam_type']} marks ki request accept ho gayi hai. Publish hote hi students ko dikhegi."
+            content = f"Your marks request for {req['subject_name']} ({req['exam_type']}) has been approved. It will be visible to students as soon as it is published."
         else:
             title = f"Marks request rejected — {req['subject_name']} ({req['exam_type']})"
-            content = f"Aapki {req['subject_name']} ke {req['exam_type']} marks ki request reject ho gayi hai."
+            content = f"Your marks request for {req['subject_name']} ({req['exam_type']}) has been rejected."
             if remarks:
                 content += f" Reason: {remarks}"
-            content += " Aap dobara edit karke submit kar sakte hain."
+            content += " You can edit it and submit again."
         _notify_faculty(cursor, req['faculty_user_id'], title, content)
 
         conn.commit()
@@ -2138,7 +2262,7 @@ def decide_marks_request(request_id):
         conn.rollback()
         cursor.close()
         conn.close()
-        return jsonify({"message": "Decision save nahi hui", "error": str(e)}), 500
+        return jsonify({"message": "Decision could not be saved", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -2148,16 +2272,16 @@ def decide_marks_request(request_id):
 @app.route('/api/admin/marks/requests/<int:request_id>/publish', methods=['PUT'])
 @admin_required
 def publish_marks_request(request_id):
-    """Sirf 'approved' request publish ho sakti hai. Publish hote hi is request ke sab marks students ko dikhne lagte hain."""
+    """Only an 'approved' request can be published. As soon as it is published, all marks of this request become visible to students."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute("SELECT * FROM marks_requests WHERE id = %s", (request_id,))
         req = cursor.fetchone()
         if not req:
-            return jsonify({"message": "Request nahi mili"}), 404
+            return jsonify({"message": "Request not found"}), 404
         if req['status'] != 'approved':
-            return jsonify({"message": "Sirf 'approved' request publish ho sakti hai"}), 409
+            return jsonify({"message": "Only an 'approved' request can be published"}), 409
 
         cursor.execute("UPDATE marks_requests SET status = 'published' WHERE id = %s", (request_id,))
         cursor.execute("UPDATE marks SET published = TRUE WHERE request_id = %s", (request_id,))
@@ -2166,7 +2290,7 @@ def publish_marks_request(request_id):
         conn.rollback()
         cursor.close()
         conn.close()
-        return jsonify({"message": "Publish nahi hua", "error": str(e)}), 500
+        return jsonify({"message": "Could not publish", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -2179,13 +2303,13 @@ def publish_marks_request(request_id):
 @app.route('/api/admin/fees/students', methods=['GET'])
 @admin_required
 def get_fee_students():
-    """Fee record add karte waqt Student dropdown (aur 'apply to whole class') ke liye students ki list."""
+    """The list of students for the Student dropdown (and 'apply to whole class') when adding a fee record."""
     semester = request.args.get('semester')
     division = request.args.get('division')
     academic_year = request.args.get('academic_year')
 
     if not semester:
-        return jsonify({"message": "semester zaroori hai"}), 400
+        return jsonify({"message": "semester is required"}), 400
 
     query = """
         SELECT s.id AS student_id, u.login_id AS enrollment, u.name
@@ -2261,8 +2385,8 @@ def get_fees():
 @admin_required
 def add_fee():
     """
-    Ek student ke liye fee record banata hai, ya 'student_ids' list de kar
-    poori class (semester+division) ke liye ek saath (bulk) bana sakte ho.
+    Creates a fee record for one student, or by passing a 'student_ids' list
+    you can create them in bulk for a whole class (semester+division) at once.
     """
     data = request.get_json()
     fee_title = data.get('fee_title')
@@ -2279,7 +2403,7 @@ def add_fee():
         student_ids = [single_id] if single_id else []
 
     if not fee_title or amount in (None, '') or not student_ids:
-        return jsonify({"message": "Fee item, amount aur kam se kam ek student zaroori hai"}), 400
+        return jsonify({"message": "Fee item, amount and at least one student are required"}), 400
 
     if status not in ('paid', 'unpaid'):
         status = 'unpaid'
@@ -2303,7 +2427,7 @@ def add_fee():
         conn.rollback()
         cursor.close()
         conn.close()
-        return jsonify({"message": "Fee record save nahi hua", "error": str(e)}), 500
+        return jsonify({"message": "Fee record could not be saved", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -2321,7 +2445,7 @@ def update_fee(fee_id):
     status = data.get('status')
 
     if not fee_title or amount in (None, ''):
-        return jsonify({"message": "Fee item aur amount zaroori hai"}), 400
+        return jsonify({"message": "Fee item and amount are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -2345,7 +2469,7 @@ def update_fee(fee_id):
     cursor.close()
     conn.close()
     if affected == 0:
-        return jsonify({"message": "Fee record nahi mila"}), 404
+        return jsonify({"message": "Fee record not found"}), 404
     return jsonify({"message": "Fee record updated"}), 200
 
 
@@ -2368,20 +2492,20 @@ def toggle_fee_status(fee_id):
     cursor.close()
     conn.close()
     if affected == 0:
-        return jsonify({"message": "Fee record nahi mila"}), 404
+        return jsonify({"message": "Fee record not found"}), 404
     return jsonify({"message": f"Fee marked {new_status}"}), 200
 
 
 @app.route('/api/admin/fees/folder', methods=['DELETE'])
 @admin_required
 def delete_fee_folder():
-    """Ek poore Fee folder (Semester + Division + Batch group) ke saare fee records
-    ek saath delete karta hai. Fees table me khud 'division' column nahi hai (woh
-    student ki row se aata hai, get_fees() ki tarah), isliye students se join karke
-    match karte hain. division query param na bheja jaye to sirf woh records match
-    honge jinke student ki division NULL hai ('All'/unset division waala folder).
-    Optional fee_title param diya jaye to us batch ke andar sirf us title ke sub-folder
-    ka delete hota hai (poora batch nahi) -- Fee Management ki nested folder view ke liye."""
+    """Deletes all fee records of an entire Fee folder (Semester + Division + Batch group)
+    in one go. The fees table itself has no 'division' column (it comes from the
+    student's row, like in get_fees()), so we match by joining with students.
+    If the division query param is not sent, only records whose student has a NULL
+    division (the 'All'/unset division folder) will match.
+    If the optional fee_title param is given, only that title's sub-folder inside that batch
+    is deleted (not the whole batch) -- for Fee Management's nested folder view."""
     semester = request.args.get('semester')
     academic_year = request.args.get('academic_year')
     division = request.args.get('division') or None
@@ -2434,36 +2558,48 @@ def delete_fee(fee_id):
     cursor.close()
     conn.close()
     if affected == 0:
-        return jsonify({"message": "Fee record nahi mila"}), 404
+        return jsonify({"message": "Fee record not found"}), 404
     return jsonify({"message": "Fee record deleted"}), 200
 
 
 # ============================================================
-# Notification bell — naye notices + naye pending marks requests
-# "since" (last dropdown khola tha) ke baad kitne naye aaye, wahi count
-# hota hai. Dropdown khulte hi frontend naya "since" save kar deta hai,
-# isliye seen karte hi red dot chala jaata hai.
+# Notification bell — new notices + new pending marks requests
+# The count is how many new ones arrived after "since" (when the dropdown was last opened).
+# As soon as the dropdown opens, the frontend saves a new "since",
+# so the red dot goes away once they are seen.
 # ============================================================
 @app.route('/api/admin/notifications', methods=['GET'])
 @admin_required
 def get_notifications():
-    since = request.args.get('since')   # ISO datetime string ya None (pehli baar)
+    since = request.args.get('since')   # ISO datetime string or None (first time)
+    admin_id = request.user['user_id']
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
 
+    # The admin's own posted notices should not be counted in their own notification badge
+    # — only notices from others (faculty) count as "new".
     if since:
-        cursor.execute("SELECT COUNT(*) AS c FROM notices WHERE created_at > %s", (since,))
+        cursor.execute(
+            "SELECT COUNT(*) AS c FROM notices WHERE created_at > %s AND (posted_by IS NULL OR posted_by <> %s)",
+            (since, admin_id)
+        )
         unseen_notices = cursor.fetchone()['c']
         cursor.execute("SELECT COUNT(*) AS c FROM marks_requests WHERE status = 'pending' AND submitted_at > %s", (since,))
         unseen_marks = cursor.fetchone()['c']
     else:
-        cursor.execute("SELECT COUNT(*) AS c FROM notices")
+        cursor.execute(
+            "SELECT COUNT(*) AS c FROM notices WHERE (posted_by IS NULL OR posted_by <> %s)",
+            (admin_id,)
+        )
         unseen_notices = cursor.fetchone()['c']
         cursor.execute("SELECT COUNT(*) AS c FROM marks_requests WHERE status = 'pending'")
         unseen_marks = cursor.fetchone()['c']
 
-    cursor.execute("SELECT title, created_at FROM notices ORDER BY created_at DESC LIMIT 5")
+    cursor.execute(
+        "SELECT title, created_at FROM notices WHERE (posted_by IS NULL OR posted_by <> %s) ORDER BY created_at DESC LIMIT 5",
+        (admin_id,)
+    )
     recent_notices = cursor.fetchall()
 
     cursor.execute("""
@@ -2497,7 +2633,10 @@ def get_notices():
     academic_year = request.args.get('academic_year')
 
     query = """SELECT n.id, n.title, n.content, n.category, n.target_role, n.semester, n.division, n.academic_year,
-                      n.is_pinned, n.file_name, n.file_size, n.file_type, n.created_at, COUNT(nr.id) AS seen_count
+                      n.is_pinned, n.file_name, n.file_size, n.file_type, n.created_at, n.posted_by,
+                      (SELECT u.name FROM users u WHERE u.id = n.posted_by) AS posted_by_name,
+                      (SELECT u.role FROM users u WHERE u.id = n.posted_by) AS posted_by_role,
+                      COUNT(nr.id) AS seen_count
                FROM notices n
                LEFT JOIN notice_reads nr ON nr.notice_id = n.id
                WHERE 1=1"""
@@ -2525,13 +2664,16 @@ def get_notices():
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
+    admin_id = request.user['user_id']
+    for r in rows:
+        r['is_mine'] = (r.pop('posted_by') == admin_id)   # a notice they posted themselves will show in a "sent" bubble on the right side
     return jsonify(rows), 200
 
 
 @app.route('/api/admin/notices', methods=['POST'])
 @admin_required
 def add_notice():
-    """multipart/form-data — attachment optional hai (JSON nahi, kyunki file bhi aa sakti hai)."""
+    """multipart/form-data — the attachment is optional (not JSON, because a file can also come along)."""
     title = request.form.get('title')
     content = request.form.get('content')
     category = request.form.get('category') or 'Academic'
@@ -2543,17 +2685,17 @@ def add_notice():
     file = request.files.get('file')
 
     if not title:
-        return jsonify({"message": "Title zaroori hai"}), 400
+        return jsonify({"message": "Title is required"}), 400
     if target_role not in ('all', 'student', 'faculty'):
         return jsonify({"message": "target_role must be all, student or faculty"}), 400
 
     file_path = file_name = file_size = file_type = None
     if file and file.filename:
         if not _allowed_notice_file(file.filename):
-            return jsonify({"message": "Sirf PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files allowed hain"}), 400
+            return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
-        unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # disk pe collision se bachne ke liye unique naam
+        unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # unique name to avoid collisions on disk
         save_path = os.path.join(NOTICE_UPLOAD_FOLDER, unique_name)
         file.save(save_path)
         file_path = unique_name
@@ -2574,8 +2716,8 @@ def add_notice():
         cursor.close()
         conn.close()
         if file_path and os.path.exists(os.path.join(NOTICE_UPLOAD_FOLDER, file_path)):
-            os.remove(os.path.join(NOTICE_UPLOAD_FOLDER, file_path))   # DB save fail hua to orphan file disk pe mat chodo
-        return jsonify({"message": "Notice save nahi hua", "error": str(e)}), 500
+            os.remove(os.path.join(NOTICE_UPLOAD_FOLDER, file_path))   # if the DB save failed, don't leave an orphan file on disk
+        return jsonify({"message": "Notice could not be saved", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
@@ -2596,7 +2738,7 @@ def update_notice(notice_id):
     is_pinned = bool(data.get('is_pinned'))
 
     if not title:
-        return jsonify({"message": "Title zaroori hai"}), 400
+        return jsonify({"message": "Title is required"}), 400
     if target_role not in ('all', 'student', 'faculty'):
         return jsonify({"message": "target_role must be all, student or faculty"}), 400
 
@@ -2611,7 +2753,7 @@ def update_notice(notice_id):
     cursor.close()
     conn.close()
     if affected == 0:
-        return jsonify({"message": "Notice nahi mila"}), 404
+        return jsonify({"message": "Notice not found"}), 404
     return jsonify({"message": "Notice updated"}), 200
 
 
@@ -2629,7 +2771,7 @@ def toggle_notice_pin(notice_id):
     cursor.close()
     conn.close()
     if affected == 0:
-        return jsonify({"message": "Notice nahi mila"}), 404
+        return jsonify({"message": "Notice not found"}), 404
     return jsonify({"message": f"Notice {'pinned' if is_pinned else 'unpinned'}"}), 200
 
 
@@ -2647,12 +2789,12 @@ def delete_notice(notice_id):
     cursor.close()
     conn.close()
     if affected == 0:
-        return jsonify({"message": "Notice nahi mila"}), 404
+        return jsonify({"message": "Notice not found"}), 404
 
     if notice and notice['file_path']:
         file_path = os.path.join(NOTICE_UPLOAD_FOLDER, notice['file_path'])
         if os.path.exists(file_path):
-            os.remove(file_path)   # DB record ke saath attachment bhi delete karo
+            os.remove(file_path)   # delete the attachment along with the DB record
 
     return jsonify({"message": "Notice deleted"}), 200
 
@@ -2668,7 +2810,7 @@ def download_notice_file(notice_id):
     conn.close()
 
     if not notice or not notice['file_path']:
-        return jsonify({"message": "Attachment nahi mila"}), 404
+        return jsonify({"message": "Attachment not found"}), 404
 
     return send_from_directory(
         NOTICE_UPLOAD_FOLDER,
@@ -2681,9 +2823,9 @@ def download_notice_file(notice_id):
 @app.route('/api/admin/notices/mark-read', methods=['POST'])
 @admin_required
 def mark_admin_notices_read():
-    """Notices tab khulte hi call hota hai — dusron (jaise faculty) ki post ki hui sabhi notices
-    ko is admin ke naam se 'seen' mark karta hai, taaki faculty ko 'Seen by' list me admin dikhe.
-    Admin ki apni post ki hui notices skip hoti hain (poster ka khud ka seen count nahi hota)."""
+    """Called as soon as the Notices tab opens — marks all notices posted by others (e.g. faculty)
+    as 'seen' in this admin's name, so the admin shows up in the faculty's 'Seen by' list.
+    The admin's own posted notices are skipped (the poster has no seen count of their own)."""
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -2707,7 +2849,7 @@ def mark_admin_notices_read():
 @app.route('/api/admin/notices/<int:notice_id>/reads', methods=['GET'])
 @admin_required
 def get_notice_reads(notice_id):
-    """Kis kis (student/faculty) ne ye notice dekh liya hai, uski list + target audience ka total count."""
+    """The list of who (students/faculty) has seen this notice + the total count of the target audience."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
 
@@ -2716,9 +2858,9 @@ def get_notice_reads(notice_id):
     if not notice:
         cursor.close()
         conn.close()
-        return jsonify({"message": "Notice nahi mila"}), 404
+        return jsonify({"message": "Notice not found"}), 404
 
-    # Jinhone dekh liya, unki list (naam, enrollment/login id, role, kab dekha)
+    # The list of those who have seen it (name, enrollment/login id, role, when seen)
     cursor.execute("""
         SELECT u.id AS user_id, u.name, u.login_id, u.role, nr.seen_at
         FROM notice_reads nr
@@ -2728,7 +2870,7 @@ def get_notice_reads(notice_id):
     """, (notice_id,))
     seen_by = cursor.fetchall()
 
-    # Target audience ka total count — kise notice dikhna chahiye tha
+    # Total count of the target audience — who was supposed to see the notice
     target_total = 0
     if notice['target_role'] in ('all', 'student'):
         q = "SELECT COUNT(*) AS c FROM students WHERE 1=1"
@@ -2786,7 +2928,7 @@ def update_admin_settings():
 
     college_email = data.get('college_email')
     if college_email and ('@' not in college_email or '.' not in college_email.split('@')[-1]):
-        return jsonify({"message": "College email ID valid nahi hai"}), 400
+        return jsonify({"message": "College email ID is not valid"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -2822,23 +2964,32 @@ def admin_change_password():
     new_password = data.get('new_password')
 
     if not current_password or not new_password:
-        return jsonify({"message": "Current aur new password dono required hain"}), 400
+        return jsonify({"message": "Both current and new password are required"}), 400
     if len(new_password) < 8:
-        return jsonify({"message": "New password kam se kam 8 characters ka hona chahiye"}), 400
+        return jsonify({"message": "New password must be at least 8 characters"}), 400
 
     user_id = request.user['user_id']
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+    cursor.execute("SELECT password_hash, login_id, role FROM users WHERE id = %s", (user_id,))
     user = cursor.fetchone()
 
     if not user or not bcrypt.checkpw(current_password.encode('utf-8'), user['password_hash'].encode('utf-8')):
         cursor.close()
         conn.close()
-        return jsonify({"message": "Current password galat hai"}), 401
+        return jsonify({"message": "Current password is incorrect"}), 401
+
+    if current_password == new_password:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "New password must be different from the current password"}), 400
+    if is_default_password(user['role'], user['login_id'], new_password):
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Please choose a password that is not the default one"}), 400
 
     new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
+    cursor.execute("UPDATE users SET password_hash = %s, must_change_password = FALSE WHERE id = %s", (new_hash, user_id))
     conn.commit()
     cursor.close()
     conn.close()
@@ -2860,8 +3011,8 @@ def get_login_history():
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    # login_time ko plain string bhejna zaroori hai, warna Flask ka jsonify() ise
-    # GMT maan ke serialize kar deta hai aur browser me time galat (aage) dikhta hai
+    # login_time must be sent as a plain string, otherwise Flask's jsonify() serializes it
+    # as GMT and the browser shows the wrong (ahead) time
     for r in rows:
         if r.get('login_time'):
             r['login_time'] = r['login_time'].strftime('%Y-%m-%d %H:%M:%S')
@@ -2869,7 +3020,7 @@ def get_login_history():
 
 
 # ============================================================
-# Academic Year management — har year ke 6 semesters ki apni-apni date
+# Academic Year management — the dates of each year's 6 semesters
 # ============================================================
 _SEM_COLS = [f"sem{n}_start" for n in range(1, 7)] + [f"sem{n}_end" for n in range(1, 7)]
 
@@ -2885,19 +3036,25 @@ def get_academic_years():
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
+    # send date columns as a plain 'YYYY-MM-DD' string — otherwise Flask serializes them in HTTP-date
+    # format, which doesn't work with <input type="date"> and date comparison
+    for r in rows:
+        for col in _SEM_COLS:
+            if r.get(col):
+                r[col] = r[col].strftime('%Y-%m-%d')
     return jsonify(rows), 200
 
 
 @app.route('/api/admin/academic-years/term-dates', methods=['GET'])
 @admin_required
 def get_term_dates_for_semester():
-    """Promote Semester form ke liye — diye gaye (target) semester ki date
-    already kisi academic_years row me set hai aur aaj ki date uske range
-    me hai, to woh dates wapas karta hai (form me pre-fill hone ke liye),
-    taaki admin galti se purani date overwrite na kar de."""
+    """For the Promote Semester form — if the date of the given (target) semester
+    is already set in some academic_years row and today's date is within its range,
+    returns those dates (to pre-fill the form),
+    so that the admin doesn't accidentally overwrite an old date."""
     semester = request.args.get('semester')
     if not semester:
-        return jsonify({"message": "semester query param required hai"}), 400
+        return jsonify({"message": "semester query param is required"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -2914,14 +3071,14 @@ def get_term_dates_for_semester():
 @app.route('/api/admin/academic-years', methods=['POST'])
 @admin_required
 def add_academic_year():
-    """Academic Management se manually bhi kisi bhi semester (1-6) ki date daali
-    ja sakti hai — yeh Promote Semester wale hi row/columns update karta hai,
-    isliye dono jagah hamesha sync me rehte hain."""
+    """The dates of any semester (1-6) can also be entered manually from Academic Management
+    — this updates the same row/columns as Promote Semester,
+    so the two always stay in sync."""
     data = request.get_json()
     year_label = (data.get('year_label') or '').strip()
 
     if not year_label:
-        return jsonify({"message": "Academic year required hai (e.g. 2027-28)"}), 400
+        return jsonify({"message": "Academic year is required (e.g. 2027-28)"}), 400
 
     sem_values = {}
     for n in range(1, 7):
@@ -2953,11 +3110,56 @@ def add_academic_year():
         conn.rollback()
         cursor.close()
         conn.close()
-        return jsonify({"message": "Add nahi hua", "error": str(e)}), 500
+        return jsonify({"message": "Could not add", "error": str(e)}), 500
 
     cursor.close()
     conn.close()
     return jsonify({"message": "Academic year saved"}), 201
+
+
+@app.route('/api/admin/academic-years/<int:year_id>', methods=['PUT'])
+@admin_required
+def update_academic_year(year_id):
+    """Edits the semester dates of an existing academic year.
+    year_label is not changed here — tables like students/subjects/timetable
+    are linked by the text of the academic_year label, and renaming it would
+    leave those records orphaned."""
+    data = request.get_json() or {}
+
+    sem_values = {}
+    for n in range(1, 7):
+        start = data.get(f"sem{n}_start") or None
+        end = data.get(f"sem{n}_end") or None
+        if start and end and start > end:
+            return jsonify({"message": f"Sem {n}: start date must be before the end date"}), 400
+        sem_values[f"sem{n}_start"] = start
+        sem_values[f"sem{n}_end"] = end
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM academic_years WHERE id = %s", (year_id,))
+    if not cursor.fetchone():
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Academic year not found"}), 404
+
+    try:
+        set_clause = ', '.join(f"{col} = %s" for col in sem_values)
+        cursor.execute(
+            f"UPDATE academic_years SET {set_clause} WHERE id = %s",
+            tuple(sem_values.values()) + (year_id,)
+        )
+        conn.commit()
+    except Exception as e:
+        print("UPDATE ACADEMIC YEAR ERROR:", repr(e))
+        conn.rollback()
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Could not update", "error": str(e)}), 500
+
+    cursor.close()
+    conn.close()
+    return jsonify({"message": "Academic year updated"}), 200
 
 
 @app.route('/api/admin/academic-years/<int:year_id>', methods=['DELETE'])
@@ -2974,7 +3176,7 @@ def delete_academic_year(year_id):
 
 # ============================================================
 # Divisions — live summary (department + semester + division wise
-# student count, seedha `students` table se; koi alag master table nahi)
+# student count, straight from the `students` table; there is no separate master table)
 # ============================================================
 @app.route('/api/admin/divisions-summary', methods=['GET'])
 @admin_required
@@ -2996,12 +3198,12 @@ def get_divisions_summary():
 
 # ============================================================
 # REPORTS — Student, Attendance, Assignment, Login Activity
-# Saare reports Excel (.xlsx) file ke roop me directly download hote hain.
+# All reports are downloaded directly as Excel (.xlsx) files.
 # ============================================================
 
-# Admin ka direct marks-entry form "Mid-Sem" bhejta hai, Faculty ka marks
-# submission form "Mid-Semester" bhejta hai — dono same exam hain, isliye
-# report banate waqt yahan normalize kar dete hain taaki ek hi column bane.
+# Admin's direct marks-entry form sends "Mid-Sem", Faculty's marks
+# submission form sends "Mid-Semester" — both are the same exam, so they are
+# normalized here while building the report so that only one column is created.
 _EXAM_TYPE_DISPLAY = {
     'mid-sem': 'Mid-Sem',
     'mid-semester': 'Mid-Sem',
@@ -3017,7 +3219,7 @@ def _normalize_exam_type(exam_type):
 
 def _excel_response(headers, rows, filename):
     """headers: list of column names. rows: list of tuples/lists (same order as headers).
-    Bold header row, auto column width, aur .xlsx file seedha download ke liye bhej deta hai."""
+    Sends a bold header row, auto column width, and the .xlsx file directly for download."""
     wb = Workbook()
     ws = wb.active
     ws.append(headers)
@@ -3026,7 +3228,7 @@ def _excel_response(headers, rows, filename):
     for row in rows:
         ws.append(row)
 
-    # Column width auto-fit (content ki lambai ke hisaab se, rough estimate)
+    # Column width auto-fit (based on content length, a rough estimate)
     for col_idx, header in enumerate(headers, start=1):
         max_len = len(str(header))
         for row in rows:
@@ -3048,15 +3250,15 @@ def _excel_response(headers, rows, filename):
 @app.route('/api/admin/reports/students/excel', methods=['GET'])
 @admin_required
 def report_students_excel():
-    """Student Report — ek specific subject ke liye required (marks/attendance
-    dono subject-wise store hote hain, isliye subject select karna zaroori hai)."""
+    """Student Report — required for one specific subject (marks/attendance
+    are both stored subject-wise, so selecting a subject is required)."""
     academic_year = request.args.get('academic_year')
     semester = request.args.get('semester')
     division = request.args.get('division')
     subject_id = request.args.get('subject_id')
 
     if not academic_year or not semester or not subject_id:
-        return jsonify({"message": "academic_year, semester aur subject_id zaroori hain"}), 400
+        return jsonify({"message": "academic_year, semester and subject_id are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -3066,7 +3268,7 @@ def report_students_excel():
     if not subject:
         cursor.close()
         conn.close()
-        return jsonify({"message": "Subject nahi mila"}), 404
+        return jsonify({"message": "Subject not found"}), 404
 
     query = """
         SELECT u.id AS user_id, u.login_id AS enrollment, u.name
@@ -3082,7 +3284,7 @@ def report_students_excel():
     cursor.execute(query, tuple(params))
     students = cursor.fetchall()
 
-    # Attendance % — sirf isi subject ka
+    # Attendance % — of this subject only
     cursor.execute("""
         SELECT s.user_id,
                SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present_count,
@@ -3094,7 +3296,7 @@ def report_students_excel():
     """, (subject_id,))
     attendance_map = {row['user_id']: row for row in cursor.fetchall()}
 
-    # Marks — sirf isi subject ke, exam_type normalize karke
+    # Marks — of this subject only, with exam_type normalized
     cursor.execute("""
         SELECT s.user_id, m.exam_type, m.marks_obtained, m.max_marks
         FROM marks m
@@ -3128,16 +3330,16 @@ def report_students_excel():
 @app.route('/api/admin/reports/attendance/excel', methods=['GET'])
 @admin_required
 def report_attendance_excel():
-    """Attendance Report — subject_id diya to us subject ka %, warna us
-    semester ke saare subjects ka combined/overall % (jo GTU ki 75% eligibility
-    check ke liye zyada kaam ka hota hai)."""
+    """Attendance Report — if subject_id is given, the % of that subject, otherwise the combined/overall
+    % of all subjects of that semester (which is more useful for
+    GTU's 75% eligibility check)."""
     academic_year = request.args.get('academic_year')
     semester = request.args.get('semester')
     division = request.args.get('division')
     subject_id = request.args.get('subject_id')
 
     if not academic_year or not semester:
-        return jsonify({"message": "academic_year aur semester zaroori hain"}), 400
+        return jsonify({"message": "academic_year and semester are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -3150,7 +3352,7 @@ def report_attendance_excel():
         if not subj:
             cursor.close()
             conn.close()
-            return jsonify({"message": "Subject nahi mila"}), 404
+            return jsonify({"message": "Subject not found"}), 404
         dept_filter = " AND s.department = %s"
         dept_params = [subj['department']]
 
@@ -3179,7 +3381,7 @@ def report_attendance_excel():
             GROUP BY s.user_id
         """, (subject_id,))
     else:
-        # Us semester+batch ke saare subjects ka combined attendance
+        # Combined attendance of all subjects of that semester+batch
         cursor.execute("""
             SELECT s.user_id,
                    SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present_count,
@@ -3210,15 +3412,15 @@ def report_attendance_excel():
 @app.route('/api/admin/reports/assignments/excel', methods=['GET'])
 @admin_required
 def report_assignments_excel():
-    """Assignment Report — ek row per student per assignment: submit kiya ya
-    nahi, kab kiya, late tha ya on-time, marks mile ya nahi."""
+    """Assignment Report — one row per student per assignment: whether it was submitted,
+    when, whether it was late or on time, and whether marks were received."""
     academic_year = request.args.get('academic_year')
     semester = request.args.get('semester')
     division = request.args.get('division')
     subject_id = request.args.get('subject_id')
 
     if not academic_year or not semester:
-        return jsonify({"message": "academic_year aur semester zaroori hain"}), 400
+        return jsonify({"message": "academic_year and semester are required"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -3336,8 +3538,8 @@ def report_login_activity_excel():
 
 # ============================================================
 # Database Backup & Restore
-# mysqldump/mysql command-line tools server pe PATH me hone chahiye
-# (XAMPP/WAMP/local MySQL install me yeh default already hota hai).
+# The mysqldump/mysql command-line tools must be in PATH on the server
+# (this is already the default in XAMPP/WAMP/local MySQL installs).
 # ============================================================
 def _get_db_credentials():
     return {
@@ -3349,12 +3551,12 @@ def _get_db_credentials():
 
 
 def _run_mysqldump(filepath):
-    """Current database ko diye gaye filepath pe .sql dump kar deta hai.
-    Success par (True, None), fail par (False, error_message) return karta hai."""
+    """Dumps the current database as a .sql file at the given filepath.
+    Returns (True, None) on success and (False, error_message) on failure."""
     creds = _get_db_credentials()
     env = os.environ.copy()
     if creds['password']:
-        env['MYSQL_PWD'] = creds['password']   # -p command-line pe nahi, env var se (process list me na dikhe)
+        env['MYSQL_PWD'] = creds['password']   # -p is passed through an env var, not on the command line (so it doesn't show in the process list)
 
     try:
         with open(filepath, 'wb') as f:
@@ -3368,9 +3570,9 @@ def _run_mysqldump(filepath):
             return False, result.stderr.decode('utf-8', errors='ignore')
         return True, None
     except FileNotFoundError:
-        return False, "mysqldump command nahi mila — MySQL client tools server pe install/PATH me hone chahiye"
+        return False, "mysqldump command not found — MySQL client tools must be installed / in PATH on the server"
     except subprocess.TimeoutExpired:
-        return False, "Backup timeout ho gaya (5 min se zyada le raha tha)"
+        return False, "Backup timed out (it was taking more than 5 min)"
 
 
 @app.route('/api/admin/backup', methods=['POST'])
@@ -3382,9 +3584,9 @@ def create_backup():
 
     ok, error = _run_mysqldump(filepath)
     if not ok:
-        return jsonify({"message": "Backup fail hua", "error": error}), 500
+        return jsonify({"message": "Backup failed", "error": error}), 500
 
-    return jsonify({"message": "Backup ban gaya", "filename": filename}), 201
+    return jsonify({"message": "Backup created", "filename": filename}), 201
 
 
 @app.route('/api/admin/backups', methods=['GET'])
@@ -3409,7 +3611,7 @@ def list_backups():
 def download_backup(filename):
     safe_name = secure_filename(filename)
     if not os.path.exists(os.path.join(BACKUP_FOLDER, safe_name)):
-        return jsonify({"message": "Backup file nahi mila"}), 404
+        return jsonify({"message": "Backup file not found"}), 404
     return send_from_directory(BACKUP_FOLDER, safe_name, as_attachment=True, download_name=safe_name)
 
 
@@ -3419,7 +3621,7 @@ def delete_backup(filename):
     safe_name = secure_filename(filename)
     fpath = os.path.join(BACKUP_FOLDER, safe_name)
     if not os.path.exists(fpath):
-        return jsonify({"message": "Backup file nahi mila"}), 404
+        return jsonify({"message": "Backup file not found"}), 404
     os.remove(fpath)
     return jsonify({"message": "Backup deleted"}), 200
 
@@ -3427,29 +3629,29 @@ def delete_backup(filename):
 @app.route('/api/admin/restore', methods=['POST'])
 @admin_required
 def restore_backup():
-    """DESTRUCTIVE — poora current database overwrite ho jaata hai. Isliye:
-    1) 'RESTORE' likh ke confirm karna zaroori hai (frontend se aata hai)
-    2) Restore se pehle current state ka ek safety backup khud-ba-khud ban jaata hai,
-       taaki restore galat file se ho jaaye to bhi wapas aaya ja sake."""
+    """DESTRUCTIVE — the entire current database gets overwritten. Therefore:
+    1) typing 'RESTORE' to confirm is required (it comes from the frontend)
+    2) a safety backup of the current state is created automatically before the restore,
+    so that you can go back even if the restore is done from the wrong file."""
     confirm_text = request.form.get('confirm')
     if confirm_text != 'RESTORE':
-        return jsonify({"message": "Confirmation text 'RESTORE' match nahi hua"}), 400
+        return jsonify({"message": "Confirmation text 'RESTORE' did not match"}), 400
 
     existing_filename = request.form.get('existing_filename')
     if existing_filename:
         safe_name = secure_filename(existing_filename)
         filepath = os.path.join(BACKUP_FOLDER, safe_name)
         if not os.path.exists(filepath):
-            return jsonify({"message": "Backup file nahi mila"}), 404
+            return jsonify({"message": "Backup file not found"}), 404
     else:
         file = request.files.get('file')
         if not file or not file.filename.lower().endswith('.sql'):
-            return jsonify({"message": "Valid .sql file upload karo"}), 400
+            return jsonify({"message": "Please upload a valid .sql file"}), 400
         safe_name = secure_filename(file.filename)
         filepath = os.path.join(BACKUP_FOLDER, f"uploaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}")
         file.save(filepath)
 
-    # Safety backup — restore se theek pehle current DB ki state save kar lo
+    # Safety backup — save the state of the current DB right before the restore
     safety_filename = f"studenthub_pre_restore_safety_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.sql"
     safety_path = os.path.join(BACKUP_FOLDER, safety_filename)
     safety_ok, _ = _run_mysqldump(safety_path)
@@ -3467,15 +3669,229 @@ def restore_backup():
             )
         if result.returncode != 0:
             return jsonify({
-                "message": "Restore fail hua — database purani state me hi hai (koi nuksan nahi hua)",
+                "message": "Restore failed — the database is still in its old state (nothing was lost)",
                 "error": result.stderr.decode('utf-8', errors='ignore')
             }), 500
     except FileNotFoundError:
-        return jsonify({"message": "mysql command nahi mila — MySQL client tools server pe install/PATH me hone chahiye"}), 500
+        return jsonify({"message": "mysql command not found — MySQL client tools must be installed / in PATH on the server"}), 500
     except subprocess.TimeoutExpired:
-        return jsonify({"message": "Restore timeout ho gaya"}), 500
+        return jsonify({"message": "Restore timed out"}), 500
 
     return jsonify({
-        "message": "Database restore ho gaya" + (f" (safety backup: {safety_filename})" if safety_ok else " (safety backup nahi ban paya — dhyan rakhna)"),
+        "message": "Database restored" + (f" (safety backup: {safety_filename})" if safety_ok else " (the safety backup could not be created — be careful)"),
         "safety_backup": safety_filename if safety_ok else None
     }), 200
+
+
+# ============================================================
+# CHATBOT FAQ MANAGEMENT - the admin adds / edits / deletes the questions the chatbot answers from the DB.
+# ============================================================
+@app.route('/api/admin/chatbot/faqs', methods=['GET'])
+@admin_required
+def list_chatbot_faqs():
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT id, question, answer, category, created_at FROM chatbot_faqs ORDER BY id DESC")
+        return jsonify(cursor.fetchall()), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/faqs', methods=['POST'])
+@admin_required
+def add_chatbot_faq():
+    data = request.get_json() or {}
+    question = (data.get('question') or '').strip()
+    answer = (data.get('answer') or '').strip()
+    category = (data.get('category') or '').strip() or None
+    if not question or not answer:
+        return jsonify({"message": "Question and answer are both required"}), 400
+    if len(question) > 255:
+        return jsonify({"message": "Question can be at most 255 characters"}), 400
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO chatbot_faqs (question, answer, category) VALUES (%s, %s, %s)",
+                       (question, answer, category))
+        conn.commit()
+        return jsonify({"message": "FAQ added", "id": cursor.lastrowid}), 201
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/faqs/<int:faq_id>', methods=['PUT'])
+@admin_required
+def update_chatbot_faq(faq_id):
+    data = request.get_json() or {}
+    question = (data.get('question') or '').strip()
+    answer = (data.get('answer') or '').strip()
+    category = (data.get('category') or '').strip() or None
+    if not question or not answer:
+        return jsonify({"message": "Question and answer are both required"}), 400
+    if len(question) > 255:
+        return jsonify({"message": "Question can be at most 255 characters"}), 400
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE chatbot_faqs SET question=%s, answer=%s, category=%s WHERE id=%s",
+                       (question, answer, category, faq_id))
+        conn.commit()
+        return jsonify({"message": "FAQ updated"}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/faqs/<int:faq_id>', methods=['DELETE'])
+@admin_required
+def delete_chatbot_faq(faq_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM chatbot_faqs WHERE id=%s", (faq_id,))
+        conn.commit()
+        return jsonify({"message": "FAQ deleted"}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+
+# ============================================================
+# CHATBOT KNOWLEDGE BASE - longer reference text the chatbot can answer from (table: chatbot_knowledge)
+# ============================================================
+@app.route('/api/admin/chatbot/knowledge', methods=['GET'])
+@admin_required
+def list_chatbot_knowledge():
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT id, title, content, created_at FROM chatbot_knowledge ORDER BY id DESC")
+        return jsonify(cursor.fetchall()), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/knowledge', methods=['POST'])
+@admin_required
+def add_chatbot_knowledge():
+    data = request.get_json() or {}
+    title = (data.get('title') or '').strip()
+    content = (data.get('content') or '').strip()
+    if not title or not content:
+        return jsonify({"message": "Title and content are both required"}), 400
+    if len(title) > 150:
+        return jsonify({"message": "Title can be at most 150 characters"}), 400
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO chatbot_knowledge (title, content) VALUES (%s, %s)", (title, content))
+        conn.commit()
+        return jsonify({"message": "Knowledge entry added", "id": cursor.lastrowid}), 201
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/knowledge/<int:kb_id>', methods=['PUT'])
+@admin_required
+def update_chatbot_knowledge(kb_id):
+    data = request.get_json() or {}
+    title = (data.get('title') or '').strip()
+    content = (data.get('content') or '').strip()
+    if not title or not content:
+        return jsonify({"message": "Title and content are both required"}), 400
+    if len(title) > 150:
+        return jsonify({"message": "Title can be at most 150 characters"}), 400
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE chatbot_knowledge SET title=%s, content=%s WHERE id=%s", (title, content, kb_id))
+        conn.commit()
+        return jsonify({"message": "Knowledge entry updated"}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/knowledge/<int:kb_id>', methods=['DELETE'])
+@admin_required
+def delete_chatbot_knowledge(kb_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM chatbot_knowledge WHERE id=%s", (kb_id,))
+        conn.commit()
+        return jsonify({"message": "Knowledge entry deleted"}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============================================================
+# CHATBOT CHAT HISTORY - review what students / faculty / admins asked (table: chat_history)
+# ============================================================
+@app.route('/api/admin/chatbot/history', methods=['GET'])
+@admin_required
+def list_chatbot_history():
+    search = (request.args.get('search') or '').strip()
+    query = """
+        SELECT h.id, h.message, h.response, h.created_at,
+               u.name AS user_name, u.login_id, u.role
+        FROM chat_history h
+        LEFT JOIN users u ON u.id = h.user_id
+    """
+    params = []
+    if search:
+        query += " WHERE h.message LIKE %s OR h.response LIKE %s OR u.name LIKE %s OR u.login_id LIKE %s"
+        like = f"%{search}%"
+        params.extend([like, like, like, like])
+    query += " ORDER BY h.id DESC LIMIT 200"
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(query, tuple(params))
+        return jsonify(cursor.fetchall()), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/history/<int:chat_id>', methods=['DELETE'])
+@admin_required
+def delete_chatbot_history(chat_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM chat_history WHERE id=%s", (chat_id,))
+        conn.commit()
+        return jsonify({"message": "Chat deleted"}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/chatbot/history', methods=['DELETE'])
+@admin_required
+def clear_chatbot_history():
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM chat_history")
+        conn.commit()
+        return jsonify({"message": "Chat history cleared"}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+
+@app.route('/api/admin/chat-history', methods=['GET'])
+@admin_required
+def admin_chat_history():
+    """This user's own previous chat with the assistant (last 50 exchanges)."""
+    return jsonify(get_user_chat_history(request.user['user_id'])), 200

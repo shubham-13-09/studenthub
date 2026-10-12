@@ -26,7 +26,7 @@
 
     .stage {
       position: relative;
-      width: min(90vw, 460px);
+      width: min(90vw, 460px, 78vh); /* 78vh keeps the logo + wordmark inside short (landscape) screens */
       aspect-ratio: 1/1.22;
       display: flex;
       flex-direction: column;
@@ -320,11 +320,11 @@
 
 
   <script>
-    // Splash dikhne ke baad login.html par redirect
-    // cycle ab 6s ka hai (pehle 8s tha) — dot se logo aane ka gap bhi kam kar diya gaya hai
-    // "StudentHub" wordmark ~4.7s par fully visible hota hai aur ~5.5s tak dikhta hai
-    // DURATION_MS ki value change karke aap splash ka time badha/ghata sakte ho
-    const DURATION_MS = 5500; // 5.5 second
+    // Redirect to login.html once the splash animation has played.
+    // The animation cycle is 6s; the "StudentHub" wordmark is fully visible at ~4.7s
+    // and stays until ~5.5s.
+    // Change DURATION_MS to make the splash screen shorter or longer.
+    const DURATION_MS = 5500; // 5.5 seconds
     setTimeout(function () {
       window.location.href = 'login.html';
     }, DURATION_MS);

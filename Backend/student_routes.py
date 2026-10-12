@@ -7,12 +7,14 @@ from werkzeug.utils import secure_filename
 
 from db import get_db
 from app import app
-from auth_middleware import student_required
+from auth_middleware import student_required, is_default_password
+from session_routes import get_holiday, get_cancelled_override
+from chatbot_helper import find_faq_answer, get_fallback_reply, log_chat, logged_assistant, get_user_chat_history
 from admin_routes import NOTES_UPLOAD_FOLDER, ASSIGNMENT_UPLOAD_FOLDER, _allowed_assignment_file, NOTICE_UPLOAD_FOLDER
 
 
 def _get_student(cursor, user_id):
-    """Logged-in student ki apni semester / division / batch — timetable isi se filter hoti hai."""
+    """The logged-in student's own semester / division / batch — the timetable is filtered by this."""
     cursor.execute("""
         SELECT s.id, s.semester, s.division, s.academic_year, u.name
         FROM students s JOIN users u ON u.id = s.user_id
@@ -22,10 +24,34 @@ def _get_student(cursor, user_id):
 
 
 # ============================================================
-# TIMETABLE (read-only) — Add/Edit/Delete sirf Admin karta hai.
-# Timetable me division comma se save hoti hai (combined lecture: "A,B"),
-# isliye FIND_IN_SET se match karte hain, "=" se nahi.
+# TIMETABLE (read-only) — only Admin can add/edit/delete.
+# The timetable stores division as a comma-separated value (combined lecture: "A,B"),
+# so we match with FIND_IN_SET, not "=".
 # ============================================================
+_DAY_INDEX = {'Mon': 0, 'Tue': 1, 'Wed': 2, 'Thu': 3, 'Fri': 4, 'Sat': 5}
+
+
+def _mark_week_status(cursor, slots, student):
+    """The weekly timetable is a plan; for THIS week (Mon-Sat) mark each slot as held / cancelled / holiday,
+    so the student can see that a lecture was cancelled (and that they were not absent)."""
+    today = datetime.date.today()
+    monday = today - datetime.timedelta(days=today.weekday())
+    holiday_cache = {}
+    for sl in slots:
+        idx = _DAY_INDEX.get(sl['day_of_week'])
+        if idx is None:
+            sl['status'], sl['status_note'], sl['date'] = 'held', None, None
+            continue
+        d = monday + datetime.timedelta(days=idx)
+        if d not in holiday_cache:
+            holiday_cache[d] = get_holiday(cursor, d, student['semester'], student['division'])
+        holiday = holiday_cache[d]
+        cancelled = None if holiday else get_cancelled_override(cursor, sl['id'], d)
+        sl['date'] = d.isoformat()
+        sl['status'] = 'holiday' if holiday else ('cancelled' if cancelled else 'held')
+        sl['status_note'] = holiday['name'] if holiday else (cancelled['reason'] if cancelled else None)
+
+
 @app.route('/api/student/timetable', methods=['GET'])
 @student_required
 def get_student_timetable():
@@ -46,7 +72,7 @@ def get_student_timetable():
             return jsonify({"student": info, "slots": []}), 200
 
         cursor.execute("""
-            SELECT t.id, t.day_of_week, t.room_no,
+            SELECT t.id, t.day_of_week, t.room_no, t.session_type,
                    TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
                    TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
                    sub.subject_name, sub.subject_code,
@@ -60,9 +86,88 @@ def get_student_timetable():
               AND (t.academic_year = %s OR t.academic_year IS NULL OR t.academic_year = '')
             ORDER BY FIELD(t.day_of_week, 'Mon','Tue','Wed','Thu','Fri','Sat'), t.start_time
         """, (student['semester'], student['division'], student['academic_year']))
-        return jsonify({"student": info, "slots": cursor.fetchall()}), 200
+        slots = cursor.fetchall()
+        _mark_week_status(cursor, slots, student)
+        return jsonify({"student": info, "slots": slots}), 200
     except Exception as e:
         return jsonify({"message": "Timetable could not be loaded", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+UPCOMING_WINDOW_DAYS = 30
+
+
+@app.route('/api/student/upcoming-changes', methods=['GET'])
+@student_required
+def get_student_upcoming_changes():
+    """Cancelled lectures/labs and holidays of the student's class for the next 30 days (today included),
+    so a faculty leave / holiday known in advance is visible in advance."""
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        student = _get_student(cursor, request.user['user_id'])
+        if not student:
+            return jsonify({"message": "Student record not found"}), 404
+        if not student['semester'] or not student['division']:
+            return jsonify({"changes": []}), 200
+
+        cursor.execute("""
+            SELECT t.id, t.day_of_week, t.session_type,
+                   TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
+                   TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
+                   sub.subject_name
+            FROM timetable t
+            LEFT JOIN subjects sub ON sub.id = t.subject_id
+            WHERE t.semester = %s AND FIND_IN_SET(%s, t.division) > 0
+              AND (t.academic_year = %s OR t.academic_year IS NULL OR t.academic_year = '')
+        """, (student['semester'], student['division'], student['academic_year']))
+        slots = cursor.fetchall()
+        if not slots:
+            return jsonify({"changes": []}), 200
+
+        today = datetime.date.today()
+        end = today + datetime.timedelta(days=UPCOMING_WINDOW_DAYS)
+
+        # 2 bulk queries instead of one per day/slot
+        cursor.execute("""
+            SELECT holiday_date, name FROM holidays
+            WHERE holiday_date BETWEEN %s AND %s
+              AND (semester IS NULL OR semester = %s)
+              AND (division IS NULL OR division = '' OR division = %s)
+        """, (today, end, student['semester'], student['division']))
+        holidays = {row['holiday_date']: row['name'] for row in cursor.fetchall()}
+
+        slot_ids = [s['id'] for s in slots]
+        ph = ','.join(['%s'] * len(slot_ids))
+        cursor.execute(f"""
+            SELECT timetable_id, session_date, reason FROM session_overrides
+            WHERE status = 'cancelled' AND session_date BETWEEN %s AND %s AND timetable_id IN ({ph})
+        """, tuple([today, end] + slot_ids))
+        cancelled = {(row['timetable_id'], row['session_date']): row['reason'] for row in cursor.fetchall()}
+
+        day_abbr = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        changes = []
+        for i in range(UPCOMING_WINDOW_DAYS + 1):
+            d = today + datetime.timedelta(days=i)
+            day_slots = [s for s in slots if s['day_of_week'] == day_abbr[d.weekday()]]
+            if not day_slots:
+                continue
+            if d in holidays:
+                changes.append({"date": d.isoformat(), "day_name": day_abbr[d.weekday()],
+                                "status": "holiday", "note": holidays[d]})
+                continue
+            for sl in sorted(day_slots, key=lambda x: x['start_time']):
+                reason = cancelled.get((sl['id'], d))
+                if reason is not None:
+                    changes.append({"date": d.isoformat(), "day_name": day_abbr[d.weekday()],
+                                    "status": "cancelled", "note": reason,
+                                    "subject_name": sl['subject_name'], "session_type": sl['session_type'],
+                                    "start_time": sl['start_time'], "end_time": sl['end_time']})
+        return jsonify({"changes": changes}), 200
+    except Exception as e:
+        return jsonify({"message": "Upcoming changes could not be loaded", "error": str(e)}), 500
     finally:
         cursor.close()
         conn.close()
@@ -71,7 +176,7 @@ def get_student_timetable():
 @app.route('/api/student/exam-timetable', methods=['GET'])
 @student_required
 def get_student_exam_timetable():
-    """Mid-Sem + Remedial dono — sirf is student ki semester / division / batch ke."""
+    """Mid-Sem + Remedial both — only for this student's semester / division / batch."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -102,9 +207,9 @@ def get_student_exam_timetable():
         conn.close()
 
 # ============================================================
-# NOTES / STUDY MATERIALS (read-only — Admin ya Faculty upload karte hain,
-# `notes` table hi dono panels ke saath shared hai. Student sirf apni
-# semester + division + batch ke materials dekh/download kar sakta hai.)
+# NOTES / STUDY MATERIALS (read-only — uploaded by Admin or Faculty;
+# the `notes` table is shared between both panels. A student can only
+# view/download materials for their own semester + division + batch.)
 # ============================================================
 @app.route('/api/student/materials', methods=['GET'])
 @student_required
@@ -143,8 +248,8 @@ def get_student_materials():
 @app.route('/api/student/materials/<int:note_id>/download', methods=['GET'])
 @student_required
 def download_student_material(note_id):
-    """Sirf tabhi download milega jab yeh material student ki apni semester/division/batch ka ho
-    — kisi aur class ka note ID guess karke download nahi kiya ja sakta."""
+    """Download is allowed only if this material belongs to the student's own semester/division/batch
+    — a note ID of another class cannot be guessed to download it."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -177,12 +282,12 @@ def download_student_material(note_id):
 
 
 # ============================================================
-# ASSIGNMENTS (student apni class ki assignments dekhta hai, problem statement
-# download karta hai, aur apni solution file submit/replace karta hai.
-# `assignments` + `assignment_submissions` dono tables Admin/Faculty ke saath shared hain.)
+# ASSIGNMENTS (a student sees their own class's assignments, downloads the
+# problem statement, and submits/replaces their solution file.
+# The `assignments` + `assignment_submissions` tables are shared with Admin/Faculty.)
 # ============================================================
 def _get_student_assignment(cursor, student, assignment_id):
-    """Assignment sirf tabhi return karta hai jab woh is student ki apni semester/division/batch ka ho."""
+    """Returns the assignment only if it belongs to this student's own semester/division/batch."""
     cursor.execute("SELECT * FROM assignments WHERE id = %s", (assignment_id,))
     assignment = cursor.fetchone()
     if not assignment:
@@ -232,10 +337,10 @@ def get_student_assignments():
 
 
 # ============================================================
-# ATTENDANCE (read-only) — Admin/Faculty hi `attendance` table me
-# mark karte hain (admin_routes.get_attendance_summary aur
-# faculty_routes.get_faculty_students jaisa hi % nikaalne ka logic
-# yahan single logged-in student ke liye use hota hai.)
+# ATTENDANCE (read-only) — only Admin/Faculty mark it in the `attendance` table
+# (the same percentage logic as admin_routes.get_attendance_summary and
+# faculty_routes.get_faculty_students is used here for the single
+# logged-in student.)
 # ============================================================
 @app.route('/api/student/attendance', methods=['GET'])
 @student_required
@@ -285,7 +390,7 @@ def get_student_attendance():
 @app.route('/api/student/assignments/<int:assignment_id>/download', methods=['GET'])
 @student_required
 def download_student_assignment(assignment_id):
-    """Assignment ka problem statement (question paper) download karta hai."""
+    """Downloads the assignment's problem statement (question paper)."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -313,14 +418,14 @@ def download_student_assignment(assignment_id):
 @app.route('/api/student/assignments/<int:assignment_id>/submit', methods=['POST'])
 @student_required
 def submit_student_assignment(assignment_id):
-    """multipart/form-data: file. Pehli baar submit ho to naya record banta hai,
-    dobara submit kare (replace) to purani file disk se hatke nayi save hoti hai aur
-    marks_obtained reset ho jaata hai (naya submission = purana grading ab valid nahi)."""
+    """multipart/form-data: file. The first submission creates a new record;
+    submitting again (replace) saves the new file and removes the old one from disk,
+    and marks_obtained is reset (a new submission invalidates the earlier grading)."""
     file = request.files.get('file')
     if not file or file.filename == '':
         return jsonify({"message": "A file is required"}), 400
-    if not _allowed_assignment_file(file.filename):
-        return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
+    if not _allowed_assignment_file(file):
+        return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -366,7 +471,7 @@ def submit_student_assignment(assignment_id):
         if old_file_path:
             old_full_path = os.path.join(ASSIGNMENT_UPLOAD_FOLDER, old_file_path)
             if os.path.exists(old_full_path):
-                os.remove(old_full_path)   # replace hone par purani file disk pe orphan nahi chodni
+                os.remove(old_full_path)   # on replace, don't leave the old file orphaned on disk
 
         return jsonify({"message": "Assignment submitted"}), 200
     except Exception as e:
@@ -378,12 +483,11 @@ def submit_student_assignment(assignment_id):
 
 
 # ============================================================
-# RESULTS (read-only) — Faculty marks bharta hai -> Admin approve
-# karta hai -> Admin publish karta hai (marks_requests + marks
-# tables, admin_routes.py/faculty_routes.py me already bana hua
-# workflow). Student ko sirf `marks.published = TRUE` wale marks
-# hi dikhte hain, un-published kabhi nahi.
-# exam_type wahi 4 values jo Faculty ki Marks Entry screen me hain:
+# RESULTS (read-only) — Faculty enters marks -> Admin approves
+# -> Admin publishes (marks_requests + marks tables, the workflow
+# already built in admin_routes.py/faculty_routes.py). A student
+# only ever sees marks with `marks.published = TRUE`, never unpublished ones.
+# The exam_type values are the same 4 as on Faculty's Marks Entry screen:
 # Mid-Semester, Remedial, Internal, Practical.
 # ============================================================
 EXAM_TYPES = ['Mid-Semester', 'Remedial', 'Internal', 'Practical']
@@ -391,8 +495,8 @@ DEFAULT_PASSING_PERCENTAGE = 40
 
 
 def _get_passing_percentage(cursor):
-    """system_settings me 'passing_percentage' key admin baad me add/change kar sakta hai
-    (jaise college_name/hod_name already hai); na mile to default 40% use hota hai."""
+    """Admin can add/change the 'passing_percentage' key in system_settings later
+    (like college_name/hod_name already there); if it is missing, the default 40% is used."""
     cursor.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'passing_percentage'")
     row = cursor.fetchone()
     try:
@@ -428,7 +532,7 @@ def get_student_results():
         """, (student['id'], student['semester'], student['academic_year']))
         rows = cursor.fetchall()
 
-        # Pivot: ek subject ka ek row, har exam_type apna column (Admin ke Student Report jaisa)
+        # Pivot: one row per subject, one column per exam_type (same as Admin's Student Report)
         subjects = {}
         for r in rows:
             sid = r['subject_id']
@@ -488,15 +592,15 @@ def get_student_results():
 
 
 # ============================================================
-# NOTICES (read-only) — Admin/Faculty hi notices post/edit/pin/
-# delete karte hain (`notices` + `notice_reads` tables, Faculty ka
-# get_faculty_notices/mark-read jaisa hi pattern). Student sirf
-# apni class (semester/division/academic_year) ki broadcast
-# notices + apni khud ki personal notices (target_user_id) dekhta hai.
+# NOTICES (read-only) — only Admin/Faculty post/edit/pin/
+# delete notices (`notices` + `notice_reads` tables, same pattern as
+# Faculty's get_faculty_notices/mark-read). A student sees only the
+# broadcast notices for their own class (semester/division/academic_year)
+# plus their own personal notices (target_user_id).
 # ============================================================
 def _student_notice_filter_sql(select_extra=''):
-    """Ek hi WHERE condition — list/unread-count/mark-read teeno me reuse hota hai,
-    taaki teeno jagah 'kaunsi notices is student ko dikhti hain' ka logic hamesha match kare."""
+    """A single WHERE condition — reused by list / unread-count / mark-read,
+    so the logic of 'which notices this student can see' always matches in all three places."""
     return """
         (
             (n.target_role IN ('all','student') AND n.target_user_id IS NULL
@@ -523,10 +627,12 @@ def get_student_notices():
             SELECT n.id, n.title, n.content, n.category, n.is_pinned, n.created_at,
                    n.file_name, n.file_size, n.file_type, n.target_user_id,
                    n.semester, n.division,
+                   u.name AS posted_by_name, u.role AS posted_by_role,
                    EXISTS(
                        SELECT 1 FROM notice_reads nr WHERE nr.notice_id = n.id AND nr.user_id = %s
                    ) AS is_read
             FROM notices n
+            LEFT JOIN users u ON u.id = n.posted_by
             WHERE {_student_notice_filter_sql()}
             ORDER BY n.is_pinned DESC, n.created_at DESC
             LIMIT 50
@@ -547,7 +653,7 @@ def get_student_notices():
 @app.route('/api/student/notices/unread-count', methods=['GET'])
 @student_required
 def get_student_notices_unread_count():
-    """Sidebar ke 'Notices' item ke badge ke liye — kitni notices dikhti hain par abhi tak dekhi nahi."""
+    """For the sidebar 'Notices' badge — how many visible notices have not been seen yet."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -575,8 +681,8 @@ def get_student_notices_unread_count():
 @app.route('/api/student/notices/mark-read', methods=['POST'])
 @student_required
 def mark_student_notices_read():
-    """Notices tab khulte hi call hota hai — jitni bhi notices is student ko dikhti hain,
-    sabko 'seen' mark kar deta hai, taaki sidebar ka badge hat jaaye."""
+    """Called as soon as the Notices tab opens — marks every notice visible to this student
+    as 'seen', so the sidebar badge disappears."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -604,9 +710,9 @@ def mark_student_notices_read():
 @app.route('/api/student/notices/<int:notice_id>/download', methods=['GET'])
 @student_required
 def download_student_notice(notice_id):
-    """Notice ka attachment download karta hai — sirf tabhi jab yeh notice
-    is student ko dikhti bhi ho (apni class/personal), kisi aur ki notice ka
-    file ID guess karke download nahi kiya ja sakta."""
+    """Downloads a notice's attachment — only if this notice is also
+    visible to this student (their own class/personal); a file ID of
+    someone else's notice cannot be guessed to download it."""
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -648,10 +754,10 @@ def download_student_notice(notice_id):
 
 
 # ============================================================
-# FACULTY DIRECTORY (read-only) — sirf woh faculty dikhte hain jo
-# is student ke apne semester/division/academic_year ke subjects
-# padhate hain (`faculty_subjects` table, Admin ke get_faculty
-# jaisa hi join). Poore college ke saare faculty nahi.
+# FACULTY DIRECTORY (read-only) — shows only the faculty who teach
+# subjects of this student's own semester/division/academic_year
+# (`faculty_subjects` table, the same join as Admin's get_faculty).
+# Not every faculty member of the whole college.
 # ============================================================
 @app.route('/api/student/faculty', methods=['GET'])
 @student_required
@@ -667,7 +773,7 @@ def get_student_faculty():
 
         cursor.execute("""
             SELECT
-                f.id AS faculty_id, u.name, f.short_name, f.email, f.department,
+                f.id AS faculty_id, u.name, f.short_name, f.email, f.department, f.whatsapp_number,
                 GROUP_CONCAT(DISTINCT sub.subject_name ORDER BY sub.subject_name SEPARATOR ', ') AS subjects_taught
             FROM faculty_subjects fs
             JOIN faculty f ON f.id = fs.faculty_id
@@ -676,7 +782,7 @@ def get_student_faculty():
             WHERE fs.semester = %s
               AND (fs.division IS NULL OR fs.division = %s)
               AND (fs.academic_year IS NULL OR fs.academic_year = %s)
-            GROUP BY f.id, u.name, f.short_name, f.email, f.department
+            GROUP BY f.id, u.name, f.short_name, f.email, f.department, f.whatsapp_number
             ORDER BY u.name ASC
         """, (student['semester'], student['division'], student['academic_year']))
         return jsonify({"faculty": cursor.fetchall()}), 200
@@ -688,10 +794,10 @@ def get_student_faculty():
 
 
 # ============================================================
-# FEES (read-only) — status/amount/due-date/payment-link sirf
-# Admin set karta hai, Faculty sirf paid/unpaid toggle karta hai.
-# Student ko apni poori fee history dikhti hai (sirf current
-# semester tak limit nahi — purane pending dues bhi yahin aa jaate hain).
+# FEES (read-only) — status/amount/due-date/payment-link are set only by
+# Admin; Faculty only toggles paid/unpaid.
+# A student sees their full fee history (not limited to the current
+# semester — older pending dues show up here too).
 # ============================================================
 @app.route('/api/student/fees', methods=['GET'])
 @student_required
@@ -730,22 +836,28 @@ def get_student_fees():
 
 
 # ============================================================
-# ASK STUDENTHUB — halka data-driven assistant (koi external AI nahi).
-# Dashboard card + floating chat popup dono isi endpoint ko call karte hain.
-# Keyword se sawal pehchan ke seedha DB se is student ka apna real jawab deta hai —
+# ASK STUDENTHUB — a lightweight data-driven assistant (no external AI).
+# The dashboard card and the floating chat popup both call this endpoint.
+# It recognises the question by keyword and answers directly from the DB with this student's own real data —
 # supported: "attendance %", "pending assignments", "fees due", "today's timetable", "notices".
 # ============================================================
 @app.route('/api/student/assistant', methods=['POST'])
 @student_required
+@logged_assistant
 def student_assistant():
     data = request.get_json() or {}
     message = (data.get('message') or '').strip().lower()
     if not message:
-        return jsonify({"reply": "Kuch pooch to sahi! 🙂"}), 200
+        return jsonify({"reply": "Go ahead, ask me something! 🙂"}), 200
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
+        # ---- 1) FAQ table first ----
+        faq_reply = find_faq_answer(cursor, message)
+        if faq_reply:
+            return jsonify({"reply": faq_reply}), 200
+
         student = _get_student(cursor, request.user['user_id'])
         if not student:
             return jsonify({"reply": "Student record not found."}), 200
@@ -814,7 +926,7 @@ def student_assistant():
         if 'timetable' in message or 'today' in message or 'class' in message:
             today_abbr = datetime.datetime.now().strftime('%a')[:3]
             cursor.execute("""
-                SELECT TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
+                SELECT t.id, TIME_FORMAT(t.start_time, '%H:%i') AS start_time,
                        TIME_FORMAT(t.end_time, '%H:%i') AS end_time,
                        sub.subject_name, t.room_no
                 FROM timetable t
@@ -825,7 +937,18 @@ def student_assistant():
                 ORDER BY t.start_time
             """, (student['semester'], student['division'], student['academic_year'], today_abbr))
             rows = cursor.fetchall()
-            lines = [f"• {r['start_time']}–{r['end_time']} {r['subject_name']} (Room {r['room_no']})" for r in rows]
+            today_date = datetime.date.today()
+            today_holiday = get_holiday(cursor, today_date, student['semester'], student['division'])
+            lines = []
+            for r in rows:
+                line = f"• {r['start_time']}–{r['end_time']} {r['subject_name']} (Room {r['room_no']})"
+                if today_holiday:
+                    line += f" — Holiday ({today_holiday['name']})"
+                else:
+                    canc = get_cancelled_override(cursor, r['id'], today_date)
+                    if canc:
+                        line += f" — CANCELLED ({canc['reason']})"
+                lines.append(line)
             reply = ("Today's timetable:\n" + "\n".join(lines)) if lines else "No classes scheduled for you today."
             return jsonify({"reply": reply}), 200
 
@@ -841,10 +964,10 @@ def student_assistant():
             reply = ("Latest notices:\n" + "\n".join(lines)) if lines else "No notices right now."
             return jsonify({"reply": reply}), 200
 
-        return jsonify({
-            "reply": "I can currently answer these kinds of questions: \"attendance %\", "
-                     "\"pending assignments\", \"fees due\", \"today's timetable\", or \"notices\"."
-        }), 200
+        help_text = ("I can currently answer these kinds of questions: \"attendance %\", "
+                     "\"pending assignments\", \"fees due\", \"today's timetable\", or \"notices\".")
+        reply = get_fallback_reply(cursor, message, request.user['user_id'], 'student', help_text)
+        return jsonify({"reply": reply}), 200
     except Exception as e:
         return jsonify({"reply": "Something went wrong, please try again."}), 200
     finally:
@@ -864,7 +987,7 @@ def get_student_profile():
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT u.name, u.login_id AS enrollment, s.email, s.mobile,
+        SELECT u.name, u.login_id AS enrollment, s.email, s.mobile, s.whatsapp_number,
                s.semester, s.division, s.academic_year, s.department
         FROM users u JOIN students s ON s.user_id = u.id
         WHERE u.id = %s
@@ -880,24 +1003,27 @@ def get_student_profile():
 @app.route('/api/student/profile', methods=['PUT'])
 @student_required
 def update_student_profile():
-    """Student apna full name + mobile number edit kar sakta hai — enrollment/email/
-    semester/division/batch/department Admin ke haath me hi rehte hain."""
+    """A student can edit their own full name + mobile number + WhatsApp number — enrollment/email/
+    semester/division/batch/department stay under Admin's control."""
     data = request.get_json() or {}
     name = data.get('name')
     mobile = data.get('mobile')
+    whatsapp_number = data.get('whatsapp_number')
 
     if not name or not name.strip():
         return jsonify({"message": "Name cannot be empty"}), 400
     if mobile and (not mobile.isdigit() or len(mobile) != 10):
         return jsonify({"message": "Mobile number must be 10 digits"}), 400
+    if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+        return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
 
     user_id = request.user['user_id']
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET name = %s WHERE id = %s", (name.strip(), user_id))
     cursor.execute(
-        "UPDATE students SET mobile = %s WHERE user_id = %s",
-        (mobile.strip() if mobile else None, user_id)
+        "UPDATE students SET mobile = %s, whatsapp_number = %s WHERE user_id = %s",
+        (mobile.strip() if mobile else None, whatsapp_number.strip() if whatsapp_number else None, user_id)
     )
     conn.commit()
     cursor.close()
@@ -920,7 +1046,7 @@ def student_change_password():
     user_id = request.user['user_id']
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+    cursor.execute("SELECT password_hash, login_id, role FROM users WHERE id = %s", (user_id,))
     user = cursor.fetchone()
 
     if not user or not bcrypt.checkpw(current_password.encode('utf-8'), user['password_hash'].encode('utf-8')):
@@ -928,9 +1054,26 @@ def student_change_password():
         conn.close()
         return jsonify({"message": "Current password is incorrect"}), 401
 
+    if current_password == new_password:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "New password must be different from the current password"}), 400
+    if is_default_password(user['role'], user['login_id'], new_password):
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Please choose a password that is not the default one"}), 400
+
     new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
+    cursor.execute("UPDATE users SET password_hash = %s, must_change_password = FALSE WHERE id = %s", (new_hash, user_id))
     conn.commit()
     cursor.close()
     conn.close()
     return jsonify({"message": "Password updated"}), 200
+
+
+
+@app.route('/api/student/chat-history', methods=['GET'])
+@student_required
+def student_chat_history():
+    """This user's own previous chat with the assistant (last 50 exchanges)."""
+    return jsonify(get_user_chat_history(request.user['user_id'])), 200
