@@ -15,7 +15,7 @@
   <!-- SIDEBAR -->
   <aside class="sidebar">
     <div class="brand-card">
-      <div class="brand-card-ic"><img src="studenthub.png" alt=""></div>
+      <div class="brand-card-ic"><img src="../assets/studenthub.png" alt=""></div>
       <div>
         <div class="brand-card-top">StudentHub</div>
         <div class="brand-card-bottom">Admin Panel</div>
@@ -169,6 +169,7 @@
           <li class="nav-sub-item" data-view="reports">Attendance Report</li>
           <li class="nav-sub-item" data-view="reports">Assignment Report</li>
           <li class="nav-sub-item" data-view="reports">Login Activity</li>
+          <li class="nav-sub-item" data-view="reports">Fee Report</li>
         </ul>
       </li>
 
@@ -347,6 +348,20 @@
             </div>
           </div>
         </div>
+        <div class="sh-chart-grid">
+          <div class="card">
+            <div class="card-head"><div class="card-title">Fee status</div></div>
+            <div id="feeStatusChart"><div class="sh-empty">Loading…</div></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><div class="card-title">Attendance by semester</div></div>
+            <div id="attendanceSemesterChart"><div class="sh-empty">Loading…</div></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><div class="card-title">Logins · last 7 days</div></div>
+            <div id="loginActivityChart"><div class="sh-empty">Loading…</div></div>
+          </div>
+        </div>
       </div>
 
       <!-- ===== STUDENT MANAGEMENT ===== -->
@@ -414,6 +429,7 @@
           <div class="card-head">
             <div class="card-title">All students</div>
             <div class="filter-row">
+              <input type="text" id="studentSearch" placeholder="Search name or enrollment…" oninput="onStudentSearchInput()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
               <select id="studentFilterDept" onchange="loadStudents()">
                 <option value="">All departments</option>
                 <option value="Computer Engineering">Computer Engineering</option>
@@ -1076,6 +1092,7 @@
           <div class="card-head">
             <div class="card-title">Attendance % summary</div>
             <span style="font-size:12px;color:var(--muted)">Students below 75% attendance will be highlighted in red</span>
+            <button class="btn-ghost" id="attNotifyBtn" onclick="notifyAttendanceShortage()" title="E-mail the students (and parents) of this class who are below the minimum attendance">📧 Send shortage alerts</button>
           </div>
           <div class="table-scroll">
             <table>
@@ -1391,72 +1408,29 @@
       <div class="view" id="view-notices">
         <div class="card-head" style="margin-bottom:16px;">
           <div class="card-title" style="font-size:20px;">Notice management</div>
-          <button class="btn-save" onclick="openAddNoticeForm()">+ Add notice</button>
         </div>
 
-        <div class="card form-card hidden" id="noticeForm">
-          <div class="card-title" style="margin-bottom:16px;" id="noticeFormTitle">Add notice</div>
-          <input type="hidden" id="noticeEditId" value="">
-          <div class="form-grid">
-            <div class="field"><label>Title</label><input type="text" id="noticeTitle" placeholder="Notice title"></div>
-            <div class="field"><label>Category</label><select id="noticeCategory">
-                <option>Academic</option>
-                <option>Event</option>
-                <option>Important</option>
-              </select></div>
-            <div class="field" style="grid-column:1/-1;"><label>Description</label><textarea id="noticeContent"
-                placeholder="Notice details" rows="4"></textarea></div>
-            <div class="field" style="grid-column:1/-1;"><label>Attachment (optional)</label>
-              <input type="file" id="noticeFile" accept=".pdf,.doc,.docx,.ppt,.pptx,.jpg,.jpeg,.png">
-              <span id="noticeExistingFile" style="font-size:12px; color:var(--muted); display:block; margin-top:4px;"></span>
-            </div>
-            <div class="field"><label>Audience</label><select id="noticeTargetRole">
-                <option value="all">Everyone</option>
-                <option value="student">Students only</option>
-                <option value="faculty">Faculty only</option>
-              </select></div>
-            <div class="field"><label>Semester</label><select id="noticeSemester">
-                <option value="">All semesters</option>
-                <option value="1">1</option>
-                <option value="2">2</option>
-                <option value="3">3</option>
-                <option value="4">4</option>
-                <option value="5">5</option>
-                <option value="6">6</option>
-              </select></div>
-            <div class="field"><label>Division</label><select id="noticeDivision">
-                <option value="">All divisions</option>
-                <option value="A">Division A</option>
-                <option value="B">Division B</option>
-              </select></div>
-            <div class="field"><label>Batch (Academic Year)</label><select id="noticeBatch">
-                <option value="">All batches</option>
-                <option value="2024-25">2024 - 2025</option>
-                <option value="2025-26">2025 - 2026</option>
-                <option value="2026-27">2026 - 2027</option>
-              </select></div>
-            <div class="field"><label>Pin this notice</label><select id="noticePinned">
-                <option value="0">No</option>
-                <option value="1">Yes</option>
-              </select></div>
-          </div>
-          <div class="form-actions">
-            <button class="btn-ghost" onclick="toggleForm('noticeForm')">Cancel</button>
-            <button class="btn-save" onclick="saveNotice()">Publish notice</button>
-          </div>
+        <!-- Chat list: one row per group (last notice + unread count), like the WhatsApp chat list -->
+        <div class="card nf-groups-card" id="noticeGroupsCard">
+          <div class="nf-group-list" id="noticeGroupList"></div>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <div class="card-title">All notices</div>
+        <!-- Open group: its notices + the message bar -->
+        <div class="card hidden" id="noticeChatCard">
+          <div class="nf-chat-head">
+            <button type="button" class="nf-back-btn" onclick="closeNoticeGroup()" title="Back to groups">←</button>
+            <div class="nf-group-avatar" id="noticeChatAvatar"></div>
+            <div class="nf-chat-title"><div class="name" id="noticeChatName"></div><small id="noticeChatSub"></small></div>
+          </div>
+          <div class="card-head" id="noticeFilterRow" style="margin-bottom:12px;">
             <div class="filter-row">
-              <select id="noticeFilterCategory" onchange="loadNotices()">
+              <select id="noticeFilterCategory" onchange="onNoticeFilterChange()">
                 <option value="">All categories</option>
                 <option value="Academic">Academic</option>
                 <option value="Event">Event</option>
                 <option value="Important">Important</option>
               </select>
-              <select id="noticeFilterSemester" onchange="loadNotices()">
+              <select id="noticeFilterSemester" onchange="onNoticeFilterChange()">
                 <option value="">All semesters</option>
                 <option value="1">Sem 1</option>
                 <option value="2">Sem 2</option>
@@ -1465,12 +1439,12 @@
                 <option value="5">Sem 5</option>
                 <option value="6">Sem 6</option>
               </select>
-              <select id="noticeFilterDivision" onchange="loadNotices()">
+              <select id="noticeFilterDivision" onchange="onNoticeFilterChange()">
                 <option value="">All divisions</option>
                 <option value="A">Division A</option>
                 <option value="B">Division B</option>
               </select>
-              <select id="noticeFilterBatch" onchange="loadNotices()">
+              <select id="noticeFilterBatch" onchange="onNoticeFilterChange()">
                 <option value="">All batches</option>
                 <option value="2024-25">2024 - 2025</option>
                 <option value="2025-26">2025 - 2026</option>
@@ -1478,11 +1452,66 @@
               </select>
             </div>
           </div>
-          <div class="notice-shell">
+          <div class="notice-shell has-composer">
             <div class="notice-feed-scroll" id="noticesListBody">
               <div class="notice-row"><span>Loading…</span></div>
             </div>
             <button class="scroll-bottom-btn hidden" id="noticesScrollBtn" onclick="nfScrollToBottom('noticesListBody')" title="Go to latest notices">↓</button>
+          </div>
+
+          <!-- WhatsApp-style message bar: type + send. Audience/semester/etc. "To:" line ke peeche -->
+          <div class="nf-composer" id="noticeComposer">
+            <input type="hidden" id="noticeEditId" value="">
+            <div class="nf-edit-banner hidden" id="noticeEditBanner">
+              <span id="noticeEditText">✎ Editing notice</span>
+              <button type="button" onclick="cancelNoticeEdit()" title="Cancel edit">✕</button>
+            </div>
+            <button type="button" class="nf-scope-line" id="noticeScopeLine" onclick="toggleNoticeOptions()" title="Change who gets this notice">
+              <span class="nf-scope-text" id="noticeScopeText">To: Everyone · Academic</span><span class="nf-caret">▾</span>
+            </button>
+            <div class="nf-options hidden" id="noticeOptions">
+              <div data-opt="audience"><label>Audience</label><select id="noticeTargetRole" onchange="updateNoticeScopeLine()">
+                  <option value="all">Everyone</option>
+                  <option value="student">Students only</option>
+                </select></div>
+              <div><label>Category</label><select id="noticeCategory" onchange="updateNoticeScopeLine()">
+                  <option>Academic</option>
+                  <option>Event</option>
+                  <option>Important</option>
+                </select></div>
+              <div data-opt="semester"><label>Semester</label><select id="noticeSemester" onchange="updateNoticeScopeLine()">
+                  <option value="">All semesters</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                  <option value="6">6</option>
+                </select></div>
+              <div data-opt="division"><label>Division</label><select id="noticeDivision" onchange="updateNoticeScopeLine()">
+                  <option value="">All divisions</option>
+                  <option value="A">Division A</option>
+                  <option value="B">Division B</option>
+                </select></div>
+              <div data-opt="batch"><label>Batch (Academic Year)</label><select id="noticeBatch" onchange="updateNoticeScopeLine()">
+                  <option value="">All batches</option>
+                  <option value="2024-25">2024 - 2025</option>
+                  <option value="2025-26">2025 - 2026</option>
+                  <option value="2026-27">2026 - 2027</option>
+                </select></div>
+              <div><label>Pin this notice</label><select id="noticePinned" onchange="updateNoticeScopeLine()">
+                  <option value="0">No</option>
+                  <option value="1">Yes</option>
+                </select></div>
+            </div>
+            <div class="nf-attach-preview hidden" id="noticeAttachPreview"></div>
+            <div class="nf-compose-row">
+              <label class="nf-attach-btn" id="noticeAttachBtn" title="Attach a file (PDF, Word, PowerPoint, JPG, PNG)">📎
+                <input type="file" id="noticeFile" accept=".pdf,.doc,.docx,.ppt,.pptx,.jpg,.jpeg,.png" onchange="nfcOnFilePicked()" hidden>
+              </label>
+              <textarea class="nf-compose-input" id="noticeContent" rows="1" placeholder="Type a notice… (first line becomes the title)" oninput="nfcAutoGrow(this)" onkeydown="nfcKeyDown(event)"></textarea>
+              <button type="button" class="nf-send-btn" id="noticeSendBtn" onclick="saveNotice()" title="Send notice">➤</button>
+            </div>
           </div>
         </div>
       </div>
@@ -1701,7 +1730,7 @@
                 <option value="paid">Paid</option>
                 <option value="unpaid">Unpaid</option>
               </select>
-              <input type="text" id="feeSearch" placeholder="Search by student or fee item…" oninput="loadFees()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
+              <input type="text" id="feeSearch" placeholder="Search by student or fee item…" oninput="onFeeSearchInput()" style="padding:8px 12px; border:1.5px solid var(--line); border-radius:8px; background:var(--paper); color:var(--ink); font-size:12.5px;">
             </div>
           </div>
           <div id="feesFolderView">
@@ -1975,6 +2004,12 @@
             <span class="subject-card-sub">Sign-ins across all roles, date-range filter</span>
             <div class="subject-card-foot"><span>Generate report →</span></div>
           </div>
+          <div class="subject-card" style="cursor:pointer;" onclick="openAdminFeeReport()">
+            <div class="subject-card-top"><span class="subj-tag mint">Fees</span></div>
+            <b>Fee Report</b>
+            <span class="subject-card-sub">Paid, pending &amp; overdue fees, defaulters - Excel or PDF</span>
+            <div class="subject-card-foot"><span>Generate report →</span></div>
+          </div>
         </div>
 
         <!-- Student Report -->
@@ -1994,6 +2029,7 @@
           </div>
           <div class="form-actions">
             <button class="btn-save" onclick="downloadReport('Student')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadReport('Student', 'pdf')">⬇ Download PDF</button>
           </div>
         </div>
 
@@ -2014,6 +2050,7 @@
           </div>
           <div class="form-actions">
             <button class="btn-save" onclick="downloadReport('Attendance')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadReport('Attendance', 'pdf')">⬇ Download PDF</button>
           </div>
         </div>
 
@@ -2034,6 +2071,7 @@
           </div>
           <div class="form-actions">
             <button class="btn-save" onclick="downloadReport('Assignment')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadReport('Assignment', 'pdf')">⬇ Download PDF</button>
           </div>
         </div>
 
@@ -2052,6 +2090,40 @@
           </div>
           <div class="form-actions">
             <button class="btn-save" onclick="downloadLoginActivityReport()">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadLoginActivityReport('pdf')">⬇ Download PDF</button>
+          </div>
+        </div>
+
+        <!-- Fee Report -->
+        <div class="card form-card hidden" id="reportFeePanel" style="margin-top:16px;">
+          <div class="card-title" style="margin-bottom:14px;">Fee Report filters</div>
+          <div class="form-grid">
+            <div class="field"><label>Batch (Academic Year)</label><select id="repFeeBatch" onchange="loadAdminFeeReportItems()"></select></div>
+            <div class="field"><label>Semester</label><select id="repFeeSem" onchange="loadAdminFeeReportItems()">
+                <option value="">Select semester</option>
+                <option value="1">Sem 1</option><option value="2">Sem 2</option><option value="3">Sem 3</option>
+                <option value="4">Sem 4</option><option value="5">Sem 5</option><option value="6">Sem 6</option>
+              </select></div>
+            <div class="field"><label>Division</label><select id="repFeeDiv" onchange="loadAdminFeeReportItems()">
+                <option value="">All</option><option value="A">A</option><option value="B">B</option>
+              </select></div>
+            <div class="field"><label>Fee item</label><select id="repFeeItem"><option value="">All fee items</option></select></div>
+            <div class="field"><label>Report type</label><select id="repFeeType" onchange="onAdminFeeReportTypeChange()">
+                <option value="summary">Student-wise summary</option>
+                <option value="detail">Fee-wise detail</option>
+                <option value="defaulters">Defaulters (unpaid / overdue only)</option>
+              </select></div>
+            <div class="field"><label>Status</label><select id="repFeeStatus">
+                <option value="all">All</option>
+                <option value="paid">Paid</option>
+                <option value="unpaid">Unpaid (includes overdue)</option>
+                <option value="overdue">Overdue</option>
+              </select></div>
+          </div>
+          <div id="repFeeHint" style="font-size:13px; color:var(--muted); margin:2px 0 12px;"></div>
+          <div class="form-actions">
+            <button class="btn-save" onclick="downloadAdminFeeReport('xlsx')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadAdminFeeReport('pdf')">⬇ Download PDF</button>
           </div>
         </div>
       </div>
@@ -2190,6 +2262,8 @@
     </div>
   </div>
 
+  <script src="../shared/config.js"></script>
+  <script src="../shared/charts.js"></script>
   <script src="../shared/force_password.js"></script>
   <script src="admin.js"></script>
 </body>

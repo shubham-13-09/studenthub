@@ -5,15 +5,17 @@ import os
 import re
 import uuid
 import io
+import zipfile
 import subprocess
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
-from app import app
+from app import app, send_plain_emails
 from auth_middleware import admin_required, is_default_password
-from session_routes import get_admin_session_block_reason
+from session_routes import get_admin_session_block_reason, same_text as _same_text
 from chatbot_helper import find_faq_answer, get_fallback_reply, log_chat, logged_assistant, get_user_chat_history
 
 # Database backup files are saved here — outside the project (same pattern as notes/assignments)
@@ -25,14 +27,47 @@ NOTICE_UPLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'studenthub_uploads
 os.makedirs(NOTICE_UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_NOTICE_EXTENSIONS = {'pdf', 'doc', 'docx', 'ppt', 'pptx', 'jpg', 'jpeg', 'png'}
 
+def _chunks(seq, size=500):
+    """Splits a list into pieces of at most `size` (so an IN (...) list never gets huge)."""
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _norm_id(value):
+    """12 and '12' are the same record id (JSON may send either); anything that is not a whole number is kept as it is."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return value
+
+
+def _is_valid_office_zip(file_obj, folder):
+    """docx/pptx are zip files: a real one has [Content_Types].xml and a word/ (or ppt/) folder inside.
+    A plain .zip (or any other zip-based file) just renamed to .docx/.pptx fails this check."""
+    try:
+        with zipfile.ZipFile(file_obj) as zf:
+            names = zf.namelist()
+        return '[Content_Types].xml' in names and any(n.startswith(folder + '/') for n in names)
+    except Exception:
+        return False
+    finally:
+        file_obj.seek(0)    # rewind so file.save() later writes the whole file
+
+
 def _is_valid_file_content(file_or_name, ext):
+    """Checks the real file content (magic bytes), not just the extension.
+    NOTE: pass the file object itself — if only the filename (a string) is passed, the content check is skipped."""
     if hasattr(file_or_name, 'read') and hasattr(file_or_name, 'seek'):
         header = file_or_name.read(16)
         file_or_name.seek(0)
         if ext == 'pdf' and not header.startswith(b'%PDF'):
             return False
-        if ext in ('docx', 'pptx') and not header.startswith(b'PK\x03\x04'):
-            return False
+        if ext in ('docx', 'pptx'):
+            if not header.startswith(b'PK\x03\x04'):
+                return False
+            if not _is_valid_office_zip(file_or_name, 'word' if ext == 'docx' else 'ppt'):
+                return False
         if ext in ('doc', 'ppt') and not header.startswith(b'\xd0\xcf\x11\xe0'):
             return False
         if ext in ('jpg', 'jpeg') and not header.startswith(b'\xff\xd8\xff'):
@@ -123,11 +158,51 @@ def dashboard_stats():
     cursor.execute("SELECT semester, COUNT(*) AS c FROM students WHERE semester IS NOT NULL GROUP BY semester ORDER BY semester")
     students_by_semester = [{"semester": r['semester'], "count": r['c']} for r in cursor.fetchall()]
 
+    # Dashboard donut chart: fee records paid vs unpaid (count + total amount)
+    cursor.execute("SELECT status, COUNT(*) AS c, COALESCE(SUM(amount), 0) AS amt FROM fees GROUP BY status")
+    fee_summary = {"paid": {"count": 0, "amount": 0.0}, "unpaid": {"count": 0, "amount": 0.0}}
+    for r in cursor.fetchall():
+        if r['status'] in fee_summary:
+            fee_summary[r['status']] = {"count": r['c'], "amount": float(r['amt'])}
+
+    # Dashboard bar chart: overall attendance % per semester (only semesters that have attendance marked)
+    cursor.execute("""
+        SELECT s.semester, COUNT(a.id) AS total,
+               SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present
+        FROM attendance a
+        JOIN students s ON s.id = a.student_id
+        WHERE s.semester IS NOT NULL
+        GROUP BY s.semester
+        ORDER BY s.semester
+    """)
+    attendance_by_semester = [
+        {"semester": r['semester'], "total": r['total'],
+         "percentage": round(float(r['present'] or 0) * 100 / r['total']) if r['total'] else 0}
+        for r in cursor.fetchall() if r['total']
+    ]
+
+    # Dashboard line chart: number of logins per day for the last 7 days (days with no login = 0)
+    cursor.execute("""
+        SELECT DATE(login_time) AS d, COUNT(*) AS c
+        FROM login_history
+        WHERE login_time >= CURDATE() - INTERVAL 6 DAY
+        GROUP BY DATE(login_time)
+    """)
+    logins_by_day = {r['d']: r['c'] for r in cursor.fetchall()}
+    today = datetime.now().date()
+    logins_last_7_days = []
+    for i in range(6, -1, -1):
+        day = today - timedelta(days=i)
+        logins_last_7_days.append({"date": day.isoformat(), "count": logins_by_day.get(day, 0)})
+
     cursor.close()
     conn.close()
 
     return jsonify({
         "students_by_semester": students_by_semester,
+        "fee_summary": fee_summary,
+        "attendance_by_semester": attendance_by_semester,
+        "logins_last_7_days": logins_last_7_days,
         "total_students": total_students,
         "total_faculty": total_faculty,
         "total_subjects": total_subjects,
@@ -303,52 +378,80 @@ def recent_activity():
 @app.route('/api/admin/students', methods=['GET'])
 @admin_required
 def get_students():
+    """Student list with filters.
+    - Without `page`: returns a plain array (optionally capped with `limit`) — used by the Promote screen and the header search.
+    - With `page` (+ optional `limit`, default 25, max 100): returns
+      {items, total, page, limit, total_pages}. A `page` beyond the last page is clamped to the last page."""
     department = request.args.get('department')
     semester = request.args.get('semester')
     academic_year = request.args.get('academic_year')
     division = request.args.get('division')
+    status = request.args.get('status')   # 'active' / 'inactive' (any other value = no status filter)
     search = request.args.get('search')   # header search box: match by name or enrollment
 
-    query = """
-        SELECT u.id, u.login_id AS enrollment, u.name, u.status,
-               s.email, s.mobile, s.whatsapp_number, s.department, s.semester, s.division, s.academic_year, s.gender,
-               s.father_name, s.father_mobile, s.mother_name, s.mother_mobile, s.parent_email, s.parent_address
+    from_where = """
         FROM users u
         JOIN students s ON s.user_id = u.id
         WHERE u.role = 'student'
     """
     params = []
     if department:
-        query += " AND s.department = %s"
+        from_where += " AND s.department = %s"
         params.append(department)
     if semester:
-        query += " AND s.semester = %s"
+        from_where += " AND s.semester = %s"
         params.append(semester)
     if academic_year:
-        query += " AND s.academic_year = %s"
+        from_where += " AND s.academic_year = %s"
         params.append(academic_year)
     if division:
-        query += " AND s.division = %s"
+        from_where += " AND s.division = %s"
         params.append(division)
+    if status in ('active', 'inactive'):
+        from_where += " AND u.status = %s"
+        params.append(status)
     if search:
-        query += " AND (u.name LIKE %s OR u.login_id LIKE %s)"
+        from_where += " AND (u.name LIKE %s OR u.login_id LIKE %s)"
         like = f"%{search}%"
         params.extend([like, like])
-    query += " ORDER BY s.academic_year DESC, s.semester ASC, u.login_id ASC"
+
+    select_sql = """
+        SELECT u.id, u.login_id AS enrollment, u.name, u.status,
+               s.email, s.mobile, s.whatsapp_number, s.department, s.semester, s.division, s.academic_year, s.gender,
+               s.father_name, s.father_mobile, s.mother_name, s.mother_mobile, s.parent_email, s.parent_address
+    """ + from_where + " ORDER BY s.academic_year DESC, s.semester ASC, u.login_id ASC"
+
     page = request.args.get('page', type=int)
     limit = request.args.get('limit', type=int)
-    if limit and limit > 0:
-        offset = (page - 1) * limit if page and page > 0 else 0
-        query += " LIMIT %s OFFSET %s"
-        params.extend([limit, offset])
+    paginated = page is not None
+    if paginated:
+        limit = min(limit, 100) if limit and limit > 0 else 25
+    elif limit and limit > 0:
+        limit = min(limit, 100)
+    else:
+        limit = None
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute(query, tuple(params))
-    students = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return jsonify(students), 200
+    try:
+        if paginated:
+            cursor.execute("SELECT COUNT(*) AS total " + from_where, tuple(params))
+            total = cursor.fetchone()['total']
+            total_pages = max(1, (total + limit - 1) // limit)
+            page = min(max(page, 1), total_pages)
+            cursor.execute(select_sql + " LIMIT %s OFFSET %s", tuple(params) + (limit, (page - 1) * limit))
+            students = cursor.fetchall()
+            return jsonify({"items": students, "total": total, "page": page,
+                            "limit": limit, "total_pages": total_pages}), 200
+
+        if limit:
+            cursor.execute(select_sql + " LIMIT %s", tuple(params) + (limit,))
+        else:
+            cursor.execute(select_sql, tuple(params))
+        return jsonify(cursor.fetchall()), 200
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route('/api/admin/students', methods=['POST'])
@@ -618,11 +721,11 @@ def promote_students():
         # (and therefore the same target semester) — the Student Management filter
         # list is always populated from a single Dept+Sem+Batch.
         sem_dates_saved = set()
+        by_target_sem = {}   # new semester -> [user ids]
         for row in rows:
             uid = row['user_id']
             sem = int(row['semester'])
             if sem >= 6:
-                cursor.execute("UPDATE users SET status = 'inactive' WHERE id = %s", (uid,))
                 graduated.append(uid)
                 continue
 
@@ -632,8 +735,17 @@ def promote_students():
                 _upsert_academic_year_semester_dates(cursor, target_sem, term_start_date, term_end_date)
                 sem_dates_saved.add(target_sem)
 
-            cursor.execute("UPDATE students SET semester = %s WHERE user_id = %s", (target_sem, uid))
+            by_target_sem.setdefault(target_sem, []).append(uid)
             promoted.append(uid)
+
+        # one UPDATE for all graduates and one per target semester (instead of one UPDATE per student)
+        for chunk in _chunks(graduated):
+            ph = ','.join(['%s'] * len(chunk))
+            cursor.execute(f"UPDATE users SET status = 'inactive' WHERE id IN ({ph})", tuple(chunk))
+        for target_sem, uids in by_target_sem.items():
+            for chunk in _chunks(uids):
+                ph = ','.join(['%s'] * len(chunk))
+                cursor.execute(f"UPDATE students SET semester = %s WHERE user_id IN ({ph})", (target_sem,) + tuple(chunk))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -741,12 +853,11 @@ def add_faculty():
         semester = data.get('semester')
         academic_year = data.get('academic_year')
         division = data.get('division') or None   # empty string = "All divisions" -> NULL
-        for sid in subject_ids:
-            if not sid:
-                continue
-            cursor.execute(
+        subject_rows = [(faculty_row_id, sid, semester, academic_year, division) for sid in subject_ids if sid]
+        if subject_rows:
+            cursor.executemany(
                 "INSERT INTO faculty_subjects (faculty_id, subject_id, semester, academic_year, division) VALUES (%s, %s, %s, %s, %s)",
-                (faculty_row_id, sid, semester, academic_year, division)
+                subject_rows
             )
         conn.commit()
     except Exception as e:
@@ -812,12 +923,11 @@ def update_faculty(user_id):
                 "DELETE FROM faculty_subjects WHERE faculty_id = %s AND semester = %s AND academic_year = %s AND division <=> %s",
                 (faculty_row_id, semester, academic_year, division)
             )
-            for sid in subject_ids:
-                if not sid:
-                    continue
-                cursor.execute(
+            subject_rows = [(faculty_row_id, sid, semester, academic_year, division) for sid in subject_ids if sid]
+            if subject_rows:
+                cursor.executemany(
                     "INSERT INTO faculty_subjects (faculty_id, subject_id, semester, academic_year, division) VALUES (%s, %s, %s, %s, %s)",
-                    (faculty_row_id, sid, semester, academic_year, division)
+                    subject_rows
                 )
 
         conn.commit()
@@ -1330,6 +1440,262 @@ def delete_exam_timetable_slot(slot_id):
 # ATTENDANCE MANAGEMENT
 # ============================================================
 
+# ============================================================
+# ATTENDANCE SHORTAGE (below the minimum %) — shared by the Admin, Faculty and Student panels
+# Minimum % = system_settings key 'attendance_min_percentage' (default 75 = GTU eligibility rule).
+# The check is EXACT (no rounding): 74.6% is a shortage even though it is displayed as 75%.
+# ============================================================
+ATTENDANCE_MIN_DEFAULT = 75
+ATTENDANCE_ALERT_MIN_CLASSES = 5      # fewer classes than this held in a subject = too early to judge / mail
+ATTENDANCE_ALERT_COOLDOWN_DAYS = 7    # the same student+subject is not mailed again within this many days
+_alert_table_ready = False
+
+
+def get_attendance_min(cursor):
+    """The minimum attendance % (system_settings 'attendance_min_percentage', default 75)."""
+    try:
+        cursor.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'attendance_min_percentage'")
+        row = cursor.fetchone()
+        value = int(float(row['setting_value'])) if row and row['setting_value'] not in (None, '') else ATTENDANCE_MIN_DEFAULT
+        return value if 1 <= value <= 99 else ATTENDANCE_MIN_DEFAULT
+    except Exception:
+        return ATTENDANCE_MIN_DEFAULT
+
+
+def attendance_is_short(attended, total, min_pct=ATTENDANCE_MIN_DEFAULT):
+    return total > 0 and attended * 100 < min_pct * total
+
+
+def attendance_need_more(attended, total, min_pct=ATTENDANCE_MIN_DEFAULT):
+    """How many more lectures the student must attend (every one of them) to reach min_pct. 0 if not short."""
+    if not attendance_is_short(attended, total, min_pct):
+        return 0
+    # (attended + x) / (total + x) >= min/100   ->   x >= (min*total - 100*attended) / (100 - min)
+    need = min_pct * total - 100 * attended
+    return -(-need // (100 - min_pct))     # ceil
+
+
+def attendance_can_miss(attended, total, min_pct=ATTENDANCE_MIN_DEFAULT):
+    """How many more lectures can still be missed while staying at or above min_pct. 0 if already short."""
+    if total <= 0 or attendance_is_short(attended, total, min_pct):
+        return 0
+    return (100 * attended - min_pct * total) // min_pct
+
+
+def _ensure_alert_table(cursor, conn):
+    """attendance_alerts is created on first use if the live DB does not have it yet (also listed in schema.sql)."""
+    global _alert_table_ready
+    if _alert_table_ready:
+        return
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attendance_alerts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NOT NULL,
+            subject_id INT NOT NULL,
+            percentage DECIMAL(5,2),
+            sent_to VARCHAR(255),
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_attendance_alert (student_id, subject_id, sent_at),
+            FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+            FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
+    _alert_table_ready = True
+
+
+def _valid_email(value):
+    value = (value or '').strip()
+    return value if ('@' in value and ' ' not in value and '.' in value.split('@')[-1]) else None
+
+
+def _attendance_alert_body(name, enrollment, subs, min_pct, college, for_parent):
+    lines = []
+    for s in subs:
+        pct = f"{s['attended'] * 100 / s['total']:.1f}"
+        need = attendance_need_more(s['attended'], s['total'], min_pct)
+        lines.append(f"  - {s['subject_name']}: {pct}% (attended {s['attended']} of {s['total']} lectures). "
+                     f"Attending the next {need} lecture{'' if need == 1 else 's'} in a row will bring it to {min_pct}%.")
+    who = f"Parent/Guardian of {name}" if for_parent else name
+    about = f"{name}'s" if for_parent else "Your"
+    return (
+        f"Dear {who},\n\n"
+        f"{about} attendance (Enrollment: {enrollment}) is below the required {min_pct}% in the following subject(s):\n\n"
+        + "\n".join(lines) +
+        f"\n\nA minimum of {min_pct}% attendance is needed to be eligible for the examination. "
+        f"Please make sure the lectures are attended regularly. If you think this is a mistake, contact the class teacher.\n\n"
+        f"Regards,\n{college}\n(This is an automated message.)"
+    )
+
+
+def notify_attendance_shortage(student_ids, force=False):
+    """E-mails the student AND the parent (if their e-mail ids are saved) when the student is below the
+    minimum attendance in a subject of the current semester. A subject is judged only after
+    ATTENDANCE_ALERT_MIN_CLASSES classes, and the same student+subject is not mailed again within
+    ATTENDANCE_ALERT_COOLDOWN_DAYS (unless force=True). Returns a small summary dict."""
+    summary = {"checked": 0, "short": 0, "emailed": 0, "skipped_recent": 0, "no_email": 0, "failed": 0}
+    ids = []
+    for sid in student_ids or []:
+        n = _norm_id(sid)
+        if isinstance(n, int) and n not in ids:
+            ids.append(n)
+    summary["checked"] = len(ids)
+    if not ids:
+        return summary
+
+    conn = None
+    try:
+        conn = get_db()
+        cursor = conn.cursor(dictionary=True)
+        _ensure_alert_table(cursor, conn)
+        min_pct = get_attendance_min(cursor)
+        cursor.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'college_name'")
+        row = cursor.fetchone()
+        college = (row['setting_value'] if row and row['setting_value'] else None) or "StudentHub"
+
+        outbox = []   # one entry per mail: {student_id, subs, to, subject, body}
+        for chunk in _chunks(ids, 300):
+            ph = ','.join(['%s'] * len(chunk))
+            cursor.execute(f"""
+                SELECT a.student_id, a.subject_id, sub.subject_name,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS attended
+                FROM attendance a
+                JOIN students st ON st.id = a.student_id
+                JOIN subjects sub ON sub.id = a.subject_id AND sub.semester = st.semester
+                WHERE a.student_id IN ({ph})
+                GROUP BY a.student_id, a.subject_id, sub.subject_name
+                ORDER BY sub.subject_name
+            """, tuple(chunk))
+            short = {}
+            for r in cursor.fetchall():
+                total, attended = int(r['total']), int(r['attended'] or 0)
+                if total >= ATTENDANCE_ALERT_MIN_CLASSES and attendance_is_short(attended, total, min_pct):
+                    short.setdefault(r['student_id'], []).append({
+                        "subject_id": r['subject_id'], "subject_name": r['subject_name'],
+                        "attended": attended, "total": total})
+            if not short:
+                continue
+            summary["short"] += len(short)
+
+            short_ids = list(short.keys())
+            ph2 = ','.join(['%s'] * len(short_ids))
+            recent = set()
+            if not force:
+                cursor.execute(
+                    f"SELECT student_id, subject_id FROM attendance_alerts "
+                    f"WHERE student_id IN ({ph2}) AND sent_at >= NOW() - INTERVAL %s DAY",
+                    tuple(short_ids) + (ATTENDANCE_ALERT_COOLDOWN_DAYS,))
+                recent = {(r['student_id'], r['subject_id']) for r in cursor.fetchall()}
+            cursor.execute(f"""
+                SELECT st.id, st.email, st.parent_email, u.name, u.login_id
+                FROM students st JOIN users u ON u.id = st.user_id
+                WHERE st.id IN ({ph2})
+            """, tuple(short_ids))
+            contacts = {r['id']: r for r in cursor.fetchall()}
+
+            for sid, subs in short.items():
+                if all((sid, s['subject_id']) in recent for s in subs):
+                    summary["skipped_recent"] += 1
+                    continue
+                c = contacts.get(sid)
+                student_mail, parent_mail = _valid_email(c and c['email']), _valid_email(c and c['parent_email'])
+                if not c or not (student_mail or parent_mail):
+                    summary["no_email"] += 1
+                    continue
+                subject_line = f"{college} - Attendance shortage alert"
+                if student_mail:
+                    outbox.append({"student_id": sid, "subs": subs, "to": student_mail, "subject": subject_line,
+                                   "body": _attendance_alert_body(c['name'], c['login_id'], subs, min_pct, college, False)})
+                if parent_mail and parent_mail != student_mail:
+                    outbox.append({"student_id": sid, "subs": subs, "to": parent_mail, "subject": subject_line,
+                                   "body": _attendance_alert_body(c['name'], c['login_id'], subs, min_pct, college, True)})
+
+        if outbox:
+            try:
+                results = send_plain_emails([(o['to'], o['subject'], o['body']) for o in outbox], sender_name=college)
+            except Exception as e:
+                print("ATTENDANCE ALERT MAIL ERROR:", repr(e))
+                results = [False] * len(outbox)
+
+            delivered = {}   # student_id -> [addresses that really got the mail]
+            for o, ok in zip(outbox, results):
+                delivered.setdefault(o['student_id'], [])
+                if ok:
+                    delivered[o['student_id']].append(o['to'])
+            log_rows = []
+            for sid, sent_to in delivered.items():
+                if not sent_to:
+                    summary["failed"] += 1
+                    continue
+                summary["emailed"] += 1
+                subs = next(o['subs'] for o in outbox if o['student_id'] == sid)
+                for s in subs:
+                    log_rows.append((sid, s['subject_id'], round(s['attended'] * 100 / s['total'], 2), ', '.join(sent_to)[:255]))
+            if log_rows:
+                cursor.executemany(
+                    "INSERT INTO attendance_alerts (student_id, subject_id, percentage, sent_to) VALUES (%s, %s, %s, %s)",
+                    log_rows)
+                conn.commit()
+        cursor.close()
+    except Exception as e:
+        print("ATTENDANCE ALERT ERROR:", repr(e))
+        summary["failed"] += 1
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+    return summary
+
+
+def trigger_attendance_shortage_alerts(student_ids):
+    """Called right after attendance is saved. Runs in a background thread so saving stays fast."""
+    ids = [i for i in (student_ids or []) if i]
+    if ids:
+        threading.Thread(target=notify_attendance_shortage, args=(ids,), daemon=True).start()
+
+
+@app.route('/api/admin/attendance/shortage/notify', methods=['POST'])
+@admin_required
+def notify_attendance_shortage_admin():
+    """Body: { semester, divisions: [..] or "A,B", academic_year }.
+    Mails every student of that class who is below the minimum attendance (and the parent).
+    Students already alerted within the cooldown are skipped."""
+    data = request.get_json() or {}
+    semester = data.get('semester')
+    divisions = data.get('divisions') or []
+    if isinstance(divisions, str):
+        divisions = [d for d in divisions.split(',') if d]
+    academic_year = data.get('academic_year')
+    if not semester or not divisions:
+        return jsonify({"message": "semester and divisions are required"}), 400
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        ph = ','.join(['%s'] * len(divisions))
+        query = f"SELECT id FROM students WHERE semester = %s AND division IN ({ph})"
+        params = [semester] + list(divisions)
+        if academic_year:
+            query += " AND academic_year = %s"
+            params.append(academic_year)
+        cursor.execute(query, tuple(params))
+        ids = [r['id'] for r in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
+    s = notify_attendance_shortage(ids)
+    if not ids:
+        message = "No student was found for this class."
+    elif s['short'] == 0:
+        message = "No student in this class is below the minimum attendance (or the classes held are too few to judge yet)."
+    else:
+        message = (f"{s['short']} student(s) below the minimum attendance — alerted: {s['emailed']}, "
+                   f"already alerted in the last {ATTENDANCE_ALERT_COOLDOWN_DAYS} days: {s['skipped_recent']}, "
+                   f"no e-mail on file: {s['no_email']}, failed: {s['failed']}.")
+    return jsonify({"message": message, "summary": s}), 200
+
+
 @app.route('/api/admin/attendance', methods=['GET'])
 @admin_required
 def get_attendance_list():
@@ -1362,7 +1728,7 @@ def get_attendance_list():
     if academic_year:
         query += " AND s.academic_year = %s"
         params.append(academic_year)
-    query += " ORDER BY s.division ASC, u.name ASC"
+    query += " ORDER BY s.division ASC, u.login_id ASC"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
@@ -1423,16 +1789,16 @@ def save_attendance():
         return jsonify({"message": block_reason}), 409
 
     try:
-        for r in records:
-            student_id = r.get('student_id')
-            status = r.get('status')
-            if not student_id or status not in ('present', 'absent'):
-                continue
-            cursor.execute("""
+        attendance_rows = [(r.get('student_id'), subject_id, date, session_type, r.get('status'))
+                           for r in records
+                           if r.get('student_id') and r.get('status') in ('present', 'absent')]
+        if attendance_rows:
+            # all students in one statement (instead of one INSERT per student)
+            cursor.executemany("""
                 INSERT INTO attendance (student_id, subject_id, attendance_date, session_type, status)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status)
-            """, (student_id, subject_id, date, session_type, status))
+            """, attendance_rows)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1442,6 +1808,7 @@ def save_attendance():
 
     cursor.close()
     conn.close()
+    trigger_attendance_shortage_alerts([r.get('student_id') for r in records if r.get('status') in ('present', 'absent')])
     return jsonify({"message": "Attendance saved"}), 200
 
 
@@ -1482,7 +1849,7 @@ def get_attendance_summary():
     if academic_year:
         query += " AND s.academic_year = %s"
         params.append(academic_year)
-    query += " GROUP BY s.id, u.login_id, u.name, s.semester, s.division, s.academic_year ORDER BY s.division ASC, u.name ASC"
+    query += " GROUP BY s.id, u.login_id, u.name, s.semester, s.division, s.academic_year ORDER BY s.division ASC, u.login_id ASC"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
@@ -1583,8 +1950,8 @@ def add_note():
     if not title or not subject_id or not file or file.filename == '':
         return jsonify({"message": "Title, subject and file are required"}), 400
 
-    if not _allowed_note_file(file.filename):
-        return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
+    if not _allowed_note_file(file):
+        return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
 
     original_name = secure_filename(file.filename)
     file_ext = original_name.rsplit('.', 1)[1].lower()
@@ -1767,8 +2134,8 @@ def add_assignment():
     file_ext = None
 
     if file and file.filename:
-        if not _allowed_assignment_file(file.filename):
-            return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
+        if not _allowed_assignment_file(file):
+            return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{file_ext}"
@@ -1915,7 +2282,7 @@ def get_assignment_submissions(assignment_id):
     if assignment['division']:
         query += " AND s.division = %s"
         params.append(assignment['division'])
-    query += " ORDER BY u.name ASC"
+    query += " ORDER BY u.login_id ASC"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
@@ -2067,28 +2434,45 @@ def save_marks_bulk():
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
+        # The last entry of a student wins (same result as saving the records one after another)
+        wanted = {}
         for r in records:
             student_id = r.get('student_id')
             marks_obtained = r.get('marks_obtained')
             if student_id is None or marks_obtained is None or marks_obtained == '':
                 continue
+            wanted[_norm_id(student_id)] = marks_obtained
 
+        # ONE query finds the marks rows that already exist (instead of one SELECT per student)
+        existing = {}   # student id -> marks row id
+        for chunk in _chunks(wanted):
+            ph = ','.join(['%s'] * len(chunk))
             cursor.execute(
-                "SELECT id FROM marks WHERE student_id = %s AND subject_id = %s AND exam_type = %s AND semester = %s AND academic_year = %s",
-                (student_id, subject_id, exam_type, semester, academic_year)
+                "SELECT id, student_id FROM marks WHERE subject_id = %s AND exam_type = %s AND semester = %s "
+                f"AND academic_year = %s AND student_id IN ({ph}) ORDER BY id",
+                (subject_id, exam_type, semester, academic_year) + tuple(chunk)
             )
-            existing = cursor.fetchone()
+            for row in cursor.fetchall():
+                existing.setdefault(row['student_id'], row['id'])
 
-            if existing:
-                cursor.execute(
-                    "UPDATE marks SET marks_obtained = %s, max_marks = %s WHERE id = %s",
-                    (marks_obtained, max_marks, existing['id'])
-                )
-            else:
-                cursor.execute(
-                    "INSERT INTO marks (student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                    (student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year)
-                )
+        # Existing rows are updated in one statement per 500 students: INSERT .. ON DUPLICATE KEY UPDATE on the primary key
+        # (every NOT NULL column is supplied, so it also works in MySQL strict mode). New rows go in with one INSERT.
+        update_rows = [(existing[sid], sid, subject_id, exam_type, marks, max_marks, semester, academic_year)
+                       for sid, marks in wanted.items() if sid in existing]
+        insert_rows = [(sid, subject_id, exam_type, marks, max_marks, semester, academic_year)
+                       for sid, marks in wanted.items() if sid not in existing]
+        for chunk in _chunks(update_rows):
+            cursor.executemany(
+                "INSERT INTO marks (id, student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE marks_obtained = VALUES(marks_obtained), max_marks = VALUES(max_marks)",
+                chunk
+            )
+        if insert_rows:
+            cursor.executemany(
+                "INSERT INTO marks (student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                insert_rows
+            )
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -2203,7 +2587,7 @@ def get_marks_request_detail(request_id):
         JOIN students s ON s.id = m.student_id
         JOIN users u ON u.id = s.user_id
         WHERE m.request_id = %s
-        ORDER BY u.name ASC
+        ORDER BY u.login_id ASC
     """, (request_id,))
     req['students'] = cursor.fetchall()
     cursor.close()
@@ -2324,7 +2708,7 @@ def get_fee_students():
     if academic_year:
         query += " AND s.academic_year = %s"
         params.append(academic_year)
-    query += " ORDER BY u.name ASC"
+    query += " ORDER BY u.login_id ASC"
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -2333,52 +2717,148 @@ def get_fee_students():
     cursor.close()
     conn.close()
     return jsonify(rows), 200
+
+
+_FEE_FROM = """
+        FROM fees f
+        JOIN students s ON s.id = f.student_id
+        JOIN users u ON u.id = s.user_id
+"""
+
+
+def _fee_where(args, use_folder=False):
+    """WHERE part shared by the fee list and the two folder summaries, so their numbers always agree.
+    Filters of the page: status, semester, division, academic_year, search.
+    With use_folder: the folder that is open on the screen - folder_semester / folder_division / folder_year
+    (the screen writes 'not set' as '-') and fee_title (the title folder inside it)."""
+    conditions, params = [], []
+    for column, name in (("f.status", "status"), ("f.semester", "semester"),
+                         ("s.division", "division"), ("f.academic_year", "academic_year")):
+        value = args.get(name)
+        if value:
+            conditions.append(f"{column} = %s")
+            params.append(value)
+    search = args.get('search')
+    if search:
+        conditions.append("(u.name LIKE %s OR u.login_id LIKE %s OR f.fee_title LIKE %s)")
+        like = f"%{search}%"
+        params += [like, like, like]
+
+    if use_folder:
+        for name, column, empty_test in (("folder_semester", "f.semester", "(f.semester IS NULL OR f.semester = 0)"),
+                                         ("folder_division", "s.division", "(s.division IS NULL OR s.division = '')"),
+                                         ("folder_year", "f.academic_year", "(f.academic_year IS NULL OR f.academic_year = '')")):
+            value = args.get(name)
+            if value is None:
+                continue
+            if value == '-':
+                conditions.append(empty_test)
+            else:
+                conditions.append(f"{column} = %s")
+                params.append(value)
+        title = args.get('fee_title')
+        if title:
+            if title == 'Untitled':
+                conditions.append("(f.fee_title IS NULL OR f.fee_title = '' OR f.fee_title = 'Untitled')")
+            else:
+                conditions.append("f.fee_title = %s")
+                params.append(title)
+
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    return where, params
+
+
+def _fee_group_rows(rows):
+    return [{**row, "records": int(row["records"]), "paid": int(row["paid"] or 0), "total": float(row["total"] or 0)}
+            for row in rows]
 
 
 @app.route('/api/admin/fees', methods=['GET'])
 @admin_required
 def get_fees():
-    status = request.args.get('status')
-    semester = request.args.get('semester')
-    division = request.args.get('division')
-    academic_year = request.args.get('academic_year')
-    search = request.args.get('search')
-
-    query = """
+    """Fee records.
+    - Without `page`: a plain array with every matching row.
+    - With `page` (+ optional `limit`, default 50, max 200): {items, total, page, limit, total_pages};
+      a page beyond the last one is clamped to the last page.
+    Besides the page filters it accepts the open folder (folder_semester / folder_division / folder_year, '-' = not set)
+    and fee_title, so the screen only loads the records of the folder it shows."""
+    where, params = _fee_where(request.args, use_folder=True)
+    # NOTE: seconds are written %S (capital) on purpose. A lowercase %s inside the SQL text is taken for a query
+    # parameter by the MySQL driver, which made every filtered request fail with 'Not enough parameters'.
+    select_sql = """
         SELECT f.id, f.fee_title, f.amount, DATE_FORMAT(f.due_date, '%Y-%m-%d') AS due_date, f.semester, f.academic_year,
-               f.status, f.payment_link, DATE_FORMAT(f.paid_at, '%Y-%m-%d %H:%i:%s') AS paid_at,
+               f.status, f.payment_link, DATE_FORMAT(f.paid_at, '%Y-%m-%d %H:%i:%S') AS paid_at,
                s.id AS student_id, u.login_id AS enrollment, u.name AS student_name, s.division
-        FROM fees f
-        JOIN students s ON s.id = f.student_id
-        JOIN users u ON u.id = s.user_id
-        WHERE 1=1
-    """
-    params = []
-    if status:
-        query += " AND f.status = %s"
-        params.append(status)
-    if semester:
-        query += " AND f.semester = %s"
-        params.append(semester)
-    if division:
-        query += " AND s.division = %s"
-        params.append(division)
-    if academic_year:
-        query += " AND f.academic_year = %s"
-        params.append(academic_year)
-    if search:
-        query += " AND (u.name LIKE %s OR u.login_id LIKE %s OR f.fee_title LIKE %s)"
-        like = f"%{search}%"
-        params += [like, like, like]
-    query += " ORDER BY f.due_date IS NULL, f.due_date ASC, u.name ASC"
+    """ + _FEE_FROM + where + " ORDER BY f.due_date IS NULL, f.due_date ASC, u.login_id ASC, f.id ASC"
+
+    page = request.args.get('page', type=int)
+    limit = request.args.get('limit', type=int)
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute(query, tuple(params))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return jsonify(rows), 200
+    try:
+        if page is None:
+            cursor.execute(select_sql, tuple(params))
+            return jsonify(cursor.fetchall()), 200
+
+        limit = min(limit, 200) if limit and limit > 0 else 50
+        cursor.execute("SELECT COUNT(*) AS total " + _FEE_FROM + where, tuple(params))
+        total = cursor.fetchone()['total']
+        total_pages = max(1, (total + limit - 1) // limit)
+        page = min(max(page, 1), total_pages)
+        cursor.execute(select_sql + " LIMIT %s OFFSET %s", tuple(params) + (limit, (page - 1) * limit))
+        return jsonify({"items": cursor.fetchall(), "total": total, "page": page,
+                        "limit": limit, "total_pages": total_pages}), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/fees/folders', methods=['GET'])
+@admin_required
+def get_fee_folders():
+    """The top-level folders of Fee Management (Semester + Division + Batch) with their record count, how many are
+    paid and the total amount - counted by the database, so the screen does not need to load every fee record."""
+    where, params = _fee_where(request.args)
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT NULLIF(f.semester, 0) AS semester, NULLIF(s.division, '') AS division,
+                   NULLIF(f.academic_year, '') AS academic_year,
+                   COUNT(*) AS records, SUM(f.status = 'paid') AS paid, SUM(f.amount) AS total
+        """ + _FEE_FROM + where + """
+            GROUP BY NULLIF(f.semester, 0), NULLIF(s.division, ''), NULLIF(f.academic_year, '')
+            ORDER BY semester, division, academic_year
+        """, tuple(params))
+        return jsonify(_fee_group_rows(cursor.fetchall())), 200
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/admin/fees/title-folders', methods=['GET'])
+@admin_required
+def get_fee_title_folders():
+    """The fee-title sub-folders inside ONE Semester + Division + Batch folder (folder_semester, folder_division,
+    folder_year are required; '-' = not set), with record count, paid count and total amount."""
+    if any(request.args.get(k) is None for k in ('folder_semester', 'folder_division', 'folder_year')):
+        return jsonify({"message": "folder_semester, folder_division and folder_year are required"}), 400
+    where, params = _fee_where(request.args, use_folder=True)
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT COALESCE(NULLIF(f.fee_title, ''), 'Untitled') AS fee_title,
+                   COUNT(*) AS records, SUM(f.status = 'paid') AS paid, SUM(f.amount) AS total
+        """ + _FEE_FROM + where + """
+            GROUP BY COALESCE(NULLIF(f.fee_title, ''), 'Untitled')
+            ORDER BY fee_title
+        """, tuple(params))
+        return jsonify(_fee_group_rows(cursor.fetchall())), 200
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route('/api/admin/fees', methods=['POST'])
@@ -2411,17 +2891,15 @@ def add_fee():
     conn = get_db()
     cursor = conn.cursor()
     try:
-        created = 0
         paid_at_val = datetime.now() if status == 'paid' else None
-        for student_id in student_ids:
-            cursor.execute("""
-                INSERT INTO fees (student_id, fee_title, amount, due_date, semester, academic_year, status, payment_link, paid_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                student_id, fee_title, amount, due_date, semester, academic_year, status, payment_link,
-                paid_at_val
-            ))
-            created += 1
+        fee_rows = [(student_id, fee_title, amount, due_date, semester, academic_year, status, payment_link, paid_at_val)
+                    for student_id in student_ids]
+        # the whole class in one INSERT (instead of one INSERT per student)
+        cursor.executemany("""
+            INSERT INTO fees (student_id, fee_title, amount, due_date, semester, academic_year, status, payment_link, paid_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, fee_rows)
+        created = len(fee_rows)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -2623,6 +3101,41 @@ def get_notifications():
 # ============================================================
 # NOTICE MANAGEMENT
 # ============================================================
+# ---- Notice chat groups (admin panel) ----
+#   all   : "Students, Faculty & Admin" -> target_role 'all' or 'student'
+#   staff : "Admin & Faculty"           -> target_role 'faculty'  (students never see these)
+ADMIN_NOTICE_GROUPS = ('all', 'staff')
+NOTICE_TITLE_MAX = 150
+NOTICE_CONTENT_MAX = 5000
+NOTICE_CATEGORIES = ('Academic', 'Event', 'Important')
+
+
+def _clean_admin_notice(title, content, category, semester, division, academic_year):
+    """Returns (values dict, error). Shared by add + edit so both apply the same limits."""
+    title = (title or '').strip()
+    content = (content or '').strip() or None
+    category = (category or 'Academic').strip()
+    semester = str(semester).strip() if semester not in (None, '') else None
+    division = (division or '').strip() or None
+    academic_year = (academic_year or '').strip() or None
+    if not title:
+        return None, "Title is required"
+    if len(title) > NOTICE_TITLE_MAX:
+        return None, f"Title can be at most {NOTICE_TITLE_MAX} characters"
+    if content and len(content) > NOTICE_CONTENT_MAX:
+        return None, f"Message can be at most {NOTICE_CONTENT_MAX} characters"
+    if category not in NOTICE_CATEGORIES:
+        return None, "Invalid category"
+    if semester is not None and not (semester.isdigit() and 1 <= int(semester) <= 12):
+        return None, "Invalid semester"
+    if division and len(division) > 5:
+        return None, "Invalid division"
+    if academic_year and len(academic_year) > 10:
+        return None, "Invalid academic year"
+    return {"title": title, "content": content, "category": category,
+            "semester": semester, "division": division, "academic_year": academic_year}, None
+
+
 @app.route('/api/admin/notices', methods=['GET'])
 @admin_required
 def get_notices():
@@ -2636,11 +3149,12 @@ def get_notices():
                       n.is_pinned, n.file_name, n.file_size, n.file_type, n.created_at, n.posted_by,
                       (SELECT u.name FROM users u WHERE u.id = n.posted_by) AS posted_by_name,
                       (SELECT u.role FROM users u WHERE u.id = n.posted_by) AS posted_by_role,
+                      EXISTS(SELECT 1 FROM notice_reads ar WHERE ar.notice_id = n.id AND ar.user_id = %s) AS is_read,
                       COUNT(nr.id) AS seen_count
                FROM notices n
                LEFT JOIN notice_reads nr ON nr.notice_id = n.id
                WHERE 1=1"""
-    params = []
+    params = [request.user['user_id']]   # for the is_read sub-select above
     if category:
         query += " AND category = %s"
         params.append(category)
@@ -2666,33 +3180,38 @@ def get_notices():
     conn.close()
     admin_id = request.user['user_id']
     for r in rows:
-        r['is_mine'] = (r.pop('posted_by') == admin_id)   # a notice they posted themselves will show in a "sent" bubble on the right side
+        posted_by = r.pop('posted_by')
+        r['is_mine'] = (posted_by == admin_id)   # a notice they posted themselves will show in a "sent" bubble on the right side
+        r['is_read'] = bool(r['is_read']) or r['is_mine'] or posted_by is None   # no poster (system / deleted user) -> nothing to mark
+        r['group'] = 'staff' if r['target_role'] == 'faculty' else 'all'
     return jsonify(rows), 200
 
 
 @app.route('/api/admin/notices', methods=['POST'])
 @admin_required
 def add_notice():
-    """multipart/form-data — the attachment is optional (not JSON, because a file can also come along)."""
-    title = request.form.get('title')
-    content = request.form.get('content')
-    category = request.form.get('category') or 'Academic'
+    """multipart/form-data — the attachment is optional (not JSON, because a file can also come along).
+    target_role 'faculty' = the "Admin & Faculty" group (no semester/division/batch, students never see it);
+    'all' / 'student' = the "Students, Faculty & Admin" group."""
     target_role = request.form.get('target_role') or 'all'
-    semester = request.form.get('semester') or None
-    division = request.form.get('division') or None
-    academic_year = request.form.get('academic_year') or None
     is_pinned = request.form.get('is_pinned') in ('1', 'true', 'True')
     file = request.files.get('file')
 
-    if not title:
-        return jsonify({"message": "Title is required"}), 400
     if target_role not in ('all', 'student', 'faculty'):
         return jsonify({"message": "target_role must be all, student or faculty"}), 400
+    values, error = _clean_admin_notice(
+        request.form.get('title'), request.form.get('content'), request.form.get('category'),
+        request.form.get('semester'), request.form.get('division'), request.form.get('academic_year'))
+    if error:
+        return jsonify({"message": error}), 400
+    if target_role == 'faculty':
+        values['semester'] = values['division'] = values['academic_year'] = None   # a staff notice has no class
 
     file_path = file_name = file_size = file_type = None
     if file and file.filename:
-        if not _allowed_notice_file(file.filename):
-            return jsonify({"message": "Only PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
+        # pass the file object (not only the name) so the content is checked too, same as the faculty upload
+        if not _allowed_notice_file(file):
+            return jsonify({"message": "Only valid PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{file_ext}"   # unique name to avoid collisions on disk
@@ -2709,15 +3228,16 @@ def add_notice():
         cursor.execute("""
             INSERT INTO notices (title, content, category, target_role, semester, division, academic_year, posted_by, is_pinned, file_path, file_name, file_size, file_type)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (title, content, category, target_role, semester, division, academic_year, request.user['user_id'], is_pinned, file_path, file_name, file_size, file_type))
+        """, (values['title'], values['content'], values['category'], target_role, values['semester'], values['division'],
+              values['academic_year'], request.user['user_id'], is_pinned, file_path, file_name, file_size, file_type))
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         cursor.close()
         conn.close()
         if file_path and os.path.exists(os.path.join(NOTICE_UPLOAD_FOLDER, file_path)):
             os.remove(os.path.join(NOTICE_UPLOAD_FOLDER, file_path))   # if the DB save failed, don't leave an orphan file on disk
-        return jsonify({"message": "Notice could not be saved", "error": str(e)}), 500
+        return jsonify({"message": "Notice could not be saved"}), 500
 
     cursor.close()
     conn.close()
@@ -2727,33 +3247,45 @@ def add_notice():
 @app.route('/api/admin/notices/<int:notice_id>', methods=['PUT'])
 @admin_required
 def update_notice(notice_id):
-    data = request.get_json()
-    title = data.get('title')
-    content = data.get('content')
-    category = data.get('category') or 'Academic'
+    """Admin can fix the text of any notice (moderation). The audience (target_role / semester / division / batch)
+    can be changed only on a notice the admin posted themselves — a faculty's class or staff notice keeps its audience."""
+    data = request.get_json(silent=True) or {}
     target_role = data.get('target_role') or 'all'
-    semester = data.get('semester') or None
-    division = data.get('division') or None
-    academic_year = data.get('academic_year') or None
     is_pinned = bool(data.get('is_pinned'))
 
-    if not title:
-        return jsonify({"message": "Title is required"}), 400
     if target_role not in ('all', 'student', 'faculty'):
         return jsonify({"message": "target_role must be all, student or faculty"}), 400
+    values, error = _clean_admin_notice(
+        data.get('title'), data.get('content'), data.get('category'),
+        data.get('semester'), data.get('division'), data.get('academic_year'))
+    if error:
+        return jsonify({"message": error}), 400
+    if target_role == 'faculty':
+        values['semester'] = values['division'] = values['academic_year'] = None
 
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE notices SET title=%s, content=%s, category=%s, target_role=%s, semester=%s, division=%s, academic_year=%s, is_pinned=%s
-        WHERE id=%s
-    """, (title, content, category, target_role, semester, division, academic_year, is_pinned, notice_id))
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT posted_by FROM notices WHERE id = %s", (notice_id,))
+    notice = cursor.fetchone()
+    if not notice:
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Notice not found"}), 404
+
+    if notice['posted_by'] == request.user['user_id']:
+        cursor.execute("""
+            UPDATE notices SET title=%s, content=%s, category=%s, target_role=%s, semester=%s, division=%s, academic_year=%s, is_pinned=%s
+            WHERE id=%s
+        """, (values['title'], values['content'], values['category'], target_role, values['semester'], values['division'],
+              values['academic_year'], is_pinned, notice_id))
+    else:
+        cursor.execute("""
+            UPDATE notices SET title=%s, content=%s, category=%s, is_pinned=%s
+            WHERE id=%s
+        """, (values['title'], values['content'], values['category'], is_pinned, notice_id))
     conn.commit()
-    affected = cursor.rowcount
     cursor.close()
     conn.close()
-    if affected == 0:
-        return jsonify({"message": "Notice not found"}), 404
     return jsonify({"message": "Notice updated"}), 200
 
 
@@ -2812,10 +3344,14 @@ def download_notice_file(notice_id):
     if not notice or not notice['file_path']:
         return jsonify({"message": "Attachment not found"}), 404
 
+    # ?inline=1 -> sent for direct viewing (image / PDF preview inside the notice feed).
+    # Any other file type is always sent as a normal download.
+    ext = (notice['file_name'] or '').rsplit('.', 1)[-1].lower()
+    inline = request.args.get('inline') == '1' and ext in ('jpg', 'jpeg', 'png', 'pdf')
     return send_from_directory(
         NOTICE_UPLOAD_FOLDER,
         notice['file_path'],
-        as_attachment=True,
+        as_attachment=not inline,
         download_name=notice['file_name']
     )
 
@@ -2826,6 +3362,13 @@ def mark_admin_notices_read():
     """Called as soon as the Notices tab opens — marks all notices posted by others (e.g. faculty)
     as 'seen' in this admin's name, so the admin shows up in the faculty's 'Seen by' list.
     The admin's own posted notices are skipped (the poster has no seen count of their own)."""
+    data = request.get_json(silent=True) or {}
+    group = data.get('group')
+    if group is not None and group not in ADMIN_NOTICE_GROUPS:
+        return jsonify({"message": "Invalid group"}), 400
+    # with a group, only that chat group is marked (called when the admin opens it)
+    group_sql = {None: "", 'staff': " AND n.target_role = 'faculty'", 'all': " AND n.target_role IN ('all','student')"}[group]
+
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -2834,13 +3377,12 @@ def mark_admin_notices_read():
             INSERT IGNORE INTO notice_reads (notice_id, user_id)
             SELECT n.id, %s
             FROM notices n
-            WHERE n.posted_by IS NOT NULL AND n.posted_by <> %s
-        """, (admin_id, admin_id))
+            WHERE n.posted_by IS NOT NULL AND n.posted_by <> %s""" + group_sql, (admin_id, admin_id))
         conn.commit()
         return jsonify({"message": "Marked as read"}), 200
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return jsonify({"message": "Failed to mark as read", "error": str(e)}), 500
+        return jsonify({"message": "Failed to mark as read"}), 500
     finally:
         cursor.close()
         conn.close()
@@ -3217,9 +3759,135 @@ def _normalize_exam_type(exam_type):
     return _EXAM_TYPE_DISPLAY.get((exam_type or '').strip().lower(), exam_type)
 
 
+# ---- PDF version of the admin reports ----
+# Every admin report (Student / Attendance / Assignment / Login Activity) ends in _excel_response(). If the
+# request carries ?format=pdf, the very same rows are sent as a PDF table instead of an Excel sheet,
+# so the admin gets Excel + PDF for every report, like the faculty panel.
+_ADMIN_PDF_TITLES = {
+    'students': 'Student Report',
+    'attendance': 'Attendance Report',
+    'assignments': 'Assignment Report',
+    'login-activity': 'Login Activity Report',
+}
+_ADMIN_PDF_MAX_ROWS = 5000   # a PDF with tens of thousands of rows is not readable; Excel has the full list
+
+
+def _report_pdf_info():
+    """The filter lines printed under the PDF title (taken from the request's query params)."""
+    a = request.args
+    info = []
+    if a.get('academic_year'):
+        info.append(f"Batch: {a.get('academic_year')}")
+    if a.get('semester'):
+        info.append(f"Semester: {a.get('semester')}")
+    if a.get('academic_year') or a.get('semester'):
+        info.append(f"Division: {a.get('division') or 'All'}")
+        subject_name = "All subjects"
+        if a.get('subject_id'):
+            try:
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                cur.execute("SELECT subject_name FROM subjects WHERE id = %s", (a.get('subject_id'),))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                if row:
+                    subject_name = row['subject_name']
+            except Exception:
+                pass
+        info.append(f"Subject: {subject_name}")
+    if 'login-activity' in request.path:
+        info.append(f"From: {a.get('from_date') or 'start'}   To: {a.get('to_date') or 'today'}   Role: {(a.get('role') or 'all').title()}")
+    info.append("Generated on: " + datetime.now().strftime('%d-%m-%Y %H:%M'))
+    return info
+
+
+def _report_pdf_response(headers, rows, filename):
+    try:
+        from xml.sax.saxutils import escape
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.lib.units import mm
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    except ImportError:
+        return jsonify({"message": "PDF export needs the 'reportlab' package on the server. Run: pip install reportlab"}), 500
+
+    title = next((t for key, t in _ADMIN_PDF_TITLES.items() if f'/reports/{key}/' in request.path), 'Report')
+    total_rows = len(rows)
+    shown = rows[:_ADMIN_PDF_MAX_ROWS]
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=16 * mm, title=title)
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle('admcell', parent=styles['Normal'], fontSize=9, leading=11)
+    head = ParagraphStyle('admhead', parent=cell, textColor=colors.white, fontName='Helvetica-Bold')
+
+    story = [Paragraph(escape(title), styles['Title'])]
+    story.append(Paragraph("<br/>".join(escape(line) for line in _report_pdf_info()), styles['Normal']))
+    story.append(Spacer(1, 5 * mm))
+
+    if not shown:
+        story.append(Paragraph("No records found for the selected filters.", styles['Normal']))
+    else:
+        # Column widths follow the content length; if the table is wider than the page it is scaled down
+        usable = 269.0   # landscape A4 minus margins, in mm
+        lens = []
+        for c, h in enumerate(headers):
+            longest = len(str(h))
+            for r in shown[:300]:
+                longest = max(longest, len(str(r[c])) if r[c] is not None else 0)
+            lens.append(min(max(longest, 4), 40))
+        # a column is never narrower than its longest header word (so "Submitted" is not split in two)
+        min_w = [max([len(word) for word in str(h).split()] or [4]) * 2.3 + 7 for h in headers]
+        widths = [max(n * 1.9 + 6, m) for n, m in zip(lens, min_w)]
+        if sum(widths) > usable:
+            # shrink only the wide (text-heavy) columns; the short ones keep their size
+            narrow = sum(w for w in widths if w <= 35)
+            wide = sum(w for w in widths if w > 35)
+            scale = (usable - narrow) / wide if wide and usable > narrow else 1
+            widths = [w if w <= 35 else max(w * scale, 35 * 0.6) for w in widths]
+            if sum(widths) > usable:
+                widths = [w * usable / sum(widths) for w in widths]
+
+        data = [[Paragraph(escape(str(h)), head) for h in headers]]
+        for r in shown:
+            data.append([Paragraph(escape('' if v is None else str(v)), cell) for v in r])
+        table = Table(data, repeatRows=1, colWidths=[w * mm for w in widths], hAlign='LEFT')
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 4 * mm))
+        count_line = f"Total rows: {total_rows}"
+        if total_rows > len(shown):
+            count_line += f"  (first {len(shown)} shown here - download the Excel file for the full list)"
+        story.append(Paragraph("<b>" + escape(count_line) + "</b>", styles['Normal']))
+
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont('Helvetica', 8)
+        canvas.setFillColor(colors.HexColor('#5b6b66'))
+        canvas.drawString(14 * mm, 8 * mm, "StudentHub - " + title)
+        canvas.drawRightString(landscape(A4)[0] - 14 * mm, 8 * mm, f"Page {document.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    buffer.seek(0)
+    pdf_name = filename.rsplit('.', 1)[0] + '.pdf'
+    return send_file(buffer, as_attachment=True, download_name=pdf_name, mimetype='application/pdf')
+
+
 def _excel_response(headers, rows, filename):
     """headers: list of column names. rows: list of tuples/lists (same order as headers).
-    Sends a bold header row, auto column width, and the .xlsx file directly for download."""
+    Sends a bold header row, auto column width, and the .xlsx file directly for download.
+    With ?format=pdf in the request the same rows are sent as a PDF instead."""
+    if (request.args.get('format') or '').strip().lower() == 'pdf':
+        return _report_pdf_response(headers, rows, filename)
     wb = Workbook()
     ws = wb.active
     ws.append(headers)
@@ -3280,7 +3948,7 @@ def report_students_excel():
     if division:
         query += " AND s.division = %s"
         params.append(division)
-    query += " ORDER BY u.name ASC"
+    query += " ORDER BY u.login_id ASC"
     cursor.execute(query, tuple(params))
     students = cursor.fetchall()
 
@@ -3366,7 +4034,7 @@ def report_attendance_excel():
     if division:
         query += " AND s.division = %s"
         params.append(division)
-    query += " ORDER BY u.name ASC"
+    query += " ORDER BY u.login_id ASC"
     cursor.execute(query, tuple(params))
     students = cursor.fetchall()
 
@@ -3426,7 +4094,7 @@ def report_assignments_excel():
     cursor = conn.cursor(dictionary=True)
 
     query = """
-        SELECT a.id, a.title, a.due_date, a.division, sub.subject_name
+        SELECT a.id, a.title, a.due_date, a.division, sub.subject_name, sub.department AS subject_department
         FROM assignments a
         JOIN subjects sub ON sub.id = a.subject_id
         WHERE a.academic_year = %s AND a.semester = %s
@@ -3438,44 +4106,49 @@ def report_assignments_excel():
     if subject_id:
         query += " AND a.subject_id = %s"
         params.append(subject_id)
-    query += " ORDER BY a.due_date DESC"
+    query += " ORDER BY a.due_date DESC, a.id"   # a.id: assignments due on the same day always come out in the same order
     cursor.execute(query, tuple(params))
     assignments = cursor.fetchall()
 
     headers = ["Assignment", "Subject", "Due Date", "Student Name", "Enrollment", "Submitted", "Submission Date", "Status", "Marks Obtained"]
     rows = []
 
-    for a in assignments:
-        student_query = """
-            SELECT u.id AS user_id, u.login_id AS enrollment, u.name
+    all_students = []
+    sub_map = {}   # (assignment id, student user id) -> submission row
+    if assignments:
+        # ONE query for every student of this semester + batch (instead of one student query per assignment);
+        # which of them belong to an assignment is decided below, in Python
+        cursor.execute("""
+            SELECT u.id AS user_id, u.login_id AS enrollment, u.name, s.department, s.division
             FROM users u
             JOIN students s ON s.user_id = u.id
-            JOIN subjects sub ON sub.department = s.department
-            WHERE u.role = 'student' AND s.academic_year = %s AND s.semester = %s AND sub.id = (
-                SELECT subject_id FROM assignments WHERE id = %s
-            )
-        """
-        sparams = [academic_year, semester, a['id']]
-        if a['division']:
-            student_query += " AND s.division = %s"
-            sparams.append(a['division'])
-        student_query += " ORDER BY u.name ASC"
-        cursor.execute(student_query, tuple(sparams))
-        class_students = cursor.fetchall()
+            WHERE u.role = 'student' AND s.academic_year = %s AND s.semester = %s
+            ORDER BY u.login_id ASC
+        """, (academic_year, semester))
+        all_students = cursor.fetchall()
 
-        cursor.execute("""
-            SELECT student_id, submitted_at, marks_obtained
-            FROM assignment_submissions WHERE assignment_id = %s
-        """, (a['id'],))
-        sub_map = {}
-        for row in cursor.fetchall():
-            cursor.execute("SELECT user_id FROM students WHERE id = %s", (row['student_id'],))
-            uid_row = cursor.fetchone()
-            if uid_row:
-                sub_map[uid_row['user_id']] = row
+        # ONE query for the submissions of all these assignments, with the student's user id fetched by a JOIN
+        # (instead of one query per assignment plus one more query per submission)
+        for chunk in _chunks([a['id'] for a in assignments]):
+            ph = ','.join(['%s'] * len(chunk))
+            cursor.execute(f"""
+                SELECT asub.assignment_id, st.user_id, asub.submitted_at, asub.marks_obtained
+                FROM assignment_submissions asub
+                JOIN students st ON st.id = asub.student_id
+                WHERE asub.assignment_id IN ({ph})
+                ORDER BY asub.id
+            """, tuple(chunk))
+            for row in cursor.fetchall():
+                sub_map[(row['assignment_id'], row['user_id'])] = row
+
+    for a in assignments:
+        # students of the subject's department; if the assignment is for one division, only that division
+        class_students = [st for st in all_students
+                          if _same_text(st['department'], a['subject_department'])
+                          and (not a['division'] or _same_text(st['division'], a['division']))]
 
         for st in class_students:
-            sub = sub_map.get(st['user_id'])
+            sub = sub_map.get((a['id'], st['user_id']))
             if sub:
                 submitted_date = sub['submitted_at'].strftime('%Y-%m-%d') if sub['submitted_at'] else '-'
                 status = 'Late' if a['due_date'] and sub['submitted_at'] and sub['submitted_at'].date() > a['due_date'] else 'On-time'
@@ -3491,6 +4164,362 @@ def report_assignments_excel():
 
     filename = f"assignment_report_sem{semester}_{academic_year}.xlsx".replace(' ', '_')
     return _excel_response(headers, rows, filename)
+
+
+# ============================================================
+# FEE REPORT - shared code
+# Used by the Admin panel (any class, route below) and by the Faculty panel (only the classes the faculty
+# teaches; faculty_routes.py imports build_fee_report / fee_report_params_error from here).
+# The routes only differ in WHO may see WHICH class and how the fee rows are fetched; everything after that
+# (filters, overdue rule, totals, Excel / PDF) is here, so both panels always produce the same report.
+# Report types: summary (student-wise) | detail (fee-wise) | defaulters
+# Overdue = unpaid + due date already passed. It is never stored; it is worked out from today's date.
+# ============================================================
+_FEE_REPORT_LABELS = {"summary": "Student-wise Summary", "detail": "Fee-wise Detail", "defaulters": "Defaulters"}
+_FEE_STATUS_LABELS = {"all": "All", "paid": "Paid", "unpaid": "Unpaid (incl. overdue)", "overdue": "Overdue"}
+
+
+def _fee_date(d):
+    return d.strftime('%d-%m-%Y') if d else "-"
+
+
+def _fee_rs(v):
+    return f"Rs. {float(v or 0):,.2f}"
+
+
+def _fee_pct(paid, total):
+    return round(paid * 100 / total, 1) if total else 0.0
+
+
+def _fee_prepare(rows, today):
+    """Adds is_paid / is_overdue / label to every fee row."""
+    for r in rows:
+        r['amount'] = float(r['amount'] or 0)
+        r['fee_title'] = (r['fee_title'] or '').strip() or 'Untitled'
+        r['is_paid'] = (r['status'] == 'paid')
+        r['is_overdue'] = (not r['is_paid']) and r['due_date'] is not None and r['due_date'] < today
+        r['label'] = 'Paid' if r['is_paid'] else ('Overdue' if r['is_overdue'] else 'Unpaid')
+    return rows
+
+
+def _fee_student_rows(rows, today):
+    """One entry per student with total / paid / pending amounts over the given fee rows."""
+    students = {}
+    for r in rows:
+        s = students.setdefault(r['student_id'], {
+            "enrollment": r['enrollment'], "name": r['name'], "division": r['division'],
+            "total": 0.0, "paid": 0.0, "pending": 0.0,
+            "unpaid_items": 0, "overdue_items": 0, "earliest_due": None, "days_overdue": 0})
+        s['total'] += r['amount']
+        if r['is_paid']:
+            s['paid'] += r['amount']
+            continue
+        s['pending'] += r['amount']
+        s['unpaid_items'] += 1
+        if r['due_date'] is not None and (s['earliest_due'] is None or r['due_date'] < s['earliest_due']):
+            s['earliest_due'] = r['due_date']
+        if r['is_overdue']:
+            s['overdue_items'] += 1
+            s['days_overdue'] = max(s['days_overdue'], (today - r['due_date']).days)
+    out = list(students.values())
+    for s in out:
+        s['label'] = 'Paid' if s['unpaid_items'] == 0 else ('Overdue' if s['overdue_items'] else 'Pending')
+    return out
+
+
+def _fee_build_table(report, rows, students, today):
+    """Returns the table for the chosen report type (rows / students are already filtered and sorted)."""
+    if report == 'summary':
+        data = [[i, s['enrollment'], s['name'], s['division'] or '-', s['total'], s['paid'], s['pending'], s['label']]
+                for i, s in enumerate(students, start=1)]
+        return {"headers": ["#", "Enrollment", "Name", "Div", "Total Fee (Rs.)", "Paid (Rs.)", "Pending (Rs.)", "Status"],
+                "data": data, "money": [4, 5, 6], "status_col": 7, "wrap": [2],
+                "xlsx_widths": [6, 16, 30, 6, 16, 14, 14, 12], "pdf_widths": [12, 32, 80, 14, 32, 32, 32, 30],
+                "total": sum(s['total'] for s in students), "paid": sum(s['paid'] for s in students)}
+    if report == 'detail':
+        data = [[i, r['enrollment'], r['name'], r['division'] or '-', r['fee_title'], r['amount'],
+                 _fee_date(r['due_date']), r['label'],
+                 r['paid_at'].strftime('%d-%m-%Y %H:%M') if (r['is_paid'] and r['paid_at']) else '-']
+                for i, r in enumerate(rows, start=1)]
+        return {"headers": ["#", "Enrollment", "Name", "Div", "Fee Item", "Amount (Rs.)", "Due Date", "Status", "Marked paid on"],
+                "data": data, "money": [5], "status_col": 7, "wrap": [2, 4],
+                "xlsx_widths": [6, 16, 28, 6, 24, 14, 13, 10, 18], "pdf_widths": [11, 28, 62, 12, 48, 26, 26, 22, 34],
+                "total": sum(r['amount'] for r in rows), "paid": sum(r['amount'] for r in rows if r['is_paid'])}
+    data = [[i, s['enrollment'], s['name'], s['division'] or '-', s['unpaid_items'], s['pending'],
+             _fee_date(s['earliest_due']), s['days_overdue'] if s['days_overdue'] else '-', s['label']]
+            for i, s in enumerate(students, start=1)]
+    return {"headers": ["#", "Enrollment", "Name", "Div", "Unpaid Items", "Pending (Rs.)", "Earliest Due Date", "Days Overdue", "Status"],
+            "data": data, "money": [5], "status_col": 8, "wrap": [2],
+            "xlsx_widths": [6, 16, 30, 6, 13, 14, 17, 13, 10], "pdf_widths": [11, 28, 70, 12, 24, 32, 34, 28, 28],
+            "total": sum(s['total'] for s in students), "paid": sum(s['paid'] for s in students)}
+
+
+def _build_fee_xlsx(meta, tbl):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Fee Report"
+    ws.append(["Fee Report - " + meta['report']])
+    ws['A1'].font = Font(bold=True, size=14)
+    info = [("Batch", meta['batch']), ("Semester", meta['semester']), ("Division", meta['division']),
+            ("Fee item", meta['fee_item']), ("Status filter", meta['status']), ("Generated on", meta['generated'])]
+    for k, v in info:   # label and value in one cell, so the narrow first column never cuts the label
+        ws.append([f"{k}: {v}"])
+    ws.append([])
+    for text in meta['overview']:
+        ws.append([text])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    if meta.get('note'):
+        ws.append([meta['note']])
+        ws.cell(row=ws.max_row, column=1).font = Font(italic=True)
+    ws.append([])
+    ws.append(tbl['headers'])
+    head_row = ws.max_row
+    for cell in ws[head_row]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="0F766E")
+    red = Font(color="C00000", bold=True)
+    for row in tbl['data']:
+        ws.append(row)
+        for c in tbl['money']:
+            ws.cell(row=ws.max_row, column=c + 1).number_format = '#,##0.00'
+        if row[tbl['status_col']] == 'Overdue':
+            ws.cell(row=ws.max_row, column=tbl['status_col'] + 1).font = red
+    ws.append([])
+    for text in meta['totals']:
+        ws.append([text])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    for idx, w in enumerate(tbl['xlsx_widths'], start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+    ws.freeze_panes = ws.cell(row=head_row + 1, column=1)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _build_fee_pdf(meta, tbl):
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="Fee Report")
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle('feecell', parent=styles['Normal'], fontSize=9, leading=11)
+    story = [Paragraph("Fee Report - " + escape(meta['report']), styles['Title'])]
+    info = (
+        f"<b>Batch:</b> {escape(str(meta['batch']))} &nbsp;&nbsp; <b>Semester:</b> {escape(str(meta['semester']))} &nbsp;&nbsp; "
+        f"<b>Division:</b> {escape(str(meta['division']))}<br/>"
+        f"<b>Fee item:</b> {escape(meta['fee_item'])} &nbsp;&nbsp; <b>Status filter:</b> {escape(meta['status'])}<br/>"
+        f"<b>Generated on:</b> {escape(meta['generated'])}<br/><br/>"
+        + "<br/>".join(f"<b>{escape(t)}</b>" for t in meta['overview'])
+    )
+    if meta.get('note'):
+        info += f"<br/><i>{escape(meta['note'])}</i>"
+    story.append(Paragraph(info, styles['Normal']))
+    story.append(Spacer(1, 5 * mm))
+
+    wrap = set(tbl['wrap'])
+    data = [tbl['headers']]
+    red_cells = []
+    for i, row in enumerate(tbl['data'], start=1):
+        out = []
+        for c, v in enumerate(row):
+            if c in tbl['money']:
+                out.append(f"{float(v):,.2f}")
+            elif c in wrap:
+                out.append(Paragraph(escape(str(v)), cell_style))
+            else:
+                out.append(str(v))
+        data.append(out)
+        if row[tbl['status_col']] == 'Overdue':
+            red_cells.append((tbl['status_col'], i))
+    table = Table(data, repeatRows=1, colWidths=[w * mm for w in tbl['pdf_widths']])
+    style = [
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5d1')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f1f7f5')]),
+        ('ALIGN', (3, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]
+    for col, i in red_cells:
+        style.append(('TEXTCOLOR', (col, i), (col, i), colors.HexColor('#C00000')))
+        style.append(('FONTNAME', (col, i), (col, i), 'Helvetica-Bold'))
+    table.setStyle(TableStyle(style))
+    story.append(table)
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph("<br/>".join(f"<b>{escape(t)}</b>" for t in meta['totals']), styles['Normal']))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+def fee_report_params_error(semester, academic_year, report, status, fmt):
+    """Returns None when the request parameters are fine, otherwise (message, http_status)."""
+    if not semester or not academic_year:
+        return "Batch and semester are required", 400
+    if fmt not in ('xlsx', 'pdf'):
+        return "format must be xlsx or pdf", 400
+    if report not in _FEE_REPORT_LABELS:
+        return "report must be summary, detail or defaulters", 400
+    if status not in _FEE_STATUS_LABELS:
+        return "status must be all, paid, unpaid or overdue", 400
+    if fmt == 'pdf':
+        try:
+            import reportlab   # noqa: F401  (only checking that it is installed)
+        except ImportError:
+            return "PDF export needs the 'reportlab' package on the server. Run: pip install reportlab", 500
+    return None
+
+
+def build_fee_report(all_rows, semester, academic_year, division, fee_title, status, report, fmt):
+    """all_rows = every fee row of the class (one row per student per fee), already limited to the class the
+    caller is allowed to see. Returns (True, (buffer, filename, mimetype)) or (False, (message, http_status))."""
+    if not all_rows:
+        return False, ("No fee records found for this class. Admin has not added fees for it yet.", 404)
+
+    today = datetime.now().date()
+    rows = _fee_prepare(all_rows, today)
+    if fee_title:
+        rows = [r for r in rows if r['fee_title'] == fee_title]
+        if not rows:
+            return False, ("No fee records found for the selected fee item.", 404)
+
+    # Class overview = every student of the class (fee item filter applied, status filter NOT applied)
+    class_students = _fee_student_rows(rows, today)
+    ov_total = sum(s['total'] for s in class_students)
+    ov_paid = sum(s['paid'] for s in class_students)
+    ov_defaulters = sum(1 for s in class_students if s['unpaid_items'] > 0)
+    ov_overdue = sum(1 for s in class_students if s['overdue_items'] > 0)
+
+    # Apply the status filter and sorting for the chosen report type
+    students = []
+    shown_rows = []
+    if report == 'detail':
+        if status == 'paid':
+            shown_rows = [r for r in rows if r['is_paid']]
+        elif status == 'unpaid':
+            shown_rows = [r for r in rows if not r['is_paid']]
+        elif status == 'overdue':
+            shown_rows = [r for r in rows if r['is_overdue']]
+        else:
+            shown_rows = list(rows)
+        shown_rows.sort(key=lambda r: (str(r['enrollment']), r['due_date'] or datetime.max.date(), r['fee_title']))
+    elif report == 'summary':
+        students = class_students
+        if status == 'paid':
+            students = [s for s in students if s['unpaid_items'] == 0]
+        elif status == 'unpaid':
+            students = [s for s in students if s['unpaid_items'] > 0]
+        elif status == 'overdue':
+            students = [s for s in students if s['overdue_items'] > 0]
+        students.sort(key=lambda s: str(s['enrollment']))
+    else:   # defaulters: only students with something unpaid, in enrollment order (status filter is not used here)
+        students = [s for s in class_students if s['unpaid_items'] > 0]
+        students.sort(key=lambda s: str(s['enrollment']))
+
+    if (report == 'detail' and not shown_rows) or (report != 'detail' and not students):
+        msg = ("No defaulters found for this class - every selected fee is paid."
+               if report == 'defaulters' else "No records match the selected filters.")
+        return False, (msg, 404)
+
+    tbl = _fee_build_table(report, shown_rows, students, today)
+    shown_pending = tbl['total'] - tbl['paid']
+    meta = {
+        "report": _FEE_REPORT_LABELS[report],
+        "batch": academic_year,
+        "semester": semester,
+        "division": division or "All",
+        "fee_item": fee_title or "All fee items",
+        "status": "Not used (defaulters only)" if report == 'defaulters' else _FEE_STATUS_LABELS[status],
+        "generated": datetime.now().strftime('%d-%m-%Y %H:%M'),
+        "overview": [
+            f"Class overview: {len(class_students)} students, {len(rows)} fee records",
+            f"Collected {_fee_rs(ov_paid)} of {_fee_rs(ov_total)} ({_fee_pct(ov_paid, ov_total)}%)   "
+            f"Pending {_fee_rs(ov_total - ov_paid)}   Defaulters {ov_defaulters} (overdue: {ov_overdue})",
+        ],
+        "totals": [
+            "TOTAL (rows shown)",
+            f"Total fee: {_fee_rs(tbl['total'])}",
+            f"Collected: {_fee_rs(tbl['paid'])}",
+            f"Pending: {_fee_rs(shown_pending)}",
+            f"% collected: {_fee_pct(tbl['paid'], tbl['total'])}%",
+        ],
+        "note": ("Marked paid on = the day the status was set to Paid in the system (not the bank payment date). "
+                 "Overdue = unpaid and due date has passed.") if report == 'detail' else
+                "Overdue = unpaid and due date has passed.",
+    }
+    base = secure_filename(
+        f"fees_{report}_sem{semester}_{academic_year}" + (f"_div{division}" if division else "")
+    ) or "fee_report"
+
+    if fmt == 'pdf':
+        return True, (_build_fee_pdf(meta, tbl), base + ".pdf", 'application/pdf')
+    return True, (_build_fee_xlsx(meta, tbl), base + ".xlsx",
+                  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+@app.route('/api/admin/reports/fees', methods=['GET'])
+@admin_required
+def report_fees():
+    """Fee Report for any class. Query params: semester, academic_year (required), division (optional),
+    fee_title (optional), status ('all' | 'paid' | 'unpaid' | 'overdue'),
+    report ('summary' | 'detail' | 'defaulters'), format ('xlsx' | 'pdf').
+    Same report as the faculty panel (shared code just above); view-only."""
+    semester = request.args.get('semester', type=int)
+    academic_year = (request.args.get('academic_year') or '').strip()
+    division = (request.args.get('division') or '').strip()
+    fee_title = (request.args.get('fee_title') or '').strip()
+    status = (request.args.get('status') or 'all').strip().lower()
+    report = (request.args.get('report') or 'summary').strip().lower()
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+
+    err = fee_report_params_error(semester, academic_year, report, status, fmt)
+    if err:
+        return jsonify({"message": err[0]}), err[1]
+
+    query = """
+        SELECT f.id AS fee_id, st.id AS student_id, u.login_id AS enrollment, u.name, st.division,
+               f.fee_title, f.amount, f.due_date, f.status, f.paid_at
+        FROM fees f
+        JOIN students st ON st.id = f.student_id
+        JOIN users u ON u.id = st.user_id
+        WHERE f.semester = %s AND f.academic_year = %s
+    """
+    params = [semester, academic_year]
+    if division:
+        query += " AND st.division = %s"
+        params.append(division)
+    query += " ORDER BY u.login_id, f.due_date, f.fee_title"
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(query, tuple(params))
+        all_rows = cursor.fetchall()
+    except Exception as e:
+        return jsonify({"message": "Report could not be generated", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    ok, out = build_fee_report(all_rows, semester, academic_year, division, fee_title, status, report, fmt)
+    if not ok:
+        return jsonify({"message": out[0]}), out[1]
+    buffer, filename, mimetype = out
+    return send_file(buffer, as_attachment=True, download_name=filename, mimetype=mimetype)
 
 
 @app.route('/api/admin/reports/login-activity/excel', methods=['GET'])

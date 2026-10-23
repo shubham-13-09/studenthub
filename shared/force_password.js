@@ -18,7 +18,7 @@
   if (!role) return;
 
   var FLAG = 'must_change_password_' + role;
-  var API = 'http://localhost:5000/api';
+  var API = window.APP_CONFIG.API_BASE;   // set in shared/config.js
   var shown = false;
   var rawFetch = window.fetch.bind(window);
 
@@ -131,7 +131,7 @@
     // brand row: logo (same file every panel already has) + small badge
     var brand = el('div', 'fp-brand');
     var logo = document.createElement('img');
-    logo.src = 'studenthub.png';
+    logo.src = '../assets/studenthub.png';
     logo.alt = 'StudentHub';
     logo.onerror = function () { logo.style.display = 'none'; };
     brand.appendChild(logo);

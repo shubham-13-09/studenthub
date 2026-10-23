@@ -28,7 +28,7 @@ async function handleLogin(e) {
   const pass = document.getElementById('li_password').value;
 
   try {
-    const res = await fetch('http://localhost:5000/api/login', {
+    const res = await fetch(window.APP_CONFIG.API_BASE + '/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ loginId: idVal, password: pass })
@@ -84,7 +84,7 @@ async function sendOtp() {
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
 
   try {
-    const res = await fetch('http://localhost:5000/api/forgot-password/send-otp', {
+    const res = await fetch(window.APP_CONFIG.API_BASE + '/forgot-password/send-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enrollment: enroll, email: email })
@@ -114,7 +114,7 @@ async function verifyOtp() {
   }
 
   try {
-    const res = await fetch('http://localhost:5000/api/forgot-password/verify-otp', {
+    const res = await fetch(window.APP_CONFIG.API_BASE + '/forgot-password/verify-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enrollment: fg_enrollment, otp: otp })
@@ -144,7 +144,7 @@ async function updatePassword() {
   if (!valid) return;
 
   try {
-    const res = await fetch('http://localhost:5000/api/forgot-password/reset-password', {
+    const res = await fetch(window.APP_CONFIG.API_BASE + '/forgot-password/reset-password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enrollment: fg_enrollment, password: pass })

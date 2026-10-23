@@ -831,3 +831,37 @@ body {
     font-size: 13px;
   }
 }
+/* ===== StudentHub Login / Registration: polish and accessibility ===== */
+html { scroll-behavior: smooth; }
+body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+button, input, select, textarea { font: inherit; }
+:where(input, select, textarea) { max-width: 100%; transition: border-color .18s ease, box-shadow .18s ease, background-color .18s ease; }
+:where(input, select, textarea):focus-visible {
+  outline: 3px solid rgba(19, 122, 94, .22);
+  outline-offset: 2px;
+  border-color: var(--teal-600, #137a5e);
+  box-shadow: 0 0 0 3px rgba(19, 122, 94, .12);
+}
+:where(button, .btn, [type="submit"], a) { -webkit-tap-highlight-color: transparent; }
+:where(button, .btn, [type="submit"]) { transition: transform .16s ease, box-shadow .16s ease, background-color .16s ease; }
+:where(button, .btn, [type="submit"]):active { transform: translateY(1px); }
+img, svg { max-width: 100%; }
+@media (max-width: 640px) {
+  :where(.container, .login-container, .register-container, .auth-card, .login-card, .form-card) { width: min(100% - 24px, 520px); }
+  :where(input, select, textarea) { min-width: 0; }
+  :where(button, .btn, [type="submit"]) { min-height: 42px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+
+/* Keep auth layouts usable on narrow screens without changing their structure. */
+html, body { min-width: 0; }
+img, svg { max-width: 100%; }
+input, select, textarea { min-width: 0; }
+:where(.login-card, .register-card, .auth-card, .form-card) { min-width: 0; }
+@media (max-width: 480px) {
+  :where(.btn-row, .form-actions, .button-row) { flex-wrap: wrap; }
+  :where(.btn-row button, .form-actions button, .button-row button) { max-width: 100%; }
+}

@@ -3,7 +3,7 @@ if(!sessionStorage.getItem('token_student')){
 }
 
 // ---- API helpers ----
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = window.APP_CONFIG.API_BASE;   // set in ../shared/config.js
 
 async function apiRequest(path, options = {}){
   const res = await fetch(API_BASE + path, {
@@ -843,6 +843,7 @@ async function loadStudentFees(silent){
     if(!stChanged('fees', data)) return;
     const fees = data.fees || [];
     updatePendingFeeStat(fees);
+    renderStudentFeeChart(fees);
     if(!tbody) return;
     if(!fees.length){
       tbody.innerHTML = '<tr><td colspan="6">No fee records found yet.</td></tr>';
@@ -891,6 +892,42 @@ function updatePendingFeeStat(fees){
   if(statusEl){ statusEl.textContent = 'Pending'; statusEl.className = 'pill bad'; }
 }
 
+// ---- Dashboard charts (drawn by shared/charts.js, using the same data as the Attendance / Results / Fees pages) ----
+// Fee status donut: paid vs pending fee records
+function renderStudentFeeChart(fees){
+  if(!window.SHCharts) return;
+  const rupees = n => '₹' + Number(n || 0).toLocaleString('en-IN');
+  const paid = fees.filter(f => f.status === 'paid');
+  const pending = fees.filter(f => f.status !== 'paid');
+  const sum = list => list.reduce((s, f) => s + (Number(f.amount) || 0), 0);
+  SHCharts.donut(document.getElementById('stuFeeChart'), [
+    { label: 'Paid',    value: paid.length,    color: SHCharts.colors.good, text: `${paid.length} · ${rupees(sum(paid))}` },
+    { label: 'Pending', value: pending.length, color: SHCharts.colors.warn, text: `${pending.length} · ${rupees(sum(pending))}` }
+  ], { center: fees.length ? `${paid.length}/${fees.length}` : '', sub: 'fees paid', label: 'Fees paid versus pending', empty: 'No fee records found yet.' });
+}
+
+// Attendance bars per subject, with the 75% line (subjects with no attendance marked yet are left out)
+function renderStudentAttendanceChart(subjects){
+  if(!window.SHCharts) return;
+  SHCharts.columns(document.getElementById('stuAttendanceChart'),
+    subjects.filter(s => s.total_classes > 0).map(s => ({
+      label: s.subject_name, value: s.percentage,
+      title: `${s.subject_name} (${s.attended_classes}/${s.total_classes} classes)`
+    })),
+    { max: 100, unit: '%', threshold: 75, label: 'Attendance percentage by subject', empty: 'No attendance has been recorded for your class yet.' });
+}
+
+// Marks bars per subject (published marks only), with the passing-percentage line
+function renderStudentMarksChart(subjects, passingPct){
+  if(!window.SHCharts) return;
+  const pass = Number(passingPct) || 40;
+  SHCharts.columns(document.getElementById('stuMarksChart'),
+    subjects.filter(s => s.percentage != null).map(s => ({
+      label: s.subject_name, value: s.percentage, title: s.subject_name
+    })),
+    { max: 100, unit: '%', threshold: pass, thresholdLabel: `Pass ${pass}%`, label: 'Marks percentage by subject', empty: 'Marks have not been published yet.' });
+}
+
 // works by id only (so onclick doesn't break when the title/filename has quotes/apostrophes)
 async function downloadStudentAssignment(id){
   const assignment = stAssignmentsData.find(x => x.id === id);
@@ -930,29 +967,74 @@ function stAttendanceStatus(pct){
   return { label: 'Excellent', cls: 'good' };
 }
 
+let stAttendanceLast = null;   // last attendance response — kept so the alert can be redrawn when the Settings toggle changes
+
 async function loadStudentAttendance(silent){
   try{
     const data = await apiRequest('/student/attendance');
     if(!stChanged('attendance', data)) return;
+    stAttendanceLast = data;
     renderStudentAttendance(data.subjects || []);
+    renderAttendanceAlert(data);
     renderAttendanceDashboardStat(data.overall_percentage || 0);
+    renderStudentAttendanceChart(data.subjects || []);
   }catch(err){
     if(silent) return;
     const tbody = document.getElementById('attendanceTableBody');
-    if(tbody) tbody.innerHTML = `<tr><td colspan="5">Attendance could not be loaded: ${escapeHtml(err.message)}</td></tr>`;
+    if(tbody) tbody.innerHTML = `<tr><td colspan="6">Attendance could not be loaded: ${escapeHtml(err.message)}</td></tr>`;
   }
+}
+
+// Attendance shortage alert: a red box (dashboard + attendance page) listing every subject that is below the
+// minimum %, with how many lectures must be attended to get back. Controlled by Settings > Attendance alerts.
+function stAttendanceAlertOn(){
+  return localStorage.getItem('stuAttendanceAlert') !== '0';   // default ON, same rule as the Settings toggle
+}
+
+function renderAttendanceAlert(data){
+  const dash = document.getElementById('attendanceAlertDash');
+  const page = document.getElementById('attendanceAlertPage');
+  if(!dash && !page) return;
+  const low = ((data && data.subjects) || []).filter(s => s.alert);
+  if(!low.length || !stAttendanceAlertOn()){
+    if(dash) dash.innerHTML = '';
+    if(page) page.innerHTML = '';
+    return;
+  }
+  const min = data.min_percentage || 75;
+  const items = low.map(s => `
+    <li><b>${escapeHtml(s.subject_name)}</b> — ${s.percentage_exact}% · attend the next ${s.need_more} lecture${s.need_more === 1 ? '' : 's'} to reach ${min}%</li>
+  `).join('');
+  const box = withLink => `
+    <div class="att-alert" role="alert">
+      <div class="att-alert-ic">⚠️</div>
+      <div>
+        <div class="att-alert-title">Attendance shortage in ${low.length} subject${low.length === 1 ? '' : 's'}</div>
+        <div class="att-alert-sub">Below ${min}% you may not be eligible for the exam. Attend every lecture of these subjects:</div>
+        <ul>${items}</ul>
+        ${withLink ? `<span class="att-alert-link" onclick="switchView('attendance')">View attendance details →</span>` : ''}
+      </div>
+    </div>`;
+  if(dash) dash.innerHTML = box(true);
+  if(page) page.innerHTML = box(false);
 }
 
 function renderStudentAttendance(subjects){
   const tbody = document.getElementById('attendanceTableBody');
   if(!tbody) return;
   if(!subjects.length){
-    tbody.innerHTML = '<tr><td colspan="5">No attendance has been recorded for your class yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">No attendance has been recorded for your class yet.</td></tr>';
     return;
   }
 
   tbody.innerHTML = subjects.map(s => {
     const status = stAttendanceStatus(s.percentage);
+    let stay = '<span class="att-ok">—</span>';
+    if(s.total_classes > 0){
+      if(s.short) stay = `<span class="att-need">Attend next ${s.need_more} lecture${s.need_more === 1 ? '' : 's'}</span>`;
+      else if(s.can_miss > 0) stay = `<span class="att-ok">Can miss ${s.can_miss} more</span>`;
+      else stay = '<span class="att-ok">No spare lectures</span>';
+    }
     return `
       <tr>
         <td>${escapeHtml(s.subject_name)}</td>
@@ -960,6 +1042,7 @@ function renderStudentAttendance(subjects){
         <td>${s.attended_classes}</td>
         <td>${s.percentage}%</td>
         <td><span class="pill ${status.cls}">${status.label}</span></td>
+        <td>${stay}</td>
       </tr>
     `;
   }).join('');
@@ -1001,6 +1084,7 @@ async function loadStudentResults(silent){
     const data = await apiRequest('/student/results');
     if(!stChanged('results', data)) return;
     renderStudentResults(data.subjects || [], data.passing_percentage);
+    renderStudentMarksChart(data.subjects || [], data.passing_percentage);
   }catch(err){
     if(silent) return;
     if(tbody) tbody.innerHTML = `<tr><td colspan="5">Results could not be loaded: ${escapeHtml(err.message)}</td></tr>`;
@@ -1084,7 +1168,7 @@ function stNoticeScope(n){
 // Same as Admin/Faculty's nfFileChip — 📎 icon + filename + size, click to download
 function stNoticeFileChip(n){
   if(!n.file_name) return '';
-  return `<div class="nf-file" onclick="stNoticeAction('download', ${n.id})" title="Download">📎 <span class="nf-file-name">${escapeHtml(n.file_name)}</span>${n.file_size ? ` <small>${nfFileSize(n.file_size)}</small>` : ''}</div>`;
+  return nfAttachmentHtml(n, `stNoticeAction('preview', ${n.id})`, `stNoticeAction('download', ${n.id})`);
 }
 
 // The card's buttons work by id (so the onclick attribute doesn't break when the
@@ -1093,6 +1177,7 @@ function stNoticeAction(action, id){
   const n = stNoticesData.find(x => x.id === id);
   if(!n) return;
   if(action === 'download') downloadStudentNotice(id, n.file_name);
+  else if(action === 'preview') nfOpenPreview(id, n.file_name);
 }
 
 // Who sent the notice — "Prof. Name" for faculty, "Name" + Admin label for admin
@@ -1300,6 +1385,204 @@ async function pollStudentNotices(){
   }
 }
 // (notices ka polling ab neeche stBackgroundRefresh ke andar hota hai)
+
+// ============================================================
+// NOTICE ATTACHMENT PREVIEW (WhatsApp-style)
+// Image (jpg/png) -> shown inline in the notice card, click = full-screen view
+// PDF             -> card with a Preview button (opens in a viewer popup) + Download
+// Word / PowerPoint -> a browser cannot display these, so they stay download-only
+// Files are fetched with the login token and shown through blob URLs (an <img src>
+// cannot send the Authorization header). Images load lazily when the card scrolls
+// into view, and every loaded image is cached so the 5-sec refresh doesn't reload it.
+// ============================================================
+const NF_TOKEN_KEY = 'token_student';
+const NF_ENDPOINT = '/student/notices';
+const NF_ESC = s => escapeHtml(s);
+const nfMediaUrls = new Map();       // notice id -> blob URL (loaded image)
+const nfMediaPromises = new Map();   // notice id -> in-flight fetch (so it's never fetched twice)
+let nfViewerUrl = null;
+
+function nfFileExt(name){
+  return (name || '').split('.').pop().toLowerCase();
+}
+
+function nfFileKind(name){
+  const ext = nfFileExt(name);
+  if(['jpg', 'jpeg', 'png'].includes(ext)) return 'image';
+  if(ext === 'pdf') return 'pdf';
+  return 'file';
+}
+
+function nfFileIcon(name){
+  const ext = nfFileExt(name);
+  if(ext === 'pdf') return '📕';
+  if(ext === 'doc' || ext === 'docx') return '📝';
+  if(ext === 'ppt' || ext === 'pptx') return '📊';
+  return '📎';
+}
+
+async function nfFetchFile(id){
+  const res = await fetch(`${API_BASE}${NF_ENDPOINT}/${id}/download?inline=1`, {
+    headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem(NF_TOKEN_KEY) }
+  });
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  return res.blob();
+}
+
+function nfImageUrl(id){
+  if(nfMediaUrls.has(id)) return Promise.resolve(nfMediaUrls.get(id));
+  if(nfMediaPromises.has(id)) return nfMediaPromises.get(id);
+  const p = nfFetchFile(id).then(blob => {
+    const url = URL.createObjectURL(blob);
+    nfMediaUrls.set(id, url);
+    nfMediaPromises.delete(id);
+    return url;
+  }).catch(err => {
+    nfMediaPromises.delete(id);
+    throw err;
+  });
+  nfMediaPromises.set(id, p);
+  return p;
+}
+
+// What a notice's attachment looks like inside the card
+function nfAttachmentHtml(n, previewCode, downloadCode){
+  const name = n.file_name || 'attachment';
+  const kind = nfFileKind(name);
+  const size = n.file_size ? nfFileSize(n.file_size) : '';
+
+  if(kind === 'image'){
+    const cached = nfMediaUrls.get(n.id);
+    return `
+      <div class="nf-media${cached ? ' loaded' : ''}" data-nf-id="${n.id}" onclick="${previewCode}" title="Click to view">
+        <img alt="${NF_ESC(name)}"${cached ? ` src="${cached}"` : ''}>
+        <span class="nf-media-state">Loading image…</span>
+      </div>
+      <div class="nf-media-cap">
+        <span class="nf-file-name">${NF_ESC(name)}</span>${size ? `<small>${size}</small>` : ''}
+        <button type="button" class="nf-doc-dl" onclick="${downloadCode}" title="Download">⬇</button>
+      </div>`;
+  }
+
+  const isPdf = kind === 'pdf';
+  const typeLabel = isPdf ? 'PDF' : (nfFileExt(name) || 'file').toUpperCase();
+  return `
+    <div class="nf-doc">
+      <div class="nf-doc-main" onclick="${isPdf ? previewCode : downloadCode}" title="${isPdf ? 'Preview' : 'Download'}">
+        <span class="nf-doc-ico">${nfFileIcon(name)}</span>
+        <span class="nf-doc-info">
+          <span class="nf-file-name">${NF_ESC(name)}</span>
+          <small>${typeLabel}${size ? ' · ' + size : ''}${isPdf ? ' · tap to preview' : ''}</small>
+        </span>
+      </div>
+      <button type="button" class="nf-doc-dl" onclick="${downloadCode}" title="Download">⬇</button>
+    </div>`;
+}
+
+// ---- lazy-load the inline images ----
+async function nfLoadMedia(el){
+  if(el.dataset.state === 'loading' || el.dataset.state === 'done') return;
+  el.dataset.state = 'loading';
+  try{
+    const url = await nfImageUrl(Number(el.dataset.nfId));
+    const img = el.querySelector('img');
+    if(img) img.src = url;
+    el.dataset.state = 'done';
+    el.classList.add('loaded');
+  }catch(err){
+    el.dataset.state = 'error';
+    const msg = el.querySelector('.nf-media-state');
+    if(msg) msg.textContent = 'Image could not be loaded — click to retry';
+  }
+}
+
+const nfMediaObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(entries => {
+      entries.forEach(en => {
+        if(en.isIntersecting){
+          nfMediaObserver.unobserve(en.target);
+          nfLoadMedia(en.target);
+        }
+      });
+    }, { rootMargin: '200px' })
+  : null;
+
+function nfScanMedia(){
+  document.querySelectorAll('.nf-media:not([data-state])').forEach(el => {
+    if(el.classList.contains('loaded')){ el.dataset.state = 'done'; return; }
+    el.dataset.state = 'pending';
+    if(nfMediaObserver) nfMediaObserver.observe(el); else nfLoadMedia(el);
+  });
+}
+
+// The feeds re-render with innerHTML from several places (polling, filters, pin/edit...),
+// so instead of patching every render function we just watch for new .nf-media boxes.
+(function nfWatchMedia(){
+  let queued = false;
+  const start = () => {
+    new MutationObserver(() => {
+      if(queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; nfScanMedia(); });
+    }).observe(document.body, { childList: true, subtree: true });
+    nfScanMedia();
+  };
+  if(document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+})();
+
+// ---- full-screen viewer (image) / popup viewer (PDF) ----
+function nfCloseViewer(){
+  const v = document.getElementById('nfViewer');
+  if(v) v.remove();
+  if(nfViewerUrl){ URL.revokeObjectURL(nfViewerUrl); nfViewerUrl = null; }
+  document.removeEventListener('keydown', nfViewerKey);
+}
+
+function nfViewerKey(e){
+  if(e.key === 'Escape') nfCloseViewer();
+}
+
+async function nfOpenPreview(id, fileName){
+  const kind = nfFileKind(fileName);
+  if(kind === 'file'){ downloadStudentNotice(id, fileName); return; }
+
+  nfCloseViewer();
+  const v = document.createElement('div');
+  v.id = 'nfViewer';
+  v.className = 'nf-viewer';
+  v.innerHTML = `
+    <div class="nf-viewer-bar">
+      <span class="nf-viewer-title">${NF_ESC(fileName)}</span>
+      <button type="button" class="nf-viewer-btn" id="nfViewerDl">⬇ Download</button>
+      <button type="button" class="nf-viewer-btn" id="nfViewerClose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="nf-viewer-body" id="nfViewerBody"><div class="nf-viewer-msg">Loading…</div></div>`;
+  v.addEventListener('click', e => { if(e.target === v || e.target.id === 'nfViewerBody') nfCloseViewer(); });
+  document.body.appendChild(v);
+  document.addEventListener('keydown', nfViewerKey);
+  document.getElementById('nfViewerClose').onclick = nfCloseViewer;
+  document.getElementById('nfViewerDl').onclick = () => downloadStudentNotice(id, fileName);
+
+  try{
+    let url;
+    if(kind === 'image'){
+      url = await nfImageUrl(id);
+    }else{
+      const blob = await nfFetchFile(id);
+      url = URL.createObjectURL(blob);
+      if(!document.getElementById('nfViewer')){ URL.revokeObjectURL(url); return; }   // closed while loading
+      nfViewerUrl = url;
+    }
+    const body = document.getElementById('nfViewerBody');
+    if(!body) return;
+    body.innerHTML = kind === 'image'
+      ? `<img src="${url}" alt="${NF_ESC(fileName)}">`
+      : `<iframe src="${url}" title="${NF_ESC(fileName)}"></iframe>`;
+  }catch(err){
+    const body = document.getElementById('nfViewerBody');
+    if(body) body.innerHTML = '<div class="nf-viewer-msg">Preview is not available — please use Download.</div>';
+  }
+}
 
 async function downloadStudentNotice(id, fileName){
   try{
@@ -1686,6 +1969,7 @@ function toggleAttendanceAlert(){
   const t = document.getElementById('settingsAttendanceAlert');
   if(!t) return;
   localStorage.setItem('stuAttendanceAlert', t.checked ? '1' : '0');
+  if(stAttendanceLast) renderAttendanceAlert(stAttendanceLast);   // show / hide the alert right away
 }
 
 document.addEventListener('DOMContentLoaded', function(){

@@ -104,7 +104,7 @@ async function handleRegister(e){
   submitBtn.textContent = 'Registering…';
 
   try {
-    const res = await fetch('http://localhost:5000/api/register', {
+    const res = await fetch(window.APP_CONFIG.API_BASE + '/register', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
@@ -134,7 +134,7 @@ async function loadRegisterYears(){
   const sel = document.getElementById('rg_year');
   if(!sel) return;
   try{
-    const res = await fetch('http://localhost:5000/api/academic-years');
+    const res = await fetch(window.APP_CONFIG.API_BASE + '/academic-years');
     if(!res.ok) return;
     const labels = await res.json();
     if(!Array.isArray(labels) || labels.length === 0) return;

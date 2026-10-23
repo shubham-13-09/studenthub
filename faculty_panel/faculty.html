@@ -16,7 +16,7 @@
   <!-- SIDEBAR -->
   <aside class="sidebar">
     <div class="brand-card">
-      <div class="brand-card-ic"><img src="studenthub.png" alt=""></div>
+      <div class="brand-card-ic"><img src="../assets/studenthub.png" alt=""></div>
       <div>
         <div class="brand-card-top">StudentHub</div>
         <div class="brand-card-bottom">Faculty Panel</div>
@@ -194,6 +194,17 @@
           </div>
         </div>
 
+        <div class="sh-chart-grid">
+          <div class="card">
+            <div class="card-head"><div class="card-title">Attendance by class</div></div>
+            <div id="facAttendanceChart"><div class="sh-empty">Loading…</div></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><div class="card-title">Assignment submissions</div></div>
+            <div id="facSubmissionChart"><div class="sh-empty">Loading…</div></div>
+          </div>
+        </div>
+
         <div class="card" id="dashCancelledCard">
           <div class="card-head">
             <div class="card-title">Cancelled lectures</div>
@@ -295,6 +306,56 @@
       <div class="view" id="view-students">
         <div class="card-head" style="margin-bottom:16px;">
           <div class="card-title" style="font-size:20px;">Students</div>
+          <button class="btn-save" onclick="openFacultyAddStudent()">+ Add student</button>
+        </div>
+
+        <div class="card form-card hidden" id="facAddStudentForm" style="margin-bottom:16px;">
+          <div class="card-title" style="margin-bottom:16px;">Add student</div>
+          <div class="form-grid">
+            <div class="field"><label>Full name</label><input type="text" id="facStuName" placeholder="Enter full name"></div>
+            <div class="field"><label>Enrollment number</label><input type="text" id="facStuEnrollment" placeholder="12 digit number"></div>
+            <div class="field"><label>Email ID</label><input type="email" id="facStuEmail" placeholder="you@gmail.com"></div>
+            <div class="field"><label>Mobile number</label><input type="text" id="facStuMobile" maxlength="10" placeholder="10 digit number"></div>
+            <div class="field"><label>WhatsApp number <span style="font-weight:400; color:var(--muted);">(optional)</span></label><input type="text" id="facStuWhatsapp" placeholder="e.g. 91XXXXXXXXXX"></div>
+            <div class="field"><label>Department</label><select id="facStuDept">
+                <option value="Computer Engineering">Computer Engineering</option>
+              </select></div>
+            <div class="field"><label>Semester</label><select id="facStuSem">
+                <option value="" selected disabled>Select semester</option>
+                <option>1</option>
+                <option>2</option>
+                <option>3</option>
+                <option>4</option>
+                <option>5</option>
+                <option>6</option>
+              </select></div>
+            <div class="field"><label>Division</label><select id="facStuDiv">
+                <option value="" selected disabled>Select division</option>
+                <option value="A">A</option>
+                <option value="B">B</option>
+              </select></div>
+            <div class="field"><label>Batch (Academic Year)</label><select id="facStuBatch">
+                <option value="" selected disabled>Select batch</option>
+                <option value="2024-25">2024 - 2025</option>
+                <option value="2025-26">2025 - 2026</option>
+                <option value="2026-27">2026 - 2027</option>
+              </select></div>
+          </div>
+
+          <div class="card-title" style="margin:20px 0 16px;font-size:14px;">Parent / Guardian details</div>
+          <div class="form-grid">
+            <div class="field"><label>Father's name <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="facStuFatherName" placeholder="Enter father's name"></div>
+            <div class="field"><label>Father's mobile number <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="facStuFatherMobile" maxlength="10" placeholder="10 digit number"></div>
+            <div class="field"><label>Mother's name <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="facStuMotherName" placeholder="Enter mother's name"></div>
+            <div class="field"><label>Mother's mobile number <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="facStuMotherMobile" maxlength="10" placeholder="10 digit number"></div>
+            <div class="field"><label>Parent's email ID <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="email" id="facStuParentEmail" placeholder="parent@gmail.com"></div>
+            <div class="field"><label>Home address <span style="font-weight:normal;color:var(--muted);">(optional)</span></label><input type="text" id="facStuParentAddress" placeholder="Enter home address"></div>
+          </div>
+
+          <div class="form-actions">
+            <button class="btn-ghost" onclick="closeFacultyAddStudent()">Cancel</button>
+            <button class="btn-save" id="facStuSaveBtn" onclick="saveFacultyStudent()">Save student</button>
+          </div>
         </div>
 
         <div class="class-selector">
@@ -776,6 +837,12 @@
             <span class="subject-card-sub">Exam-wise marks, pass/fail &amp; distribution - download Excel or PDF</span>
             <div class="subject-card-foot"><span>Generate report →</span></div>
           </div>
+          <div class="subject-card" style="cursor:pointer;" onclick="openFacultyReport('fees')">
+            <div class="subject-card-top"><span class="subj-tag mint">Fees</span></div>
+            <b>Fee Report</b>
+            <span class="subject-card-sub">Paid, pending &amp; overdue fees, defaulters - download Excel or PDF</span>
+            <div class="subject-card-foot"><span>Generate report →</span></div>
+          </div>
         </div>
 
         <!-- Attendance Report filters -->
@@ -907,6 +974,39 @@
             <button class="btn-ghost" onclick="downloadFacultyMarksReport('pdf')">⬇ Download PDF</button>
           </div>
         </div>
+
+        <!-- Fee Report filters (class-level: Batch -> Semester -> Division, same as the Fees screen) -->
+        <div class="card form-card hidden" id="facRepFeesPanel" style="margin-top:16px;">
+          <div class="card-title" style="margin-bottom:14px;">Fee Report filters</div>
+          <div class="form-grid">
+            <div class="field"><label>Batch</label>
+              <select id="facRepFeeBatch" onchange="onFacRepFeeBatchChange()"></select></div>
+            <div class="field"><label>Semester</label>
+              <select id="facRepFeeSem" onchange="onFacRepFeeSemChange()"><option value="">Select semester</option></select></div>
+            <div class="field"><label>Division</label>
+              <select id="facRepFeeDiv" onchange="loadFacRepFeeItems()"><option value="">All divisions</option></select></div>
+            <div class="field"><label>Fee item</label>
+              <select id="facRepFeeItem"><option value="">All fee items</option></select></div>
+            <div class="field"><label>Report type</label>
+              <select id="facRepFeeType" onchange="onFacRepFeeTypeChange()">
+                <option value="summary">Student-wise summary</option>
+                <option value="detail">Fee-wise detail</option>
+                <option value="defaulters">Defaulters (unpaid / overdue only)</option>
+              </select></div>
+            <div class="field"><label>Status</label>
+              <select id="facRepFeeStatus">
+                <option value="all">All</option>
+                <option value="paid">Paid</option>
+                <option value="unpaid">Unpaid (includes overdue)</option>
+                <option value="overdue">Overdue</option>
+              </select></div>
+          </div>
+          <div id="facRepFeeHint" style="font-size:13px; color:var(--muted); margin:2px 0 12px;"></div>
+          <div class="form-actions">
+            <button class="btn-save" onclick="downloadFacultyFeesReport('xlsx')">⬇ Download Excel</button>
+            <button class="btn-ghost" onclick="downloadFacultyFeesReport('pdf')">⬇ Download PDF</button>
+          </div>
+        </div>
       </div>
 
       <!-- ===== TIMETABLE ===== -->
@@ -957,58 +1057,62 @@
       <div class="view" id="view-notices">
         <div class="card-head" style="margin-bottom:16px;">
           <div class="card-title" style="font-size:20px;">Notices</div>
-          <button class="btn-save" onclick="openFacultyNoticeForm()">+ Post notice</button>
         </div>
 
-        <div class="card notice-form-card hidden" id="facNoticeFormCard">
-          <div class="card-head">
-            <div class="card-title" id="facNoticeFormTitle">Post a notice to your class</div>
-          </div>
-          <input type="hidden" id="facNoticeEditId">
-          <div class="form-grid" style="margin-bottom:14px;">
-            <div class="field"><label>Title</label><input type="text" id="facNoticeTitle" placeholder="Notice title"></div>
-            <div class="field">
-              <label>Class (your subject)</label>
-              <select id="facNoticeSubject" onchange="onFacNoticeSubjectChange()"></select>
-            </div>
-            <div class="field" id="facNoticeDivisionField" style="display:none;">
-              <label>Division (optional)</label>
-              <select id="facNoticeDivision"><option value="">All divisions</option></select>
-            </div>
-            <div class="field">
-              <label>Category</label>
-              <select id="facNoticeCategory">
-                <option value="Academic">Academic</option>
-                <option value="Event">Event</option>
-                <option value="Important">Important</option>
-              </select>
-            </div>
-            <div class="field" style="grid-column:1/-1;"><label>Message</label><input type="text" id="facNoticeMessage" placeholder="Notice details"></div>
-            <div class="field" id="facNoticeFileField"><label>Attachment (optional)</label><input type="file" id="facNoticeFile" accept=".pdf,.doc,.docx,.ppt,.pptx,.jpg,.jpeg,.png"></div>
-          </div>
-          <div class="form-actions">
-            <button class="btn-ghost" id="facNoticeCancelBtn" onclick="closeFacultyNoticeForm()">Cancel</button>
-            <button class="btn-save" id="facNoticeSaveBtn" onclick="saveFacultyNotice()">Post notice</button>
-          </div>
+        <!-- Chat list: one row per group (last notice + unread count), like the WhatsApp chat list -->
+        <div class="card nf-groups-card" id="facNoticeGroupsCard">
+          <div class="nf-group-list" id="facNoticeGroupList"></div>
         </div>
 
-        <div class="card" style="margin-top:16px;">
-          <div class="card-head"><div class="card-title">Notices you've posted</div></div>
-          <div class="notice-shell">
-            <div class="notice-feed-scroll" id="facultyPostedNoticesList">
-              <div class="notice-row" style="border-bottom:none;">Loading...</div>
-            </div>
-            <button class="scroll-bottom-btn hidden" id="facultyPostedScrollBtn" onclick="nfScrollToBottom('facultyPostedNoticesList')" title="Go to latest notices">↓</button>
+        <!-- Open group: its notices + the message bar (or a read-only note) -->
+        <div class="card hidden" id="facNoticeChatCard">
+          <div class="nf-chat-head">
+            <button type="button" class="nf-back-btn" onclick="closeFacNoticeGroup()" title="Back to groups">←</button>
+            <div class="nf-group-avatar" id="facNoticeChatAvatar"></div>
+            <div class="nf-chat-title"><div class="name" id="facNoticeChatName"></div><small id="facNoticeChatSub"></small></div>
           </div>
-        </div>
 
-        <div class="card" style="margin-top:16px;">
-          <div class="card-head"><div class="card-title">Notices for you</div></div>
-          <div class="notice-shell">
+          <div class="notice-shell has-composer">
             <div class="notice-feed-scroll" id="facultyNoticesList">
               <div class="notice-row" style="border-bottom:none;">Loading...</div>
             </div>
             <button class="scroll-bottom-btn hidden" id="facultyNoticesScrollBtn" onclick="nfScrollToBottom('facultyNoticesList')" title="Go to latest notices">↓</button>
+          </div>
+
+          <div class="nf-readonly-note hidden" id="facNoticeReadonly">🔒 Only admin can post in this group. You can read it here.</div>
+
+          <!-- WhatsApp-style message bar: type + send. Class/category "To:" line ke peeche -->
+          <div class="nf-composer" id="facNoticeComposer">
+            <input type="hidden" id="facNoticeEditId" value="">
+            <div class="nf-edit-banner hidden" id="facNoticeEditBanner">
+              <span id="facNoticeEditText">✎ Editing notice</span>
+              <button type="button" onclick="cancelFacultyNoticeEdit()" title="Cancel edit">✕</button>
+            </div>
+            <button type="button" class="nf-scope-line" id="facNoticeScopeLine" onclick="toggleFacNoticeOptions()" title="Change class or category">
+              <span class="nf-scope-text" id="facNoticeScopeText">To: your class</span><span class="nf-caret">▾</span>
+            </button>
+            <div class="nf-options hidden" id="facNoticeOptions">
+              <div id="facNoticeClassOpts" style="display:contents;">
+                <div style="grid-column:1/-1;"><label>Class (your subject)</label>
+                  <select id="facNoticeSubject" onchange="onFacNoticeSubjectChange()"></select></div>
+                <div id="facNoticeDivisionField" style="display:none;"><label>Division (optional)</label>
+                  <select id="facNoticeDivision" onchange="updateFacNoticeScopeLine()"><option value="">All divisions</option></select></div>
+              </div>
+              <div><label>Category</label>
+                <select id="facNoticeCategory" onchange="updateFacNoticeScopeLine()">
+                  <option value="Academic">Academic</option>
+                  <option value="Event">Event</option>
+                  <option value="Important">Important</option>
+                </select></div>
+            </div>
+            <div class="nf-attach-preview hidden" id="facNoticeAttachPreview"></div>
+            <div class="nf-compose-row">
+              <label class="nf-attach-btn" id="facNoticeAttachBtn" title="Attach a file (PDF, Word, PowerPoint, JPG, PNG — max 10MB)">📎
+                <input type="file" id="facNoticeFile" accept=".pdf,.doc,.docx,.ppt,.pptx,.jpg,.jpeg,.png" onchange="nfcOnFilePicked()" hidden>
+              </label>
+              <textarea class="nf-compose-input" id="facNoticeMessage" rows="1" placeholder="Type a notice… (first line becomes the title)" oninput="nfcAutoGrow(this)" onkeydown="nfcKeyDown(event)"></textarea>
+              <button type="button" class="nf-send-btn" id="facNoticeSaveBtn" onclick="saveFacultyNotice()" title="Send notice">➤</button>
+            </div>
           </div>
         </div>
       </div>
@@ -1108,6 +1212,8 @@
     </div>
   </div>
 
+  <script src="../shared/config.js"></script>
+  <script src="../shared/charts.js"></script>
   <script src="../shared/force_password.js"></script>
   <script src="faculty.js"></script>
 </body>

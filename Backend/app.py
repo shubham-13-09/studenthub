@@ -130,6 +130,34 @@ def send_otp_email(to_email, otp):
         server.sendmail(GMAIL_USER, to_email, msg.as_string())
 
 
+def send_plain_emails(messages, sender_name="StudentHub"):
+    """Sends many plain-text mails through Gmail SMTP using ONE login.
+    messages = [(to_email, subject, body), ...]. Returns a list of True/False (one per message),
+    so the caller knows which mails really went out. Raises only if Gmail is not configured or the login fails.
+    Used by the attendance shortage alerts."""
+    if not messages:
+        return []
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        raise RuntimeError("GMAIL_USER / GMAIL_APP_PASSWORD are not set in Backend/.env")
+
+    results = []
+    with smtplib.SMTP('smtp.gmail.com', 587, timeout=30) as server:
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        for to_email, subject, body in messages:
+            try:
+                msg = MIMEText(body, 'plain', 'utf-8')
+                msg['Subject'] = subject
+                msg['From'] = formataddr((sender_name, GMAIL_USER))
+                msg['To'] = to_email
+                server.sendmail(GMAIL_USER, [to_email], msg.as_string())
+                results.append(True)
+            except Exception as e:
+                print("MAIL SEND ERROR:", to_email, repr(e))
+                results.append(False)
+    return results
+
+
 import auth_routes
 import admin_routes
 import faculty_routes

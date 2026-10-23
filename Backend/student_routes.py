@@ -8,9 +8,9 @@ from werkzeug.utils import secure_filename
 from db import get_db
 from app import app
 from auth_middleware import student_required, is_default_password
-from session_routes import get_holiday, get_cancelled_override
+from session_routes import get_holiday, get_cancelled_override, SessionCalendar
 from chatbot_helper import find_faq_answer, get_fallback_reply, log_chat, logged_assistant, get_user_chat_history
-from admin_routes import NOTES_UPLOAD_FOLDER, ASSIGNMENT_UPLOAD_FOLDER, _allowed_assignment_file, NOTICE_UPLOAD_FOLDER
+from admin_routes import get_attendance_min, attendance_is_short, attendance_need_more, attendance_can_miss, ATTENDANCE_ALERT_MIN_CLASSES, NOTES_UPLOAD_FOLDER, ASSIGNMENT_UPLOAD_FOLDER, _allowed_assignment_file, NOTICE_UPLOAD_FOLDER
 
 
 def _get_student(cursor, user_id):
@@ -34,19 +34,20 @@ _DAY_INDEX = {'Mon': 0, 'Tue': 1, 'Wed': 2, 'Thu': 3, 'Fri': 4, 'Sat': 5}
 def _mark_week_status(cursor, slots, student):
     """The weekly timetable is a plan; for THIS week (Mon-Sat) mark each slot as held / cancelled / holiday,
     so the student can see that a lecture was cancelled (and that they were not absent)."""
+    if not slots:
+        return
     today = datetime.date.today()
     monday = today - datetime.timedelta(days=today.weekday())
-    holiday_cache = {}
+    # this week's holidays + cancellations: 2 queries (instead of one per day and one per slot)
+    cal = SessionCalendar(cursor, monday, monday + datetime.timedelta(days=6), [sl['id'] for sl in slots])
     for sl in slots:
         idx = _DAY_INDEX.get(sl['day_of_week'])
         if idx is None:
             sl['status'], sl['status_note'], sl['date'] = 'held', None, None
             continue
         d = monday + datetime.timedelta(days=idx)
-        if d not in holiday_cache:
-            holiday_cache[d] = get_holiday(cursor, d, student['semester'], student['division'])
-        holiday = holiday_cache[d]
-        cancelled = None if holiday else get_cancelled_override(cursor, sl['id'], d)
+        holiday = cal.holiday(d, student['semester'], student['division'])
+        cancelled = None if holiday else cal.cancelled(sl['id'], d)
         sl['date'] = d.isoformat()
         sl['status'] = 'holiday' if holiday else ('cancelled' if cancelled else 'held')
         sl['status_note'] = holiday['name'] if holiday else (cancelled['reason'] if cancelled else None)
@@ -354,6 +355,7 @@ def get_student_attendance():
         if not student['semester']:
             return jsonify({"subjects": [], "overall_percentage": 0}), 200
 
+        min_pct = get_attendance_min(cursor)
         cursor.execute("""
             SELECT
                 sub.id AS subject_id, sub.subject_name, sub.subject_code,
@@ -371,15 +373,26 @@ def get_student_attendance():
         total_classes = 0
         total_attended = 0
         for row in subjects:
-            row['total_classes'] = row['total_classes'] or 0
-            row['attended_classes'] = row['attended_classes'] or 0
+            row['total_classes'] = int(row['total_classes'] or 0)
+            row['attended_classes'] = int(row['attended_classes'] or 0)   # SUM() comes back as Decimal (JSON would make it a string)
             row['percentage'] = round(row['attended_classes'] * 100 / row['total_classes']) if row['total_classes'] else 0
+            row['percentage_exact'] = round(row['attended_classes'] * 100 / row['total_classes'], 1) if row['total_classes'] else 0
+            # shortage info: exact (no rounding); 'alert' only once enough classes were held to judge
+            row['short'] = attendance_is_short(row['attended_classes'], row['total_classes'], min_pct)
+            row['alert'] = row['short'] and row['total_classes'] >= ATTENDANCE_ALERT_MIN_CLASSES
+            row['need_more'] = attendance_need_more(row['attended_classes'], row['total_classes'], min_pct)
+            row['can_miss'] = attendance_can_miss(row['attended_classes'], row['total_classes'], min_pct)
             total_classes += row['total_classes']
             total_attended += row['attended_classes']
 
         overall_percentage = round(total_attended * 100 / total_classes) if total_classes else 0
 
-        return jsonify({"subjects": subjects, "overall_percentage": overall_percentage}), 200
+        return jsonify({
+            "subjects": subjects,
+            "overall_percentage": overall_percentage,
+            "min_percentage": min_pct,
+            "shortage_count": sum(1 for s in subjects if s['alert'])
+        }), 200
     except Exception as e:
         return jsonify({"message": "Attendance could not be loaded", "error": str(e)}), 500
     finally:
@@ -745,10 +758,14 @@ def download_student_notice(notice_id):
         cursor.close()
         conn.close()
 
+    # ?inline=1 -> sent for direct viewing (image / PDF preview inside the notice feed).
+    # Any other file type is always sent as a normal download.
+    ext = (notice['file_name'] or '').rsplit('.', 1)[-1].lower()
+    inline = request.args.get('inline') == '1' and ext in ('jpg', 'jpeg', 'png', 'pdf')
     return send_from_directory(
         NOTICE_UPLOAD_FOLDER,
         notice['file_path'],
-        as_attachment=True,
+        as_attachment=not inline,
         download_name=notice['file_name']
     )
 

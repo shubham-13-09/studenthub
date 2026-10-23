@@ -10,7 +10,7 @@ window.escapeHtml = escapeHtml;
 window.escapeHtmlMR = escapeHtml;
 
 // ---- API helpers ----
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = window.APP_CONFIG.API_BASE;   // set in ../shared/config.js
 
 // Department short-code -> full name (if you add a new department here, add it to this list as well)
 const DEPT_NAMES = {
@@ -105,6 +105,48 @@ function resetStudentForm(){
   document.getElementById('studentParentAddress').value = '';
 }
 
+// ---- Students list: server-side pagination (25 per page) ----
+const STUDENTS_PAGE_SIZE = 25;
+let studentsPage = 1;
+let studentsFilterSig = null;   // when a filter/search changes, the list goes back to page 1
+let studentsReqSeq = 0;         // so that an older, slower response can never overwrite a newer one
+let studentsSearchTimer = null;
+
+function onStudentSearchInput(){
+  clearTimeout(studentsSearchTimer);
+  studentsSearchTimer = setTimeout(() => loadStudents(), 300);   // wait until typing pauses
+}
+
+function goToStudentsPage(p){
+  studentsPage = p;
+  loadStudents();
+}
+
+function renderStudentsPager(total, page, totalPages, shown){
+  const table = document.getElementById('studentsTableBody').closest('table');
+  let pager = document.getElementById('studentsPager');
+  if(!pager){
+    pager = document.createElement('div');
+    pager.id = 'studentsPager';
+    pager.style.cssText = 'display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:12px; font-size:13px; color:var(--muted);';
+    table.insertAdjacentElement('afterend', pager);
+  }
+  if(!total){
+    pager.innerHTML = '';
+    return;
+  }
+  const from = (page - 1) * STUDENTS_PAGE_SIZE + 1;
+  const to = from + shown - 1;
+  const info = `<span>Showing ${from}–${to} of ${total} student${total === 1 ? '' : 's'}</span>`;
+  const controls = totalPages > 1 ? `
+    <span style="display:flex; align-items:center; gap:10px;">
+      <button class="btn-ghost" ${page <= 1 ? 'disabled' : ''} onclick="goToStudentsPage(${page - 1})">‹ Prev</button>
+      <span>Page ${page} of ${totalPages}</span>
+      <button class="btn-ghost" ${page >= totalPages ? 'disabled' : ''} onclick="goToStudentsPage(${page + 1})">Next ›</button>
+    </span>` : '';
+  pager.innerHTML = info + controls;
+}
+
 async function loadStudents(){
   const tbody = document.getElementById('studentsTableBody');
   tbody.innerHTML = '<tr><td colspan="9">Loading…</td></tr>';
@@ -113,14 +155,32 @@ async function loadStudents(){
   const sem = document.getElementById('studentFilterSem').value;
   const year = document.getElementById('studentFilterYear').value;
   const statusFilter = document.getElementById('studentFilterStatus').value;
+  const searchBox = document.getElementById('studentSearch');
+  const search = searchBox ? searchBox.value.trim() : '';
+
+  // a different filter/search than last time -> start from page 1 (other callers, e.g. after save/delete, keep the current page)
+  const sig = [dept, sem, year, statusFilter, search].join('|');
+  if(sig !== studentsFilterSig){
+    studentsFilterSig = sig;
+    studentsPage = 1;
+  }
+
   const params = new URLSearchParams();
   if(dept) params.set('department', dept);
   if(sem) params.set('semester', sem);
   if(year) params.set('academic_year', year);
+  if(statusFilter) params.set('status', statusFilter);   // filtered on the server, so each page is already complete
+  if(search) params.set('search', search);
+  params.set('page', studentsPage);
+  params.set('limit', STUDENTS_PAGE_SIZE);
 
+  const seq = ++studentsReqSeq;
   try{
-    let students = await apiRequest('/admin/students?' + params.toString());
-    if(statusFilter) students = students.filter(s => s.status === statusFilter);
+    const res = await apiRequest('/admin/students?' + params.toString());
+    if(seq !== studentsReqSeq) return;   // a newer request has been made in the meantime
+    const students = res.items;
+    studentsPage = res.page;             // the server clamps it (e.g. after deleting the last student of the last page)
+    renderStudentsPager(res.total, res.page, res.total_pages, students.length);
     if(!students.length){
       tbody.innerHTML = '<tr><td colspan="9">No students found.</td></tr>';
       return;
@@ -144,6 +204,7 @@ async function loadStudents(){
       </tr>
     `).join('');
   }catch(err){
+    if(seq !== studentsReqSeq) return;
     tbody.innerHTML = `<tr><td colspan="9">Failed to load students: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
@@ -320,9 +381,48 @@ async function loadDashboardStats(){
     document.getElementById('statNoticesWeek').textContent = stats.notices_this_week;
     document.getElementById('statPendingMarksRequests').textContent = stats.pending_marks_requests;
     renderSemesterChart(stats.students_by_semester);
+    renderAdminCharts(stats);
   }catch(err){
     console.error('Dashboard stats error:', err.message);
   }
+}
+
+// Dashboard charts (fee status / attendance by semester / logins last 7 days) — drawn by shared/charts.js
+function renderAdminCharts(stats){
+  if(!window.SHCharts) return;
+
+  const fee = stats.fee_summary || {};
+  const paid = fee.paid || { count: 0, amount: 0 };
+  const unpaid = fee.unpaid || { count: 0, amount: 0 };
+  const rupees = n => '₹' + Number(n || 0).toLocaleString('en-IN');
+  const feeTotal = (paid.count || 0) + (unpaid.count || 0);
+  SHCharts.donut(document.getElementById('feeStatusChart'), [
+    { label: 'Paid',   value: paid.count || 0,   color: SHCharts.colors.good, text: `${paid.count || 0} · ${rupees(paid.amount)}` },
+    { label: 'Unpaid', value: unpaid.count || 0, color: SHCharts.colors.warn, text: `${unpaid.count || 0} · ${rupees(unpaid.amount)}` }
+  ], {
+    center: feeTotal ? Math.round((paid.count || 0) * 100 / feeTotal) + '%' : '',
+    sub: 'fees paid',
+    label: 'Fees paid versus unpaid',
+    empty: 'No fee records yet.'
+  });
+
+  SHCharts.columns(document.getElementById('attendanceSemesterChart'),
+    (stats.attendance_by_semester || []).map(r => ({
+      label: 'Sem ' + r.semester, value: r.percentage,
+      title: `Semester ${r.semester} (${r.total} records)`
+    })),
+    { max: 100, unit: '%', threshold: 75, label: 'Attendance percentage by semester', empty: 'Attendance has not been marked yet.' });
+
+  SHCharts.line(document.getElementById('loginActivityChart'),
+    (stats.logins_last_7_days || []).map(r => {
+      const d = new Date(r.date + 'T00:00:00');
+      return {
+        label: d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }),
+        title: d.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'short' }),
+        value: r.count
+      };
+    }),
+    { label: 'Logins per day for the last 7 days', empty: 'No logins in the last 7 days.' });
 }
 
 // The "Students by semester" bar chart on the Dashboard (Sem 1-6, 0 for a semester with no students)
@@ -1858,7 +1958,7 @@ async function loadAttendanceSummary(silent){
           <td>${escapeHtml(s.academic_year || '-')}</td>
           <td>${total}</td>
           <td>${present}</td>
-          <td>${pct !== null ? pct + '%' : '—'}</td>
+          <td>${pct !== null ? pct + '%' : '—'}${isLow ? ` <small style="color:var(--muted);">· needs ${Math.ceil((75 * total - 100 * present) / 25)} more</small>` : ''}</td>
           <td>${calendarCell}</td>
         </tr>
       `;
@@ -1866,6 +1966,32 @@ async function loadAttendanceSummary(silent){
   }catch(err){
     if(silent) return;
     tbody.innerHTML = `<tr><td colspan="9">Failed to load summary: ${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+// E-mails the students of the selected class (and their parents) who are below the minimum attendance.
+// Students already alerted in the last 7 days are skipped by the backend.
+async function notifyAttendanceShortage(){
+  const semester = document.getElementById('attSemester').value;
+  const divisions = getSelectedAttendanceDivisions();
+  const academicYear = document.getElementById('attBatch').value;
+  if(!semester){ alert('Select a semester first.'); return; }
+  if(!divisions.length){ alert('Select at least one division.'); return; }
+  if(!confirm('E-mail every student of this class who is below the minimum attendance (and their parents)?\nStudents already alerted in the last 7 days are skipped.')) return;
+
+  const btn = document.getElementById('attNotifyBtn');
+  const oldText = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'Sending…'; }
+  try{
+    const res = await apiRequest('/admin/attendance/shortage/notify', {
+      method: 'POST',
+      body: JSON.stringify({ semester, divisions, academic_year: academicYear })
+    });
+    alert(res.message);
+  }catch(err){
+    alert('Alerts could not be sent: ' + err.message);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = oldText; }
   }
 }
 
@@ -2054,22 +2180,11 @@ function switchView(name){
   document.querySelectorAll('.nav-sub-item').forEach(i=> i.classList.toggle('active', i.dataset.view===name));
   document.querySelectorAll('.view').forEach(v=> v.classList.toggle('active', v.id==='view-'+name));
   if(name === 'notices'){
-    markAdminNoticesRead();
-    Object.keys(NF_SCROLL_BTN).forEach(id => nfScrollToBottom(id, false));
-  }
-}
-
-// As soon as the Notices tab opens, the admin's 'seen' record is created, then the list is refreshed so the 👁 count updates
-async function markAdminNoticesRead(){
-  try{
-    await apiRequest('/admin/notices/mark-read', { method: 'POST' });
     loadNotices();
-    // Once the notice is seen -> also sync the 🔔 notification badge in the header right away,
-    // otherwise it keeps showing the old unseen count
-    localStorage.setItem('notifSeenAt', toLocalDbDateTime(new Date()));
-    refreshNotifBadge();
-  }catch(err){
-    // silent fail
+    if(adminNoticeGroup){
+      nfScrollToBottom('noticesListBody', false);
+      if(nfGroupNotices(adminNoticeGroup).some(n => !n.is_read)) markNoticeGroupRead(adminNoticeGroup);
+    }
   }
 }
 
@@ -2201,6 +2316,10 @@ document.querySelectorAll('.nav-sub-item').forEach(item=>{
       const formId = item.dataset.view + 'Form';
       const form = document.getElementById(formId);
       if(form) form.classList.remove('hidden');
+      if(item.dataset.view === 'notices'){
+        openNoticeGroup('all');
+        setTimeout(() => { const box = document.getElementById('noticeContent'); if(box) box.focus(); }, 50);
+      }
     }
   });
 });
@@ -3412,93 +3531,125 @@ async function populateFeeStudents(){
   }
 }
 
-let allFees = [];
+// ---- Fee Management: 3 levels (folders -> fee-title folders -> records) ----
+// Each level is loaded from the server only when it is shown: the folder cards come with their counts and totals
+// (counted by the database), and the records of a title folder come 50 per page. So the page never has to hold
+// every fee record of the whole college.
+const FEES_PAGE_SIZE = 50;
+let feeFolders = [];        // level 1: [{semester, division, academic_year, records, paid, total}]
+let feeTitleGroups = [];    // level 2: [{fee_title, records, paid, total}] of the open folder
 let openFeeFolderKey = null;
 let openFeeTitleKey = null;
+let feesPage = 1;
+let feesFoldersSeq = 0;     // sequence numbers: an older, slower answer can never overwrite a newer one
+let feeTitlesSeq = 0;
+let feeRecordsSeq = 0;
+let feeSearchTimer = null;
 
 function feeFolderKey(f){
   return `${f.semester || '-'}|${f.division || '-'}|${f.academic_year || '-'}`;
+}
+
+function feeFolderLabel(f){
+  return `Sem ${f.semester || '-'} • Div ${f.division || 'All'} • ${f.academic_year || '-'}`;
+}
+
+function currentFeeFolder(){
+  return feeFolders.find(f => feeFolderKey(f) === openFeeFolderKey);
+}
+
+function onFeeSearchInput(){
+  clearTimeout(feeSearchTimer);
+  feeSearchTimer = setTimeout(() => loadFees(), 300);   // wait until typing pauses
+}
+
+// The filters of the page (Semester / Division / Batch / Status / search). They are sent with every request,
+// so the folder cards, the title folders and the records always agree with each other.
+function feePageFilters(){
+  const params = new URLSearchParams();
+  const semester = document.getElementById('feeFilterSemester').value;
+  const division = document.getElementById('feeFilterDivision').value;
+  const academicYear = document.getElementById('feeFilterYear').value;
+  const status = document.getElementById('feeFilterStatus').value;
+  const search = document.getElementById('feeSearch').value.trim();
+  if(semester) params.set('semester', semester);
+  if(division) params.set('division', division);
+  if(academicYear) params.set('academic_year', academicYear);
+  if(status) params.set('status', status);
+  if(search) params.set('search', search);
+  return params;
+}
+
+// + the folder that is open ('-' means "not set") and, optionally, the fee-title folder inside it
+function feeFolderParams(key, title){
+  const params = feePageFilters();
+  const [sem, div, year] = key.split('|');
+  params.set('folder_semester', sem);
+  params.set('folder_division', div);
+  params.set('folder_year', year);
+  if(title) params.set('fee_title', title);
+  return params;
 }
 
 async function loadFees(){
   const grid = document.getElementById('feesFolderGrid');
   if(grid) grid.innerHTML = '<div style="color:var(--muted); font-size:13px;">Loading…</div>';
 
-  const semester = document.getElementById('feeFilterSemester').value;
-  const division = document.getElementById('feeFilterDivision').value;
-  const academicYear = document.getElementById('feeFilterYear').value;
-  const status = document.getElementById('feeFilterStatus').value;
-  const search = document.getElementById('feeSearch').value.trim();
-  const params = new URLSearchParams();
-  if(semester) params.set('semester', semester);
-  if(division) params.set('division', division);
-  if(academicYear) params.set('academic_year', academicYear);
-  if(status) params.set('status', status);
-  if(search) params.set('search', search);
-
+  const seq = ++feesFoldersSeq;
   try{
-    allFees = await apiRequest('/admin/fees?' + params.toString());
+    const folders = await apiRequest('/admin/fees/folders?' + feePageFilters().toString());
+    if(seq !== feesFoldersSeq) return;   // a newer request has been made in the meantime
+    feeFolders = folders;
     renderFeeFolders();
-    // If any folder/sub-folder was already open, refresh it with the new data.
+    // If a folder / sub-folder was already open, refresh it with the new data.
     if(openFeeFolderKey){
-      const stillHasFolder = allFees.some(f => feeFolderKey(f) === openFeeFolderKey);
-      if(!stillHasFolder){
+      if(!feeFolders.some(f => feeFolderKey(f) === openFeeFolderKey)){
         closeFeeFolder();
       } else if(openFeeTitleKey){
-        const stillHasTitle = allFees.some(f => feeFolderKey(f) === openFeeFolderKey && f.fee_title === openFeeTitleKey);
-        stillHasTitle ? openFeeTitleFolder(openFeeTitleKey) : closeFeeTitleFolder();
+        await Promise.all([loadFeeTitleGroups(), openFeeTitleFolder(openFeeTitleKey, true)]);
       } else {
-        openFeeFolder(openFeeFolderKey);
+        await openFeeFolder(openFeeFolderKey);
       }
     }
   }catch(err){
+    if(seq !== feesFoldersSeq) return;
     if(grid) grid.innerHTML = `<div style="color:var(--muted); font-size:13px;">Failed to load fees: ${escapeHtml(err.message)}</div>`;
   }
+}
+
+function feeFolderCardHtml(name, records, paid, total, attrs, deleteAttrs){
+  const unpaid = records - paid;
+  return `
+      <div class="fee-folder-card" ${attrs}>
+        <button class="icon-action danger fee-folder-delete" title="Delete folder" ${deleteAttrs}>🗑</button>
+        <div class="fee-folder-icon">📁</div>
+        <div class="fee-folder-name">${escapeHtml(name)}</div>
+        <div class="fee-folder-meta">${records} record${records === 1 ? '' : 's'} · ₹${Number(total).toLocaleString('en-IN')}</div>
+        <div class="fee-folder-stats">
+          <span class="pill good">${paid} Paid</span>
+          <span class="pill bad">${unpaid} Unpaid</span>
+        </div>
+      </div>
+    `;
 }
 
 function renderFeeFolders(){
   const grid = document.getElementById('feesFolderGrid');
   if(!grid) return;
 
-  if(!allFees.length){
+  if(!feeFolders.length){
     grid.innerHTML = '<div style="color:var(--muted); font-size:13px;">No fee records found.</div>';
     return;
   }
 
-  const groups = {};
-  allFees.forEach(f => {
-    const key = feeFolderKey(f);
-    if(!groups[key]){
-      groups[key] = {
-        semester: f.semester || '-',
-        division: f.division || 'All',
-        academic_year: f.academic_year || '-',
-        records: []
-      };
-    }
-    groups[key].records.push(f);
-  });
-
-  const sortedKeys = Object.keys(groups).sort((a, b) => a.localeCompare(b));
-
-  grid.innerHTML = sortedKeys.map(key => {
-    const g = groups[key];
-    const paidCount = g.records.filter(r => r.status === 'paid').length;
-    const unpaidCount = g.records.length - paidCount;
-    const total = g.records.reduce((sum, r) => sum + Number(r.amount || 0), 0);
-    return `
-      <div class="fee-folder-card" data-key="${escapeHtml(key)}" onclick="openFeeFolder(this.dataset.key)">
-        <button class="icon-action danger fee-folder-delete" title="Delete folder"
-          data-key="${escapeHtml(key)}" onclick="deleteFeeFolder(this.dataset.key, event)">🗑</button>
-        <div class="fee-folder-icon">📁</div>
-        <div class="fee-folder-name">Sem ${escapeHtml(g.semester)} • Div ${escapeHtml(g.division)} • ${escapeHtml(g.academic_year)}</div>
-        <div class="fee-folder-meta">${g.records.length} record${g.records.length === 1 ? '' : 's'} · ₹${total.toLocaleString('en-IN')}</div>
-        <div class="fee-folder-stats">
-          <span class="pill good">${paidCount} Paid</span>
-          <span class="pill bad">${unpaidCount} Unpaid</span>
-        </div>
-      </div>
-    `;
+  const sorted = feeFolders.slice().sort((a, b) => feeFolderKey(a).localeCompare(feeFolderKey(b)));
+  grid.innerHTML = sorted.map(g => {
+    const key = escapeHtml(feeFolderKey(g));
+    return feeFolderCardHtml(
+      feeFolderLabel(g), g.records, g.paid, g.total,
+      `data-key="${key}" onclick="openFeeFolder(this.dataset.key)"`,
+      `data-key="${key}" onclick="deleteFeeFolder(this.dataset.key, event)"`
+    );
   }).join('');
 }
 
@@ -3506,15 +3657,13 @@ function renderFeeFolders(){
 async function deleteFeeFolder(key, event){
   if(event) event.stopPropagation();
 
-  const records = allFees.filter(f => feeFolderKey(f) === key);
-  if(!records.length) return;
-  const first = records[0];
-  const label = `Sem ${first.semester || '-'} • Div ${first.division || 'All'} • ${first.academic_year || '-'}`;
+  const folder = feeFolders.find(f => feeFolderKey(f) === key);
+  if(!folder) return;
 
-  if(!confirm(`Delete all ${records.length} fee record(s) in "${label}"? This cannot be undone.`)) return;
+  if(!confirm(`Delete all ${folder.records} fee record(s) in "${feeFolderLabel(folder)}"? This cannot be undone.`)) return;
 
-  const params = new URLSearchParams({ semester: first.semester, academic_year: first.academic_year });
-  if(first.division) params.set('division', first.division);
+  const params = new URLSearchParams({ semester: folder.semester, academic_year: folder.academic_year });
+  if(folder.division) params.set('division', folder.division);
 
   try{
     await apiRequest('/admin/fees/folder?' + params.toString(), { method: 'DELETE' });
@@ -3527,59 +3676,56 @@ async function deleteFeeFolder(key, event){
 
 // When a Batch folder is opened, instead of records directly, it first shows sub-folders inside that batch
 // by fee title (e.g. "Tuition Fee", "Exam Fee" — each title has its own separate folder).
-function openFeeFolder(key){
+async function openFeeFolder(key){
   openFeeFolderKey = key;
   openFeeTitleKey = null;
-  renderFeeTitleFolders(key);
+  feeTitleGroups = [];
 
   document.getElementById('feesFolderView').classList.add('hidden');
   document.getElementById('feesRecordsView').classList.add('hidden');
   document.getElementById('feesTitleFolderView').classList.remove('hidden');
+  document.getElementById('feesTitleFolderGrid').innerHTML = '<div style="color:var(--muted); font-size:13px;">Loading…</div>';
+  const folder = currentFeeFolder();
+  document.getElementById('feesTitleFolderHeading').textContent = folder ? feeFolderLabel(folder) : '';
+
+  await loadFeeTitleGroups();
+}
+
+// Fetches the fee-title folders of the open folder (counts + totals come from the database) and shows them.
+async function loadFeeTitleGroups(){
+  const key = openFeeFolderKey;
+  if(!key) return;
+  const seq = ++feeTitlesSeq;
+  try{
+    const groups = await apiRequest('/admin/fees/title-folders?' + feeFolderParams(key).toString());
+    if(seq !== feeTitlesSeq || openFeeFolderKey !== key) return;
+    feeTitleGroups = groups;
+    renderFeeTitleFolders(key);
+  }catch(err){
+    if(seq !== feeTitlesSeq) return;
+    document.getElementById('feesTitleFolderGrid').innerHTML =
+      `<div style="color:var(--muted); font-size:13px;">Failed to load fees: ${escapeHtml(err.message)}</div>`;
+  }
 }
 
 function renderFeeTitleFolders(key){
-  const records = allFees.filter(f => feeFolderKey(f) === key);
   const grid = document.getElementById('feesTitleFolderGrid');
+  const folder = feeFolders.find(f => feeFolderKey(f) === key);
+  document.getElementById('feesTitleFolderHeading').textContent = folder ? feeFolderLabel(folder) : '';
 
-  const first = records[0];
-  const heading = first
-    ? `Sem ${first.semester || '-'} • Div ${first.division || 'All'} • ${first.academic_year || '-'}`
-    : '';
-  document.getElementById('feesTitleFolderHeading').textContent = heading;
-
-  if(!records.length){
+  if(!feeTitleGroups.length){
     grid.innerHTML = '<div style="color:var(--muted); font-size:13px;">No fee records found.</div>';
     return;
   }
 
-  const titleGroups = {};
-  records.forEach(f => {
-    const t = f.fee_title || 'Untitled';
-    if(!titleGroups[t]) titleGroups[t] = [];
-    titleGroups[t].push(f);
-  });
-
-  const titles = Object.keys(titleGroups).sort((a, b) => a.localeCompare(b));
-
-  grid.innerHTML = titles.map(title => {
-    const recs = titleGroups[title];
-    const paidCount = recs.filter(r => r.status === 'paid').length;
-    const unpaidCount = recs.length - paidCount;
-    const total = recs.reduce((sum, r) => sum + Number(r.amount || 0), 0);
-    const safeTitle = title.replace(/'/g, "\\'");
-    return `
-      <div class="fee-folder-card" onclick="openFeeTitleFolder('${safeTitle}')">
-        <button class="icon-action danger fee-folder-delete" title="Delete this folder"
-          onclick="deleteFeeTitleFolder('${openFeeFolderKey}', '${safeTitle}', event)">🗑</button>
-        <div class="fee-folder-icon">📁</div>
-        <div class="fee-folder-name">${escapeHtml(title)}</div>
-        <div class="fee-folder-meta">${recs.length} record${recs.length === 1 ? '' : 's'} · ₹${total.toLocaleString('en-IN')}</div>
-        <div class="fee-folder-stats">
-          <span class="pill good">${paidCount} Paid</span>
-          <span class="pill bad">${unpaidCount} Unpaid</span>
-        </div>
-      </div>
-    `;
+  const sorted = feeTitleGroups.slice().sort((a, b) => a.fee_title.localeCompare(b.fee_title));
+  grid.innerHTML = sorted.map(g => {
+    const title = escapeHtml(g.fee_title);
+    return feeFolderCardHtml(
+      g.fee_title, g.records, g.paid, g.total,
+      `data-title="${title}" onclick="openFeeTitleFolder(this.dataset.title)"`,
+      `data-title="${title}" onclick="deleteFeeTitleFolder(openFeeFolderKey, this.dataset.title, event)"`
+    );
   }).join('');
 }
 
@@ -3589,14 +3735,14 @@ async function deleteFeeTitleFolder(key, title, event){
   if(event) event.stopPropagation();
   if(!key || !title) return;
 
-  const records = allFees.filter(f => feeFolderKey(f) === key && f.fee_title === title);
-  if(!records.length) return;
-  const first = records[0];
+  const folder = feeFolders.find(f => feeFolderKey(f) === key);
+  const group = feeTitleGroups.find(g => g.fee_title === title);
+  if(!folder || !group) return;
 
-  if(!confirm(`Delete all ${records.length} "${title}" record(s) in this batch? This cannot be undone.`)) return;
+  if(!confirm(`Delete all ${group.records} "${title}" record(s) in this batch? This cannot be undone.`)) return;
 
-  const params = new URLSearchParams({ semester: first.semester, academic_year: first.academic_year, fee_title: title });
-  if(first.division) params.set('division', first.division);
+  const params = new URLSearchParams({ semester: folder.semester, academic_year: folder.academic_year, fee_title: title });
+  if(folder.division) params.set('division', folder.division);
 
   try{
     await apiRequest('/admin/fees/folder?' + params.toString(), { method: 'DELETE' });
@@ -3607,21 +3753,72 @@ async function deleteFeeTitleFolder(key, title, event){
   }
 }
 
+function goToFeesPage(p){
+  feesPage = p;
+  openFeeTitleFolder(openFeeTitleKey, true);
+}
+
+function renderFeesPager(total, page, totalPages, shown){
+  const table = document.getElementById('feesTableBody').closest('table');
+  let pager = document.getElementById('feesPager');
+  if(!pager){
+    pager = document.createElement('div');
+    pager.id = 'feesPager';
+    pager.style.cssText = 'display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:12px; font-size:13px; color:var(--muted);';
+    table.insertAdjacentElement('afterend', pager);
+  }
+  if(!total){
+    pager.innerHTML = '';
+    return;
+  }
+  const from = (page - 1) * FEES_PAGE_SIZE + 1;
+  const to = from + shown - 1;
+  const info = `<span>Showing ${from}–${to} of ${total} record${total === 1 ? '' : 's'}</span>`;
+  const controls = totalPages > 1 ? `
+    <span style="display:flex; align-items:center; gap:10px;">
+      <button class="btn-ghost" ${page <= 1 ? 'disabled' : ''} onclick="goToFeesPage(${page - 1})">‹ Prev</button>
+      <span>Page ${page} of ${totalPages}</span>
+      <button class="btn-ghost" ${page >= totalPages ? 'disabled' : ''} onclick="goToFeesPage(${page + 1})">Next ›</button>
+    </span>` : '';
+  pager.innerHTML = info + controls;
+}
+
 // When a sub-folder is opened, the actual student-wise records table shows (existing behavior, just that it is now
-// also filtered by fee_title).
-function openFeeTitleFolder(title){
+// also filtered by fee_title) — 50 records per page, loaded from the server.
+// keepPage = true when the same table is only being refreshed (after an edit, status change, page change ...).
+async function openFeeTitleFolder(title, keepPage){
   openFeeTitleKey = title;
-  const records = allFees.filter(f => feeFolderKey(f) === openFeeFolderKey && f.fee_title === title);
+  if(!keepPage) feesPage = 1;
+  const key = openFeeFolderKey;
   const tbody = document.getElementById('feesTableBody');
 
-  const first = records[0];
-  const heading = first
-    ? `Sem ${first.semester || '-'} • Div ${first.division || 'All'} • ${first.academic_year || '-'} • ${title}`
-    : title;
-  document.getElementById('feesFolderTitle').textContent = heading;
+  const folder = currentFeeFolder();
+  document.getElementById('feesFolderTitle').textContent = folder ? `${feeFolderLabel(folder)} • ${title}` : title;
+  if(!keepPage){
+    tbody.innerHTML = '<tr><td colspan="7">Loading…</td></tr>';
+    document.getElementById('feesTitleFolderView').classList.add('hidden');
+    document.getElementById('feesRecordsView').classList.remove('hidden');
+  }
 
-  window._feesCache = new Map(records.map(f => [String(f.id), f]));
-  tbody.innerHTML = records.length ? records.map(f => `
+  const params = feeFolderParams(key, title);
+  params.set('page', feesPage);
+  params.set('limit', FEES_PAGE_SIZE);
+
+  const seq = ++feeRecordsSeq;
+  try{
+    const res = await apiRequest('/admin/fees?' + params.toString());
+    if(seq !== feeRecordsSeq || openFeeFolderKey !== key || openFeeTitleKey !== title) return;
+    const records = res.items;
+    feesPage = res.page;   // the server clamps it (e.g. after the last record of the last page was deleted)
+
+    // nothing left in this sub-folder (e.g. its last record was deleted, or a filter excludes it): go back
+    if(!res.total && keepPage){
+      closeFeeTitleFolder();
+      return;
+    }
+
+    window._feesCache = new Map(records.map(f => [String(f.id), f]));
+    tbody.innerHTML = records.length ? records.map(f => `
       <tr>
         <td>${escapeHtml(f.student_name)} (${escapeHtml(f.enrollment)})</td>
         <td>${escapeHtml(f.fee_title)}</td>
@@ -3637,21 +3834,23 @@ function openFeeTitleFolder(title){
         </td>
       </tr>
     `).join('') : '<tr><td colspan="7">No fee records found.</td></tr>';
-
-  document.getElementById('feesTitleFolderView').classList.add('hidden');
-  document.getElementById('feesRecordsView').classList.remove('hidden');
+    renderFeesPager(res.total, res.page, res.total_pages, records.length);
+  }catch(err){
+    if(seq !== feeRecordsSeq) return;
+    tbody.innerHTML = `<tr><td colspan="7">Failed to load fees: ${escapeHtml(err.message)}</td></tr>`;
+  }
 }
 
 function viewFeeDetailsById(id){
-  const f = window._feesCache ? window._feesCache.get(String(id)) : (allFees || []).find(x => String(x.id) === String(id));
+  const f = window._feesCache && window._feesCache.get(String(id));
   if(f) viewFeeDetails(f);
 }
 function editFeeById(id){
-  const f = window._feesCache ? window._feesCache.get(String(id)) : (allFees || []).find(x => String(x.id) === String(id));
+  const f = window._feesCache && window._feesCache.get(String(id));
   if(f) editFee(f);
 }
 function deleteFeeById(id){
-  const f = window._feesCache ? window._feesCache.get(String(id)) : (allFees || []).find(x => String(x.id) === String(id));
+  const f = window._feesCache && window._feesCache.get(String(id));
   if(f) deleteFee(f.id, f.fee_title);
 }
 
@@ -3660,8 +3859,9 @@ function closeFeeTitleFolder(){
   openFeeTitleKey = null;
   document.getElementById('feesRecordsView').classList.add('hidden');
   if(openFeeFolderKey){
-    renderFeeTitleFolders(openFeeFolderKey);
+    renderFeeTitleFolders(openFeeFolderKey);      // what we already have, straight away ...
     document.getElementById('feesTitleFolderView').classList.remove('hidden');
+    loadFeeTitleGroups();                         // ... and the fresh counts (a status may have changed, records deleted)
   } else {
     document.getElementById('feesFolderView').classList.remove('hidden');
   }
@@ -3807,16 +4007,93 @@ async function deleteFee(id, title){
 // ============================================================
 const NOTICE_TAG_CLASS = { Academic: '', Event: 'event', Important: 'urgent' };
 
-function openAddNoticeForm(){
-  resetNoticeForm();
-  document.getElementById('noticeFormTitle').textContent = 'Add notice';
-  document.getElementById('noticeForm').classList.remove('hidden');
+const NF_ROLE_TEXT = { all: 'Everyone', student: 'Students', faculty: 'Faculty' };
+const NFC_MAX_TITLE = 150;   // notices.title is VARCHAR(150)
+
+// "To: Everyone · Sem 3 · Academic" — shows who will get the notice, without opening the options
+function updateNoticeScopeLine(){
+  const g = id => document.getElementById(id).value;
+  const parts = [];
+  if(adminNoticeGroup === 'staff'){
+    parts.push('Admin & Faculty');
+  }else{
+    parts.push(NF_ROLE_TEXT[g('noticeTargetRole')] || 'Everyone');
+    if(g('noticeSemester')) parts.push('Sem ' + g('noticeSemester'));
+    if(g('noticeDivision')) parts.push('Div ' + g('noticeDivision'));
+    if(g('noticeBatch')) parts.push(g('noticeBatch'));
+  }
+  parts.push(g('noticeCategory'));
+  if(g('noticePinned') === '1') parts.push('📌 Pinned');
+  document.getElementById('noticeScopeText').textContent = 'To: ' + parts.join(' · ');
 }
 
+function toggleNoticeOptions(){
+  const box = document.getElementById('noticeOptions');
+  box.classList.toggle('hidden');
+  document.getElementById('noticeScopeLine').classList.toggle('open', !box.classList.contains('hidden'));
+}
+
+function nfcAutoGrow(el){
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+
+// Enter = send, Shift+Enter = new line (on phones Enter stays a new line, the ➤ button sends)
+function nfcKeyDown(e){
+  if(e.key === 'Enter' && !e.shiftKey && !e.isComposing && window.innerWidth > 860){
+    e.preventDefault();
+    saveNotice();
+  }
+}
+
+// First line = title, the rest = body (like a WhatsApp message with a heading)
+function nfcSplitMessage(text){
+  const lines = text.split('\n');
+  const first = lines[0].trim();
+  const rest = lines.slice(1).join('\n').trim();
+  if(first.length <= NFC_MAX_TITLE) return { title: first, content: rest };
+  return { title: first.slice(0, NFC_MAX_TITLE - 1).trimEnd() + '…', content: text };
+}
+
+let nfcThumbUrl = null;
+function nfcRenderFilePreview(){
+  const box = document.getElementById('noticeAttachPreview');
+  const file = document.getElementById('noticeFile').files[0];
+  if(nfcThumbUrl){ URL.revokeObjectURL(nfcThumbUrl); nfcThumbUrl = null; }
+  if(!file){
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  let thumb;
+  if(nfFileKind(file.name) === 'image'){
+    nfcThumbUrl = URL.createObjectURL(file);
+    thumb = `<img src="${nfcThumbUrl}" alt="">`;
+  }else{
+    thumb = `<div class="nf-attach-ic">${nfFileIcon(file.name)}</div>`;
+  }
+  box.innerHTML = `${thumb}
+    <div class="nf-attach-info"><div class="nf-attach-name">${nfEsc(file.name)}</div><span>${nfEsc(nfFileSize(file.size))}</span></div>
+    <button type="button" class="nf-attach-x" onclick="nfcClearFile()" title="Remove attachment">✕</button>`;
+  box.classList.remove('hidden');
+}
+
+function nfcOnFilePicked(){
+  nfcRenderFilePreview();
+  document.getElementById('noticeContent').focus();
+}
+
+function nfcClearFile(){
+  document.getElementById('noticeFile').value = '';
+  nfcRenderFilePreview();
+}
+
+// Composer back to its defaults (after send / cancel edit)
 function resetNoticeForm(){
   document.getElementById('noticeEditId').value = '';
-  document.getElementById('noticeTitle').value = '';
-  document.getElementById('noticeContent').value = '';
+  const box = document.getElementById('noticeContent');
+  box.value = '';
+  nfcAutoGrow(box);
   document.getElementById('noticeCategory').value = 'Academic';
   document.getElementById('noticeTargetRole').value = 'all';
   document.getElementById('noticeSemester').value = '';
@@ -3824,7 +4101,17 @@ function resetNoticeForm(){
   document.getElementById('noticeBatch').value = '';
   document.getElementById('noticePinned').value = '0';
   document.getElementById('noticeFile').value = '';
-  document.getElementById('noticeExistingFile').textContent = '';
+  document.getElementById('noticeEditBanner').classList.add('hidden');
+  document.getElementById('noticeAttachBtn').classList.remove('hidden');
+  const send = document.getElementById('noticeSendBtn');
+  send.textContent = '➤';
+  send.title = 'Send notice';
+  nfcRenderFilePreview();
+  updateNoticeScopeLine();
+}
+
+function cancelNoticeEdit(){
+  resetNoticeForm();
 }
 
 function timeAgo(dateStr){
@@ -3868,8 +4155,8 @@ function nfFileSize(bytes){
   return (bytes / 1048576).toFixed(1) + ' MB';
 }
 
-function nfFileChip(n, onclickCode){
-  return `<div class="nf-file" onclick="${onclickCode}" title="Download">📎 <span class="nf-file-name">${nfEsc(n.file_name)}</span>${n.file_size ? ` <small>${nfFileSize(n.file_size)}</small>` : ''}</div>`;
+function nfFileChip(n, previewCode, downloadCode){
+  return nfAttachmentHtml(n, previewCode, downloadCode);
 }
 
 // The backend sends the list as is_pinned DESC, created_at DESC (newest-first), but the feed should
@@ -3967,7 +4254,7 @@ function nfAdminCard(n){
       </div>
       <div class="nf-title">${nfEsc(n.title)}</div>
       ${n.content ? `<div class="nf-body" onclick="nfToggleBody(this)">${nfEsc(n.content)}</div>` : ''}
-      ${n.file_name ? nfFileChip(n, `nfAdminAction('download', ${n.id})`) : ''}
+      ${n.file_name ? nfFileChip(n, `nfAdminAction('preview', ${n.id})`, `nfAdminAction('download', ${n.id})`) : ''}
       <div class="nf-meta">
         <span>${nfTime(n.created_at)}</span>
         <button class="nf-ticks ${seen ? 'seen' : ''}" onclick="nfAdminAction('reads', ${n.id})" title="Seen by">${seen ? '✓✓ ' + n.seen_count : '✓ Sent'}</button>
@@ -3983,6 +4270,7 @@ function nfAdminAction(action, id){
   else if(action === 'pin') toggleNoticePin(id, !!n.is_pinned);
   else if(action === 'edit') editNotice(n);
   else if(action === 'delete') deleteNotice(id, n.title);
+  else if(action === 'preview') nfOpenPreview(id, n.file_name);
   else if(action === 'download') downloadNoticeFile(id);
 }
 
@@ -4025,90 +4313,235 @@ function nfSetFeedHtml(feedId, html){
   nfUpdateScrollBtn(feedId);
 }
 
+// ============================================================
+// NOTICE GROUPS (chat list like WhatsApp). The server decides each notice's group (n.group):
+//   all   = "Students, Faculty & Admin"  (target_role all / student)
+//   staff = "Admin & Faculty"            (target_role faculty — students can never see these)
+// ============================================================
+const NOTICE_GROUPS = {
+  all:   { name: 'Students, Faculty & Admin', sub: 'Announcements for students and faculty', icon: '👥' },
+  staff: { name: 'Admin & Faculty',           sub: 'Staff only — students can’t see this group', icon: '🏫' }
+};
+let adminNoticeGroup = null;   // null = the chat list is showing
 let adminNoticesSnap = '';
-async function loadNotices(silent){
-  const container = document.getElementById('noticesListBody');
-  // Show "Loading…" only when the feed hasn't been built yet — otherwise the scroll position would reset on every reload
-  if(container && !container.querySelector('.nf-feed')) container.innerHTML = '<div class="notice-row"><span>Loading…</span></div>';
 
-  const category = document.getElementById('noticeFilterCategory').value;
-  const semester = document.getElementById('noticeFilterSemester').value;
-  const division = document.getElementById('noticeFilterDivision').value;
-  const academicYear = document.getElementById('noticeFilterBatch').value;
-  const params = new URLSearchParams();
-  if(category) params.set('category', category);
-  if(semester) params.set('semester', semester);
-  if(division) params.set('division', division);
-  if(academicYear) params.set('academic_year', academicYear);
+function nfGroupNotices(key){
+  return cachedAdminNotices.filter(n => n.group === key);
+}
 
+// "10:30 AM" today, "Yesterday", otherwise "12 Oct 2026" — like the WhatsApp chat list
+function nfListTime(iso){
+  const label = nfDateLabel(iso);
+  return label === 'Today' ? nfTime(iso) : label;
+}
+
+function nfAdminPreview(n){
+  const who = n.is_mine ? 'You' : (n.posted_by_name || '').trim();
+  return (who ? who + ': ' : '') + (n.file_name ? '📎 ' : '') + n.title;
+}
+
+function renderNoticeGroupList(){
+  const box = document.getElementById('noticeGroupList');
+  if(!box) return;
+  box.innerHTML = Object.keys(NOTICE_GROUPS).map(key => {
+    const g = NOTICE_GROUPS[key];
+    const list = nfGroupNotices(key);
+    const last = list.reduce((a, n) => (!a || new Date(n.created_at) > new Date(a.created_at)) ? n : a, null);
+    const unread = list.filter(n => !n.is_read && !n.is_mine).length;
+    return `
+      <button type="button" class="nf-group-row ${unread ? 'unread' : ''}" onclick="openNoticeGroup('${key}')">
+        <div class="nf-group-avatar">${g.icon}</div>
+        <div class="nf-group-main">
+          <div class="nf-group-top">
+            <span class="nf-group-name">${nfEsc(g.name)}</span>
+            <span class="nf-group-time">${last ? nfEsc(nfListTime(last.created_at)) : ''}</span>
+          </div>
+          <div class="nf-group-bottom">
+            <span class="nf-group-preview">${last ? nfEsc(nfAdminPreview(last)) : 'No notices yet'}</span>
+            ${unread ? `<span class="nf-group-badge">${unread > 99 ? '99+' : unread}</span>` : ''}
+          </div>
+        </div>
+      </button>`;
+  }).join('');
+}
+
+// The filters (category / semester / division / batch) work on the "Students, Faculty & Admin" group, same rules as before
+function nfPassesFilters(n){
+  const v = id => document.getElementById(id).value;
+  const cat = v('noticeFilterCategory'), sem = v('noticeFilterSemester'), div = v('noticeFilterDivision'), yr = v('noticeFilterBatch');
+  if(cat && n.category !== cat) return false;
+  if(sem && n.semester != null && String(n.semester) !== sem) return false;
+  if(div && n.division && n.division !== div) return false;
+  if(yr && n.academic_year && n.academic_year !== yr) return false;
+  return true;
+}
+
+function renderNoticeFeed(){
+  if(!adminNoticeGroup) return;
+  let list = nfGroupNotices(adminNoticeGroup);
+  if(adminNoticeGroup === 'all') list = list.filter(nfPassesFilters);
+  nfSetFeedHtml('noticesListBody', list.length
+    ? nfRenderFeed(list, nfAdminCard)
+    : '<div class="nf-empty">No notices here yet — type one below to send it.</div>');
+}
+
+function onNoticeFilterChange(){
+  renderNoticeFeed();
+}
+
+// The staff group has no semester / division / batch / audience — those options are hidden there
+function applyNoticeGroupToComposer(){
+  const isStaff = adminNoticeGroup === 'staff';
+  document.querySelectorAll('#noticeOptions [data-opt]').forEach(el => el.classList.toggle('hidden', isStaff));
+  document.getElementById('noticeOptions').classList.add('hidden');
+  document.getElementById('noticeScopeLine').classList.remove('open');
+}
+
+function openNoticeGroup(key){
+  const g = NOTICE_GROUPS[key];
+  if(!g) return;
+  adminNoticeGroup = key;
+  document.getElementById('noticeGroupsCard').classList.add('hidden');
+  document.getElementById('noticeChatCard').classList.remove('hidden');
+  document.getElementById('noticeChatAvatar').textContent = g.icon;
+  document.getElementById('noticeChatName').textContent = g.name;
+  document.getElementById('noticeChatSub').textContent = g.sub;
+  document.getElementById('noticeFilterRow').classList.toggle('hidden', key !== 'all');
+  applyNoticeGroupToComposer();
+  resetNoticeForm();
+  document.getElementById('noticesListBody').innerHTML = '';   // fresh feed -> opens scrolled to the latest notice
+  renderNoticeFeed();
+  nfScrollToBottom('noticesListBody', false);
+  if(nfGroupNotices(key).some(n => !n.is_read)) markNoticeGroupRead(key);
+}
+
+function closeNoticeGroup(){
+  adminNoticeGroup = null;
+  nfCloseMenus();
+  resetNoticeForm();
+  document.getElementById('noticeChatCard').classList.add('hidden');
+  document.getElementById('noticeGroupsCard').classList.remove('hidden');
+  renderNoticeGroupList();
+}
+
+// Opening a group = the admin has seen its notices (so the 👁 counts of faculty's notices include the admin)
+let nfAutoMarkBusy = false;
+async function markNoticeGroupRead(key){
+  if(nfAutoMarkBusy) return;
+  nfAutoMarkBusy = true;
   try{
-    const notices = await apiRequest('/admin/notices?' + params.toString());
-    if(!container) return;
-    // background refresh: kuch badla nahi to feed ko chhedo mat (expanded cards / scroll safe)
-    const snap = params.toString() + '|' + JSON.stringify(notices);
-    if(silent === true && snap === adminNoticesSnap) return;
-    adminNoticesSnap = snap;
-    cachedAdminNotices = notices;
-    nfSetFeedHtml('noticesListBody', notices.length ? nfRenderFeed(notices, nfAdminCard) : '<div class="nf-empty">No notices found.</div>');
+    await apiRequest('/admin/notices/mark-read', { method: 'POST', body: JSON.stringify({ group: key }) });
+    cachedAdminNotices.forEach(n => { if(n.group === key) n.is_read = true; });
+    renderNoticeGroupList();
+    // the 🔔 badge counts by time, so clear it only when no group has anything unread
+    if(!cachedAdminNotices.some(n => !n.is_read)) localStorage.setItem('notifSeenAt', toLocalDbDateTime(new Date()));
+    refreshNotifBadge();
+    adminNoticesSnap = '';
+    await loadNotices(true);
   }catch(err){
-    if(silent === true) return;
-    if(container) container.innerHTML = `<div class="notice-row"><span>Failed to load notices: ${escapeHtml(err.message)}</span></div>`;
+    // silent fail
+  }finally{
+    nfAutoMarkBusy = false;
   }
 }
 
-async function saveNotice(){
-  const editId = document.getElementById('noticeEditId').value;
-  const title = document.getElementById('noticeTitle').value.trim();
+async function loadNotices(silent){
+  const list = document.getElementById('noticeGroupList');
+  if(list && !list.children.length) list.innerHTML = '<div class="nf-empty" style="padding:18px;">Loading…</div>';
 
+  try{
+    const notices = await apiRequest('/admin/notices');
+    if(!list) return;
+    // background refresh: if nothing changed, don't touch the screen (expanded cards / scroll stay as they are)
+    const snap = JSON.stringify(notices);
+    if(silent === true && snap === adminNoticesSnap) return;
+    adminNoticesSnap = snap;
+    cachedAdminNotices = notices;
+    renderNoticeGroupList();
+    if(adminNoticeGroup){
+      renderNoticeFeed();
+      // a new notice arrived while this group is open -> it is seen right away
+      if(!nfAutoMarkBusy && nfGroupNotices(adminNoticeGroup).some(n => !n.is_read)) markNoticeGroupRead(adminNoticeGroup);
+    }
+  }catch(err){
+    if(silent === true) return;
+    if(list) list.innerHTML = `<div class="nf-empty" style="padding:18px;">Failed to load notices: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+let nfcSending = false;
+async function saveNotice(){
+  if(nfcSending) return;
+  const editId = document.getElementById('noticeEditId').value;
+  const box = document.getElementById('noticeContent');
+  const text = box.value.trim();
+  const file = document.getElementById('noticeFile').files[0];
+
+  if(!adminNoticeGroup) return;
+  const isStaff = adminNoticeGroup === 'staff';   // "Admin & Faculty": audience is fixed, no semester / division / batch
+  const role = isStaff ? 'faculty' : document.getElementById('noticeTargetRole').value;
+  const sem = isStaff ? '' : document.getElementById('noticeSemester').value;
+  const div = isStaff ? '' : document.getElementById('noticeDivision').value;
+  const batch = isStaff ? '' : document.getElementById('noticeBatch').value;
+
+  let { title, content } = nfcSplitMessage(text);
+  // Only a file, no text -> the file name becomes the title (like sending a document on WhatsApp)
+  if(!editId && !title && file){
+    title = file.name.length > NFC_MAX_TITLE ? file.name.slice(0, NFC_MAX_TITLE - 1) + '…' : file.name;
+    content = '';
+  }
   if(!title){
-    alert('Title is required');
+    alert('Type a notice first');
+    box.focus();
     return;
   }
 
+  const send = document.getElementById('noticeSendBtn');
+  nfcSending = true;
+  send.disabled = true;
   try{
     if(editId){
       // The file attachment is not changed on edit — only the details are updated
       const payload = {
         title,
-        content: document.getElementById('noticeContent').value.trim(),
+        content,
         category: document.getElementById('noticeCategory').value,
-        target_role: document.getElementById('noticeTargetRole').value,
-        semester: document.getElementById('noticeSemester').value || null,
-        division: document.getElementById('noticeDivision').value || null,
-        academic_year: document.getElementById('noticeBatch').value || null,
+        target_role: role,
+        semester: sem || null,
+        division: div || null,
+        academic_year: batch || null,
         is_pinned: document.getElementById('noticePinned').value === '1'
       };
       await apiRequest(`/admin/notices/${editId}`, { method: 'PUT', body: JSON.stringify(payload) });
-      alert('Notice updated');
     } else {
       const formData = new FormData();
       formData.append('title', title);
-      formData.append('content', document.getElementById('noticeContent').value.trim());
+      formData.append('content', content);
       formData.append('category', document.getElementById('noticeCategory').value);
-      formData.append('target_role', document.getElementById('noticeTargetRole').value);
-      formData.append('semester', document.getElementById('noticeSemester').value || '');
-      formData.append('division', document.getElementById('noticeDivision').value || '');
-      formData.append('academic_year', document.getElementById('noticeBatch').value || '');
+      formData.append('target_role', role);
+      formData.append('semester', sem || '');
+      formData.append('division', div || '');
+      formData.append('academic_year', batch || '');
       formData.append('is_pinned', document.getElementById('noticePinned').value === '1' ? '1' : '0');
-      const fileInput = document.getElementById('noticeFile');
-      if(fileInput.files[0]) formData.append('file', fileInput.files[0]);
-
+      if(file) formData.append('file', file);
       await apiUpload('/admin/notices', formData);
-      alert('Notice published');
     }
-    toggleForm('noticeForm');
     resetNoticeForm();
     await loadNotices();
     if(!editId) nfScrollToBottom('noticesListBody');   // their own new notice should show at the bottom
   }catch(err){
-    alert('Error: ' + err.message);
+    alert('Error: ' + err.message);   // the typed message stays in the box so nothing is lost
+  }finally{
+    nfcSending = false;
+    send.disabled = false;
   }
 }
 
+// Edit = the message goes back into the bar (title on the first line, body below it)
 function editNotice(notice){
   document.getElementById('noticeEditId').value = notice.id;
-  document.getElementById('noticeTitle').value = notice.title;
-  document.getElementById('noticeContent').value = notice.content || '';
+  const box = document.getElementById('noticeContent');
+  box.value = notice.content ? notice.title + '\n' + notice.content : notice.title;
   document.getElementById('noticeCategory').value = notice.category || 'Academic';
   document.getElementById('noticeTargetRole').value = notice.target_role || 'all';
   document.getElementById('noticeSemester').value = notice.semester || '';
@@ -4116,11 +4549,16 @@ function editNotice(notice){
   document.getElementById('noticeBatch').value = notice.academic_year || '';
   document.getElementById('noticePinned').value = notice.is_pinned ? '1' : '0';
   document.getElementById('noticeFile').value = '';
-  document.getElementById('noticeExistingFile').textContent = notice.file_name
-    ? `Current attachment: ${notice.file_name} (uploading a new file is not supported yet, only the details can be edited)`
-    : '';
-  document.getElementById('noticeFormTitle').textContent = 'Edit notice';
-  document.getElementById('noticeForm').classList.remove('hidden');
+  nfcRenderFilePreview();
+  document.getElementById('noticeAttachBtn').classList.add('hidden');   // attachment is not changed on edit
+  document.getElementById('noticeEditText').textContent = '✎ Editing notice' + (notice.file_name ? ' · attachment can’t be changed' : '');
+  document.getElementById('noticeEditBanner').classList.remove('hidden');
+  const send = document.getElementById('noticeSendBtn');
+  send.textContent = '✓';
+  send.title = 'Save changes';
+  updateNoticeScopeLine();
+  nfcAutoGrow(box);
+  box.focus();
 }
 
 async function toggleNoticePin(id, currentlyPinned){
@@ -4139,6 +4577,204 @@ async function deleteNotice(id, title){
     loadNotices();
   }catch(err){
     alert('Error: ' + err.message);
+  }
+}
+
+// ============================================================
+// NOTICE ATTACHMENT PREVIEW (WhatsApp-style)
+// Image (jpg/png) -> shown inline in the notice card, click = full-screen view
+// PDF             -> card with a Preview button (opens in a viewer popup) + Download
+// Word / PowerPoint -> a browser cannot display these, so they stay download-only
+// Files are fetched with the login token and shown through blob URLs (an <img src>
+// cannot send the Authorization header). Images load lazily when the card scrolls
+// into view, and every loaded image is cached so the 5-sec refresh doesn't reload it.
+// ============================================================
+const NF_TOKEN_KEY = 'token_admin';
+const NF_ENDPOINT = '/admin/notices';
+const NF_ESC = s => nfEsc(s);
+const nfMediaUrls = new Map();       // notice id -> blob URL (loaded image)
+const nfMediaPromises = new Map();   // notice id -> in-flight fetch (so it's never fetched twice)
+let nfViewerUrl = null;
+
+function nfFileExt(name){
+  return (name || '').split('.').pop().toLowerCase();
+}
+
+function nfFileKind(name){
+  const ext = nfFileExt(name);
+  if(['jpg', 'jpeg', 'png'].includes(ext)) return 'image';
+  if(ext === 'pdf') return 'pdf';
+  return 'file';
+}
+
+function nfFileIcon(name){
+  const ext = nfFileExt(name);
+  if(ext === 'pdf') return '📕';
+  if(ext === 'doc' || ext === 'docx') return '📝';
+  if(ext === 'ppt' || ext === 'pptx') return '📊';
+  return '📎';
+}
+
+async function nfFetchFile(id){
+  const res = await fetch(`${API_BASE}${NF_ENDPOINT}/${id}/download?inline=1`, {
+    headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem(NF_TOKEN_KEY) }
+  });
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  return res.blob();
+}
+
+function nfImageUrl(id){
+  if(nfMediaUrls.has(id)) return Promise.resolve(nfMediaUrls.get(id));
+  if(nfMediaPromises.has(id)) return nfMediaPromises.get(id);
+  const p = nfFetchFile(id).then(blob => {
+    const url = URL.createObjectURL(blob);
+    nfMediaUrls.set(id, url);
+    nfMediaPromises.delete(id);
+    return url;
+  }).catch(err => {
+    nfMediaPromises.delete(id);
+    throw err;
+  });
+  nfMediaPromises.set(id, p);
+  return p;
+}
+
+// What a notice's attachment looks like inside the card
+function nfAttachmentHtml(n, previewCode, downloadCode){
+  const name = n.file_name || 'attachment';
+  const kind = nfFileKind(name);
+  const size = n.file_size ? nfFileSize(n.file_size) : '';
+
+  if(kind === 'image'){
+    const cached = nfMediaUrls.get(n.id);
+    return `
+      <div class="nf-media${cached ? ' loaded' : ''}" data-nf-id="${n.id}" onclick="${previewCode}" title="Click to view">
+        <img alt="${NF_ESC(name)}"${cached ? ` src="${cached}"` : ''}>
+        <span class="nf-media-state">Loading image…</span>
+      </div>
+      <div class="nf-media-cap">
+        <span class="nf-file-name">${NF_ESC(name)}</span>${size ? `<small>${size}</small>` : ''}
+        <button type="button" class="nf-doc-dl" onclick="${downloadCode}" title="Download">⬇</button>
+      </div>`;
+  }
+
+  const isPdf = kind === 'pdf';
+  const typeLabel = isPdf ? 'PDF' : (nfFileExt(name) || 'file').toUpperCase();
+  return `
+    <div class="nf-doc">
+      <div class="nf-doc-main" onclick="${isPdf ? previewCode : downloadCode}" title="${isPdf ? 'Preview' : 'Download'}">
+        <span class="nf-doc-ico">${nfFileIcon(name)}</span>
+        <span class="nf-doc-info">
+          <span class="nf-file-name">${NF_ESC(name)}</span>
+          <small>${typeLabel}${size ? ' · ' + size : ''}${isPdf ? ' · tap to preview' : ''}</small>
+        </span>
+      </div>
+      <button type="button" class="nf-doc-dl" onclick="${downloadCode}" title="Download">⬇</button>
+    </div>`;
+}
+
+// ---- lazy-load the inline images ----
+async function nfLoadMedia(el){
+  if(el.dataset.state === 'loading' || el.dataset.state === 'done') return;
+  el.dataset.state = 'loading';
+  try{
+    const url = await nfImageUrl(Number(el.dataset.nfId));
+    const img = el.querySelector('img');
+    if(img) img.src = url;
+    el.dataset.state = 'done';
+    el.classList.add('loaded');
+  }catch(err){
+    el.dataset.state = 'error';
+    const msg = el.querySelector('.nf-media-state');
+    if(msg) msg.textContent = 'Image could not be loaded — click to retry';
+  }
+}
+
+const nfMediaObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(entries => {
+      entries.forEach(en => {
+        if(en.isIntersecting){
+          nfMediaObserver.unobserve(en.target);
+          nfLoadMedia(en.target);
+        }
+      });
+    }, { rootMargin: '200px' })
+  : null;
+
+function nfScanMedia(){
+  document.querySelectorAll('.nf-media:not([data-state])').forEach(el => {
+    if(el.classList.contains('loaded')){ el.dataset.state = 'done'; return; }
+    el.dataset.state = 'pending';
+    if(nfMediaObserver) nfMediaObserver.observe(el); else nfLoadMedia(el);
+  });
+}
+
+// The feeds re-render with innerHTML from several places (polling, filters, pin/edit...),
+// so instead of patching every render function we just watch for new .nf-media boxes.
+(function nfWatchMedia(){
+  let queued = false;
+  const start = () => {
+    new MutationObserver(() => {
+      if(queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; nfScanMedia(); });
+    }).observe(document.body, { childList: true, subtree: true });
+    nfScanMedia();
+  };
+  if(document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+})();
+
+// ---- full-screen viewer (image) / popup viewer (PDF) ----
+function nfCloseViewer(){
+  const v = document.getElementById('nfViewer');
+  if(v) v.remove();
+  if(nfViewerUrl){ URL.revokeObjectURL(nfViewerUrl); nfViewerUrl = null; }
+  document.removeEventListener('keydown', nfViewerKey);
+}
+
+function nfViewerKey(e){
+  if(e.key === 'Escape') nfCloseViewer();
+}
+
+async function nfOpenPreview(id, fileName){
+  const kind = nfFileKind(fileName);
+  if(kind === 'file'){ downloadNoticeFile(id, fileName); return; }
+
+  nfCloseViewer();
+  const v = document.createElement('div');
+  v.id = 'nfViewer';
+  v.className = 'nf-viewer';
+  v.innerHTML = `
+    <div class="nf-viewer-bar">
+      <span class="nf-viewer-title">${NF_ESC(fileName)}</span>
+      <button type="button" class="nf-viewer-btn" id="nfViewerDl">⬇ Download</button>
+      <button type="button" class="nf-viewer-btn" id="nfViewerClose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="nf-viewer-body" id="nfViewerBody"><div class="nf-viewer-msg">Loading…</div></div>`;
+  v.addEventListener('click', e => { if(e.target === v || e.target.id === 'nfViewerBody') nfCloseViewer(); });
+  document.body.appendChild(v);
+  document.addEventListener('keydown', nfViewerKey);
+  document.getElementById('nfViewerClose').onclick = nfCloseViewer;
+  document.getElementById('nfViewerDl').onclick = () => downloadNoticeFile(id, fileName);
+
+  try{
+    let url;
+    if(kind === 'image'){
+      url = await nfImageUrl(id);
+    }else{
+      const blob = await nfFetchFile(id);
+      url = URL.createObjectURL(blob);
+      if(!document.getElementById('nfViewer')){ URL.revokeObjectURL(url); return; }   // closed while loading
+      nfViewerUrl = url;
+    }
+    const body = document.getElementById('nfViewerBody');
+    if(!body) return;
+    body.innerHTML = kind === 'image'
+      ? `<img src="${url}" alt="${NF_ESC(fileName)}">`
+      : `<iframe src="${url}" title="${NF_ESC(fileName)}"></iframe>`;
+  }catch(err){
+    const body = document.getElementById('nfViewerBody');
+    if(body) body.innerHTML = '<div class="nf-viewer-msg">Preview is not available — please use Download.</div>';
   }
 }
 
@@ -4591,7 +5227,7 @@ const BATCH_YEAR_SELECT_IDS = [
   'assignBatch', 'assignFilterYear',
   'noticeBatch', 'noticeFilterBatch',
   'marksBatch', 'feeBatch', 'feeFilterYear',
-  'repStudentBatch', 'repAttendanceBatch', 'repAssignmentBatch'
+  'repStudentBatch', 'repAttendanceBatch', 'repAssignmentBatch', 'repFeeBatch'
 ];
 
 function formatYearLabel(label){
@@ -4809,7 +5445,7 @@ async function runGlobalSearch(query){
 
   try{
     const [students, faculty] = await Promise.all([
-      apiRequest('/admin/students?search=' + encodeURIComponent(query)),
+      apiRequest('/admin/students?limit=5&search=' + encodeURIComponent(query)),
       apiRequest('/admin/faculty?search=' + encodeURIComponent(query))
     ]);
 
@@ -4843,6 +5479,10 @@ function goToSearchResult(type, idText){
   const tbodyId = type === 'student' ? 'studentsTableBody' : 'facultyTableBody';
   switchView(targetView);
 
+  if(type === 'student'){
+    const box = document.getElementById('studentSearch');
+    if(box) box.value = idText;   // the list is paginated, so filter it down to this student (clear the box to see all again)
+  }
   const loader = type === 'student' ? loadStudents : loadFaculty;
   loader().then(() => {
     setTimeout(() => {
@@ -4909,7 +5549,7 @@ async function downloadReportFile(url, filenameFallback){
   }
 }
 
-function downloadReport(reportType){
+function downloadReport(reportType, format = 'xlsx'){
   const batch = document.getElementById(`rep${reportType}Batch`).value;
   const sem = document.getElementById(`rep${reportType}Sem`).value;
   const div = document.getElementById(`rep${reportType}Div`).value;
@@ -4927,12 +5567,13 @@ function downloadReport(reportType){
   const params = new URLSearchParams({ academic_year: batch, semester: sem });
   if(div) params.set('division', div);
   if(subject) params.set('subject_id', subject);
+  if(format === 'pdf') params.set('format', 'pdf');
 
   const endpoint = reportType.toLowerCase();   // 'student' | 'attendance' | 'assignment'
-  downloadReportFile(`/admin/reports/${endpoint}s/excel?${params.toString()}`, `${endpoint}_report.xlsx`);
+  downloadReportFile(`/admin/reports/${endpoint}s/excel?${params.toString()}`, `${endpoint}_report.${format}`);
 }
 
-function downloadLoginActivityReport(){
+function downloadLoginActivityReport(format = 'xlsx'){
   const params = new URLSearchParams();
   const from = document.getElementById('repLoginFrom').value;
   const to = document.getElementById('repLoginTo').value;
@@ -4940,8 +5581,74 @@ function downloadLoginActivityReport(){
   if(from) params.set('from_date', from);
   if(to) params.set('to_date', to);
   if(role) params.set('role', role);
+  if(format === 'pdf') params.set('format', 'pdf');
 
-  downloadReportFile(`/admin/reports/login-activity/excel?${params.toString()}`, 'login_activity_report.xlsx');
+  downloadReportFile(`/admin/reports/login-activity/excel?${params.toString()}`, `login_activity_report.${format}`);
+}
+
+// ---- Fee Report (any class; same report as the Faculty panel) ----
+let adminFeeRepSeq = 0;
+
+function openAdminFeeReport(){
+  toggleForm('reportFeePanel');
+  const panel = document.getElementById('reportFeePanel');
+  if(panel && !panel.classList.contains('hidden')) loadAdminFeeReportItems();
+}
+
+// The fee items are whatever was created for that class, so the list comes from the class's own fee records.
+async function loadAdminFeeReportItems(){
+  const batch = document.getElementById('repFeeBatch').value;
+  const sem = document.getElementById('repFeeSem').value;
+  const div = document.getElementById('repFeeDiv').value;
+  const itemSel = document.getElementById('repFeeItem');
+  const hint = document.getElementById('repFeeHint');
+  const seq = ++adminFeeRepSeq;
+  itemSel.innerHTML = '<option value="">All fee items</option>';
+  hint.textContent = '';
+  if(!batch || !sem) return;
+  try{
+    let url = '/admin/fees?semester=' + encodeURIComponent(sem) + '&academic_year=' + encodeURIComponent(batch);
+    if(div) url += '&division=' + encodeURIComponent(div);
+    const fees = await apiRequest(url);
+    if(seq !== adminFeeRepSeq) return;
+    const titles = [...new Set((fees || []).map(f => (f.fee_title || '').trim() || 'Untitled'))]
+      .sort((a, b) => a.localeCompare(b));
+    itemSel.innerHTML = '<option value="">All fee items</option>' +
+      titles.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join('');
+    if(!titles.length) hint.textContent = 'No fee records for this class yet. Add fees first from the Fees section.';
+  }catch(err){
+    if(seq !== adminFeeRepSeq) return;
+    hint.textContent = 'Could not load the fee items for this class.';
+  }
+}
+
+function onAdminFeeReportTypeChange(){
+  const type = document.getElementById('repFeeType').value;
+  const statusSel = document.getElementById('repFeeStatus');
+  // Defaulters always means "unpaid or overdue", so the Status filter is not used there
+  if(type === 'defaulters'){ statusSel.value = 'all'; statusSel.disabled = true; }
+  else statusSel.disabled = false;
+}
+
+function downloadAdminFeeReport(format){
+  const batch = document.getElementById('repFeeBatch').value;
+  const sem = document.getElementById('repFeeSem').value;
+  const div = document.getElementById('repFeeDiv').value;
+  const item = document.getElementById('repFeeItem').value;
+  const type = document.getElementById('repFeeType').value;
+  const status = document.getElementById('repFeeStatus').value;
+
+  if(!batch || !sem){
+    alert('Select both Batch and Semester');
+    return;
+  }
+
+  const params = new URLSearchParams({ academic_year: batch, semester: sem, format, report: type, status });
+  if(div) params.set('division', div);
+  if(item) params.set('fee_title', item);
+
+  const filename = `fees_${type}_sem${sem}_${batch}${div ? '_div' + div : ''}.${format}`.replace(/[^A-Za-z0-9._-]+/g, '_');
+  downloadReportFile(`/admin/reports/fees?${params.toString()}`, filename);
 }
 
 // ============================================================

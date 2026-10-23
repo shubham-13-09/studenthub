@@ -3,10 +3,20 @@ from db import get_db
 import bcrypt
 import jwt
 import datetime
+import os
 import secrets
 
 from app import app, SECRET_KEY, send_otp_email, limiter
 from auth_middleware import is_default_password
+
+# How long a login token stays valid. Short on purpose (a stolen/forgotten token stops working soon).
+# Change it from .env with JWT_EXPIRY_HOURS (default 4; accepted range 0.25 to 24 hours, anything else falls back to 4).
+try:
+    JWT_EXPIRY_HOURS = float(os.getenv('JWT_EXPIRY_HOURS', '4'))
+except ValueError:
+    JWT_EXPIRY_HOURS = 4.0
+if not (0.25 <= JWT_EXPIRY_HOURS <= 24):
+    JWT_EXPIRY_HOURS = 4.0
 
 # ============ ACADEMIC YEARS (public — register form dropdown) ============
 # Academic Management me jo batches hain wahi register page par dikhengi
@@ -166,7 +176,7 @@ def login():
     token = jwt.encode({
         'user_id': user['id'],
         'role': user['role'],
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=1)
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXPIRY_HOURS)
     }, SECRET_KEY, algorithm='HS256')
 
     # Login history me entry

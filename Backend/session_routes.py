@@ -126,6 +126,91 @@ def get_substitute_slots_between(cursor, faculty_id, start_date, end_date):
     return cursor.fetchall()
 
 
+def same_text(a, b):
+    """Same comparison MySQL makes for names like department/division: ignores case and trailing spaces. NULL never matches."""
+    if a is None or b is None:
+        return False
+    return str(a).rstrip().lower() == str(b).rstrip().lower()
+
+
+def _same_number(a, b):
+    if a is None or b is None:
+        return False
+    try:
+        return int(a) == int(b)
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
+
+
+class SessionCalendar:
+    """Holidays + cancelled/substituted overrides of a date range, loaded with ONE or TWO queries and then answered
+    from memory.  Gives the same answers as get_holiday / get_holiday_for_slot / get_cancelled_override /
+    get_substitute_override, which run a query on EVERY call (far too slow inside loops over days x timetable slots).
+    Use it when many slots/dates are checked in one request:
+        cal = SessionCalendar(cursor, first_date, last_date, [timetable ids])
+        cal.holiday_for_slot(d, semester, division_csv) / cal.cancelled(timetable_id, d) / cal.substitute(timetable_id, d)"""
+
+    def __init__(self, cursor, start_date, end_date, timetable_ids=()):
+        self._holidays = {}      # date -> [holiday rows]
+        self._overrides = {}     # (timetable id, date, status) -> row
+        cursor.execute("""
+            SELECT id, name, holiday_date, semester, division FROM holidays
+            WHERE holiday_date BETWEEN %s AND %s ORDER BY id
+        """, (start_date, end_date))
+        for h in cursor.fetchall():
+            self._holidays.setdefault(self._day(h['holiday_date']), []).append(h)
+
+        ids = sorted({i for i in timetable_ids if i is not None})
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ','.join(['%s'] * len(chunk))
+            cursor.execute(f"""
+                SELECT o.id, o.timetable_id, o.session_date, o.status, o.reason, o.substitute_faculty_id,
+                       u.name AS substitute_name
+                FROM session_overrides o
+                LEFT JOIN faculty f ON f.id = o.substitute_faculty_id
+                LEFT JOIN users u ON u.id = f.user_id
+                WHERE o.timetable_id IN ({placeholders}) AND o.session_date BETWEEN %s AND %s
+                ORDER BY o.id
+            """, tuple(chunk) + (start_date, end_date))
+            for o in cursor.fetchall():
+                self._overrides.setdefault((o['timetable_id'], self._day(o['session_date']), o['status']), o)
+
+    @staticmethod
+    def _day(value):
+        return value.date() if isinstance(value, datetime) else value
+
+    def holiday(self, date_obj, semester, division):
+        """Same rule as get_holiday(): semester NULL = whole college, division NULL = every division."""
+        div = division or ''
+        for h in self._holidays.get(self._day(date_obj), ()):
+            if h['semester'] is not None and not _same_number(h['semester'], semester):
+                continue
+            if h['division'] is not None and not same_text(h['division'], div):
+                continue
+            return {'id': h['id'], 'name': h['name']}
+        return None
+
+    def holiday_for_slot(self, date_obj, semester, division_csv):
+        """Same rule as get_holiday_for_slot(): a multi-division slot ('A,B') is a holiday only if EVERY division has one."""
+        divs = split_divisions(division_csv)
+        if not divs:
+            return self.holiday(date_obj, semester, '')
+        found = [self.holiday(date_obj, semester, d) for d in divs]
+        return found[0] if all(found) else None
+
+    def cancelled(self, timetable_id, date_obj):
+        o = self._overrides.get((timetable_id, self._day(date_obj), 'cancelled'))
+        return {'id': o['id'], 'reason': o['reason']} if o else None
+
+    def substitute(self, timetable_id, date_obj):
+        o = self._overrides.get((timetable_id, self._day(date_obj), 'substituted'))
+        if not o:
+            return None
+        return {'id': o['id'], 'reason': o['reason'], 'substitute_faculty_id': o['substitute_faculty_id'],
+                'substitute_name': o['substitute_name']}
+
+
 def has_scheduled_slot(cursor, faculty_id, subject_id, semester, division, session_type, date_obj):
     """True if the timetable has a slot for this faculty+subject+class+session type on this weekday.
     A slot with division 'A,B' covers both A and B; a slot with no division covers every division.
@@ -517,17 +602,20 @@ def faculty_mark_leave():
 
         cancelled_count = 0
         skipped_saved = 0
+        override_rows = []
+        # holidays + existing cancellations/substitutions of the whole range: 2 queries (instead of 3 per slot per day)
+        cal = SessionCalendar(cursor, from_d, to_d, [sl['id'] for sl in slots])
         d = from_d
         while d <= to_d:
             day = DAY_ABBR[d.weekday()]
             for sl in slots:
                 if sl['day_of_week'] != day:
                     continue
-                if get_holiday_for_slot(cursor, d, sl['semester'], sl['division']):
+                if cal.holiday_for_slot(d, sl['semester'], sl['division']):
                     continue
-                if get_cancelled_override(cursor, sl['id'], d):
+                if cal.cancelled(sl['id'], d):
                     continue
-                if get_substitute_override(cursor, sl['id'], d):
+                if cal.substitute(sl['id'], d):
                     continue   # a substitute is already arranged for this slot — leave it as it is
                 cursor.execute("""
                     SELECT 1 FROM attendance a JOIN students st ON st.id = a.student_id
@@ -539,13 +627,16 @@ def faculty_mark_leave():
                 if cursor.fetchone():
                     skipped_saved += 1
                     continue
-                cursor.execute("""
-                    INSERT INTO session_overrides (timetable_id, session_date, status, reason, marked_by)
-                    VALUES (%s, %s, 'cancelled', %s, %s)
-                    ON DUPLICATE KEY UPDATE reason = VALUES(reason), marked_by = VALUES(marked_by)
-                """, (sl['id'], d, reason, request.user['user_id']))
+                override_rows.append((sl['id'], d, reason, request.user['user_id']))
                 cancelled_count += 1
             d += timedelta(days=1)
+        if override_rows:
+            # all cancellations in one INSERT (instead of one per slot)
+            cursor.executemany("""
+                INSERT INTO session_overrides (timetable_id, session_date, status, reason, marked_by)
+                VALUES (%s, %s, 'cancelled', %s, %s)
+                ON DUPLICATE KEY UPDATE reason = VALUES(reason), marked_by = VALUES(marked_by)
+            """, override_rows)
         conn.commit()
 
         msg = f"{cancelled_count} lecture/lab slot(s) marked as cancelled"

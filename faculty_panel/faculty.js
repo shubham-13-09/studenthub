@@ -37,7 +37,7 @@ if(!sessionStorage.getItem('token_faculty')){
 }
 
 // ---- API helpers ----
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = window.APP_CONFIG.API_BASE;   // set in ../shared/config.js
 
 function authHeaders(){
   return {
@@ -99,8 +99,11 @@ function switchView(name){
   document.querySelectorAll('.nav-item').forEach(i=> i.classList.toggle('active', i.dataset.view===name));
   document.querySelectorAll('.view').forEach(v=> v.classList.toggle('active', v.id==='view-'+name));
   if(name === 'notices'){
-    markFacultyNoticesRead();
-    Object.keys(NF_SCROLL_BTN).forEach(id => nfScrollToBottom(id, false));
+    renderFacNoticeGroupList();
+    if(facNoticeGroup){
+      nfScrollToBottom('facultyNoticesList', false);
+      if(facGroupNotices(facNoticeGroup).some(n => !n.is_read && !n.can_manage)) markFacNoticeGroupRead(facNoticeGroup);
+    }
   }
   // If you came here from the My Subjects card for "attendance" and a subject context is pending (set by openClass),
   // load the filters + student list for that subject right away
@@ -109,18 +112,20 @@ function switchView(name){
 
 // ---- Reports ----
 function openFacultyReport(type){
-  // type: 'attendance' | 'assignment' | 'student' | 'marks'
+  // type: 'attendance' | 'assignment' | 'student' | 'marks' | 'fees'
   const panels = {
     attendance: 'facRepAttendancePanel',
     assignment: 'facRepAssignPanel',
     student: 'facRepStudentPanel',
-    marks: 'facRepMarksPanel'
+    marks: 'facRepMarksPanel',
+    fees: 'facRepFeesPanel'
   };
   const loaders = {
     attendance: () => populateFacRepAttBatches(),
     assignment: () => populateFacRepAsgBatches(),
     student: () => populateFacRepStuBatches(),
-    marks: () => populateFacRepMkBatches()
+    marks: () => populateFacRepMkBatches(),
+    fees: () => populateFacRepFeeBatches()
   };
   if(!panels[type]) return;
   const panel = document.getElementById(panels[type]);
@@ -701,6 +706,131 @@ async function downloadFacultyMarksReport(format){
   }
 }
 
+// ---- Fee Report: Batch -> Semester -> Division (class-level, like the Fees screen - no Subject filter) ----
+let facRepFeeSeq = 0;
+
+function populateFacRepFeeBatches(){
+  const batchSel = document.getElementById('facRepFeeBatch');
+  const years = uniqueSorted((cachedSubjects || []).filter(s => s.semester != null && s.academic_year), 'academic_year').reverse();   // latest batch first
+  if(!years.length){
+    batchSel.innerHTML = '<option value="">No classes assigned</option>';
+    document.getElementById('facRepFeeSem').innerHTML = '<option value="">Select semester</option>';
+    document.getElementById('facRepFeeDiv').innerHTML = '<option value="">All divisions</option>';
+    document.getElementById('facRepFeeItem').innerHTML = '<option value="">All fee items</option>';
+    document.getElementById('facRepFeeHint').textContent = '';
+    return;
+  }
+  const prev = batchSel.value;
+  batchSel.innerHTML = years.map(y => `<option value="${escapeAttr(y)}">${escapeAttr(y)}</option>`).join('');
+  batchSel.value = years.includes(prev) ? prev : years[0];
+  onFacRepFeeBatchChange();
+  onFacRepFeeTypeChange();
+}
+
+function onFacRepFeeBatchChange(){
+  const batch = document.getElementById('facRepFeeBatch').value;
+  const semSel = document.getElementById('facRepFeeSem');
+  const sems = uniqueSorted((cachedSubjects || []).filter(s => s.academic_year === batch && s.semester != null), 'semester');
+  semSel.innerHTML = '<option value="">Select semester</option>' + sems.map(s => `<option value="${s}">Sem ${s}</option>`).join('');
+  if(sems.length === 1) semSel.value = String(sems[0]);
+  onFacRepFeeSemChange();
+}
+
+function onFacRepFeeSemChange(){
+  const batch = document.getElementById('facRepFeeBatch').value;
+  const sem = document.getElementById('facRepFeeSem').value;
+  const divSel = document.getElementById('facRepFeeDiv');
+  const divs = new Set();
+  if(sem){
+    (cachedSubjects || []).forEach(s => {
+      if(s.academic_year === batch && String(s.semester) === sem){
+        (s.available_divisions || []).forEach(d => divs.add(d));
+        if(s.division) divs.add(s.division);
+      }
+    });
+  }
+  divSel.innerHTML = '<option value="">All divisions</option>' +
+    [...divs].sort().map(d => `<option value="${escapeAttr(d)}">Division ${escapeAttr(d)}</option>`).join('');
+  loadFacRepFeeItems();
+}
+
+// The fee items are whatever Admin created for that class, so the list is read from the class's own fee records.
+async function loadFacRepFeeItems(){
+  const batch = document.getElementById('facRepFeeBatch').value;
+  const sem = document.getElementById('facRepFeeSem').value;
+  const div = document.getElementById('facRepFeeDiv').value;
+  const itemSel = document.getElementById('facRepFeeItem');
+  const hint = document.getElementById('facRepFeeHint');
+  const seq = ++facRepFeeSeq;
+  itemSel.innerHTML = '<option value="">All fee items</option>';
+  hint.textContent = '';
+  if(!batch || !sem) return;
+  try{
+    let url = '/faculty/fees?semester=' + encodeURIComponent(sem) + '&academic_year=' + encodeURIComponent(batch);
+    if(div) url += '&division=' + encodeURIComponent(div);
+    const data = await apiRequest(url);
+    if(seq !== facRepFeeSeq) return;
+    const titles = [...new Set((data.fees || []).map(f => (f.fee_title || '').trim() || 'Untitled'))]
+      .sort((a, b) => a.localeCompare(b));
+    itemSel.innerHTML = '<option value="">All fee items</option>' +
+      titles.map(t => `<option value="${escapeAttr(t)}">${escapeAttr(t)}</option>`).join('');
+    if(!titles.length) hint.textContent = 'No fee records for this class yet - Admin has not added fees for it.';
+  }catch(err){
+    if(seq !== facRepFeeSeq) return;
+    hint.textContent = 'Could not load the fee items for this class.';
+  }
+}
+
+function onFacRepFeeTypeChange(){
+  const type = document.getElementById('facRepFeeType').value;
+  const statusSel = document.getElementById('facRepFeeStatus');
+  // Defaulters always means "unpaid or overdue", so the Status filter is not used there
+  if(type === 'defaulters'){ statusSel.value = 'all'; statusSel.disabled = true; }
+  else statusSel.disabled = false;
+}
+
+async function downloadFacultyFeesReport(format){
+  const batch = document.getElementById('facRepFeeBatch').value;
+  const sem = document.getElementById('facRepFeeSem').value;
+  const div = document.getElementById('facRepFeeDiv').value;
+  const item = document.getElementById('facRepFeeItem').value;
+  const type = document.getElementById('facRepFeeType').value;
+  const status = document.getElementById('facRepFeeStatus').value;
+
+  if(!batch || !sem){
+    alert('Select Batch and Semester');
+    return;
+  }
+
+  const params = new URLSearchParams({ academic_year: batch, semester: sem, format, report: type, status });
+  if(div) params.set('division', div);
+  if(item) params.set('fee_title', item);
+
+  const filename = `fees_${type}_sem${sem}_${batch}${div ? '_div' + div : ''}.${format}`.replace(/[^A-Za-z0-9._-]+/g, '_');
+
+  try{
+    const res = await fetch(API_BASE + '/faculty/reports/fees?' + params.toString(), {
+      headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem('token_faculty') }
+    });
+    if(!res.ok){
+      const err = await res.json().catch(() => ({}));
+      alert(err.message || 'Report generation failed');
+      return;
+    }
+    const blob = await res.blob();
+    const dlUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = dlUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(dlUrl);
+  }catch(err){
+    alert('Download error: ' + err.message);
+  }
+}
+
 // ---- Subject card click -> jump to a class-context view (attendance/students/etc) ----
 // Dashboard ke "Mark" buttons (aaj ke lectures + attendance pending) ke liye attendance page ka context.
 // Timetable ki lecture kisi khaas division (jaise B) ki hoti hai, par faculty ka assignment "All divisions" ho sakta hai.
@@ -808,6 +938,7 @@ document.addEventListener('DOMContentLoaded', loadFacultyNotices);
 document.addEventListener('DOMContentLoaded', loadMyMarksRequests);
 document.addEventListener('DOMContentLoaded', loadFacultyTimetable);
 document.addEventListener('DOMContentLoaded', loadFacultyDashboardSummary);
+document.addEventListener('DOMContentLoaded', loadFacultyDashboardCharts);
 document.addEventListener('DOMContentLoaded', renderDashboardBanner);
 document.addEventListener('DOMContentLoaded', loadAttendancePendingDays);
 document.addEventListener('DOMContentLoaded', loadCancelledLectures);
@@ -830,6 +961,8 @@ function facBackgroundRefresh(){
   const stuAttOv = document.getElementById('stuAttOverlay');
   if(stuAttOv && stuAttOv.classList.contains('open')) loadStudentAttendanceDays(true);
   loadFacultyDashboardSummary();
+  const dashView = document.getElementById('view-dashboard');
+  if(dashView && dashView.classList.contains('active')) loadFacultyDashboardCharts();   // charts only while the dashboard is open
   loadAttendancePendingDays();
   loadCancelledLectures();
   loadFacultyTimetable();
@@ -847,9 +980,9 @@ let cachedFacultyNotices = [];
 let facNoticesSnap = '';
 
 async function loadFacultyNotices(silent){
-  const receivedList = document.getElementById('facultyNoticesList');
-  const postedList = document.getElementById('facultyPostedNoticesList');
-  if(!receivedList) return;
+  const groupList = document.getElementById('facNoticeGroupList');
+  if(!groupList) return;
+  if(!groupList.children.length) groupList.innerHTML = '<div class="nf-empty" style="padding:18px;">Loading…</div>';
   try{
     const data = await apiRequest('/faculty/notices');
     // background refresh: kuch badla nahi to feed dobara draw na karo (khule/expanded cards collapse ho jaate hain)
@@ -861,8 +994,7 @@ async function loadFacultyNotices(silent){
     renderFacultyNoticeLists();
   }catch(err){
     if(silent === true) return;   // background refresh fail ho to purani list dikhti rahe
-    receivedList.innerHTML = '<div class="notice-row" style="border-bottom:none;">Notices could not be loaded.</div>';
-    if(postedList) postedList.innerHTML = '<div class="notice-row" style="border-bottom:none;">Notices could not be loaded.</div>';
+    groupList.innerHTML = '<div class="nf-empty" style="padding:18px;">Notices could not be loaded.</div>';
   }
 }
 
@@ -896,8 +1028,8 @@ function nfFileSize(bytes){
   return (bytes / 1048576).toFixed(1) + ' MB';
 }
 
-function nfFileChip(n, onclickCode){
-  return `<div class="nf-file" onclick="${onclickCode}" title="Download">📎 <span class="nf-file-name">${nfEsc(n.file_name)}</span>${n.file_size ? ` <small>${nfFileSize(n.file_size)}</small>` : ''}</div>`;
+function nfFileChip(n, previewCode, downloadCode){
+  return nfAttachmentHtml(n, previewCode, downloadCode);
 }
 
 // The backend sends the list as is_pinned DESC, created_at DESC (newest-first), but the feed should
@@ -961,13 +1093,13 @@ function nfFacScope(n){
 // A notice posted by the faculty themselves — "sent bubble" on the right + ✓ / ✓✓ ticks
 function nfFacSentCard(n){
   const tagCls = NF_CAT_CLASS[n.category] || '';
-  const scope = nfFacScope(n) || 'All classes';
+  const scope = n.group === 'staff' ? '' : (nfFacScope(n) || 'All classes');
   const seen = (n.seen_count || 0) > 0 || n.admin_seen;
   return `
     <div class="nf-card sent">
       <div class="nf-top">
         <span class="notice-tag ${tagCls}">${nfEsc(n.category || 'Academic')}</span>
-        <span class="nf-scope">${nfEsc(scope)}</span>
+        ${scope ? `<span class="nf-scope">${nfEsc(scope)}</span>` : ''}
         <div class="nf-menu">
           <button class="nf-menu-btn" onclick="nfToggleMenu(this, event)" title="More">⋯</button>
           <div class="nf-menu-list">
@@ -980,7 +1112,7 @@ function nfFacSentCard(n){
       </div>
       <div class="nf-title">${nfEsc(n.title)}</div>
       ${n.content ? `<div class="nf-body" onclick="nfToggleBody(this)">${nfEsc(n.content)}</div>` : ''}
-      ${n.file_name ? nfFileChip(n, `nfFacAction('download', ${n.id})`) : ''}
+      ${n.file_name ? nfFileChip(n, `nfFacAction('preview', ${n.id})`, `nfFacAction('download', ${n.id})`) : ''}
       <div class="nf-meta">
         ${n.admin_seen ? '<span class="nf-admin-pill" title="Admin has seen this notice">Admin seen</span>' : ''}
         <span>${nfTime(n.created_at)}</span>
@@ -1012,7 +1144,7 @@ function nfFacReceivedCard(n){
       </div>
       <div class="nf-title">${nfEsc(n.title)}</div>
       ${n.content ? `<div class="nf-body" onclick="nfToggleBody(this)">${nfEsc(n.content)}</div>` : ''}
-      ${n.file_name ? nfFileChip(n, `nfFacAction('download', ${n.id})`) : ''}
+      ${n.file_name ? nfFileChip(n, `nfFacAction('preview', ${n.id})`, `nfFacAction('download', ${n.id})`) : ''}
       <div class="nf-meta"><span>${nfTime(n.created_at)}</span></div>
     </div>`;
 }
@@ -1025,12 +1157,12 @@ function nfFacAction(action, id){
   else if(action === 'pin') toggleFacultyNoticePin(id, !n.is_pinned);
   else if(action === 'edit') editFacultyNotice(n);
   else if(action === 'delete') deleteFacultyNotice(id, n.title);
+  else if(action === 'preview') nfOpenPreview(id, n.file_name);
   else if(action === 'download') downloadFacultyNotice(id, n.file_name);
 }
 
 // ---- Notices feed scroll (WhatsApp-style) — for both feeds (posted / received) ----
 const NF_SCROLL_BTN = {
-  facultyPostedNoticesList: 'facultyPostedScrollBtn',
   facultyNoticesList: 'facultyNoticesScrollBtn'
 };
 
@@ -1070,12 +1202,130 @@ function nfSetFeedHtml(feedId, html){
   nfUpdateScrollBtn(feedId);
 }
 
-function renderFacultyNoticeLists(){
-  const posted = cachedFacultyNotices.filter(n => n.can_manage);
-  const received = cachedFacultyNotices.filter(n => !n.can_manage);
+// ============================================================
+// NOTICE GROUPS (chat list like WhatsApp). The server decides each notice's group (n.group):
+//   staff = "Admin & Faculty"            — faculty and admin can post, students never see it
+//   all   = "Students, Faculty & Admin"  — admin broadcasts; READ ONLY for faculty
+//   class = "My classes"                 — notices the faculty sent to their own students
+// ============================================================
+const FAC_NOTICE_GROUPS = {
+  staff: { name: 'Admin & Faculty',           sub: 'Staff only — students can’t see this group', icon: '🏫', canPost: true },
+  all:   { name: 'Students, Faculty & Admin', sub: 'Announcements — only admin can post here',   icon: '👥', canPost: false },
+  class: { name: 'My classes',                sub: 'Notices you send to your students',          icon: '🎓', canPost: true }
+};
+let facNoticeGroup = null;   // null = the chat list is showing
 
-  nfSetFeedHtml('facultyPostedNoticesList', posted.length ? nfRenderFeed(posted, nfFacSentCard) : '<div class="nf-empty">You have not posted any notice yet.</div>');
-  nfSetFeedHtml('facultyNoticesList', received.length ? nfRenderFeed(received, nfFacReceivedCard) : '<div class="nf-empty">No notices yet.</div>');
+function facGroupNotices(key){
+  return cachedFacultyNotices.filter(n => n.group === key);
+}
+
+// "10:30 AM" today, "Yesterday", otherwise "12 Oct 2026" — like the WhatsApp chat list
+function nfListTime(iso){
+  const label = nfDateLabel(iso);
+  return label === 'Today' ? nfTime(iso) : label;
+}
+
+function nfFacPreview(n){
+  const who = n.can_manage ? 'You' : (n.posted_by_name || '').trim();
+  return (who ? who + ': ' : '') + (n.file_name ? '📎 ' : '') + n.title;
+}
+
+function renderFacNoticeGroupList(){
+  const box = document.getElementById('facNoticeGroupList');
+  if(!box) return;
+  box.innerHTML = Object.keys(FAC_NOTICE_GROUPS).map(key => {
+    const g = FAC_NOTICE_GROUPS[key];
+    const list = facGroupNotices(key);
+    const last = list.reduce((a, n) => (!a || new Date(n.created_at) > new Date(a.created_at)) ? n : a, null);
+    const unread = list.filter(n => !n.is_read && !n.can_manage).length;
+    return `
+      <button type="button" class="nf-group-row ${unread ? 'unread' : ''}" onclick="openFacNoticeGroup('${key}')">
+        <div class="nf-group-avatar">${g.icon}</div>
+        <div class="nf-group-main">
+          <div class="nf-group-top">
+            <span class="nf-group-name">${nfEsc(g.name)}</span>
+            <span class="nf-group-time">${last ? nfEsc(nfListTime(last.created_at)) : ''}</span>
+          </div>
+          <div class="nf-group-bottom">
+            <span class="nf-group-preview">${last ? nfEsc(nfFacPreview(last)) : 'No notices yet'}</span>
+            ${unread ? `<span class="nf-group-badge">${unread > 99 ? '99+' : unread}</span>` : ''}
+          </div>
+        </div>
+      </button>`;
+  }).join('');
+}
+
+function renderFacNoticeFeed(){
+  if(!facNoticeGroup) return;
+  const list = facGroupNotices(facNoticeGroup);
+  const empty = FAC_NOTICE_GROUPS[facNoticeGroup].canPost
+    ? 'No notices here yet — type one below to send it.'
+    : 'No notices here yet.';
+  nfSetFeedHtml('facultyNoticesList', list.length
+    ? nfRenderFeed(list, n => n.can_manage ? nfFacSentCard(n) : nfFacReceivedCard(n))
+    : `<div class="nf-empty">${empty}</div>`);
+}
+
+function renderFacultyNoticeLists(){
+  renderFacNoticeGroupList();
+  if(facNoticeGroup){
+    renderFacNoticeFeed();
+    // a new notice arrived while this group is open -> it is seen right away
+    if(!facMarkBusy && facGroupNotices(facNoticeGroup).some(n => !n.is_read && !n.can_manage)) markFacNoticeGroupRead(facNoticeGroup);
+  }
+}
+
+// Read-only group (the "all" group): no message bar. The staff group has no class / division options.
+function applyFacNoticeGroupToComposer(){
+  const g = FAC_NOTICE_GROUPS[facNoticeGroup];
+  document.getElementById('facNoticeComposer').classList.toggle('hidden', !g.canPost);
+  document.getElementById('facNoticeReadonly').classList.toggle('hidden', g.canPost);
+  document.getElementById('facNoticeClassOpts').classList.toggle('hidden', facNoticeGroup !== 'class');
+  document.getElementById('facNoticeOptions').classList.add('hidden');
+  document.getElementById('facNoticeScopeLine').classList.remove('open');
+}
+
+function openFacNoticeGroup(key){
+  const g = FAC_NOTICE_GROUPS[key];
+  if(!g) return;
+  facNoticeGroup = key;
+  document.getElementById('facNoticeGroupsCard').classList.add('hidden');
+  document.getElementById('facNoticeChatCard').classList.remove('hidden');
+  document.getElementById('facNoticeChatAvatar').textContent = g.icon;
+  document.getElementById('facNoticeChatName').textContent = g.name;
+  document.getElementById('facNoticeChatSub').textContent = g.sub;
+  applyFacNoticeGroupToComposer();
+  if(g.canPost) resetFacultyNoticeForm();
+  document.getElementById('facultyNoticesList').innerHTML = '';   // fresh feed -> opens scrolled to the latest notice
+  renderFacNoticeFeed();
+  nfScrollToBottom('facultyNoticesList', false);
+  if(facGroupNotices(key).some(n => !n.is_read && !n.can_manage)) markFacNoticeGroupRead(key);
+}
+
+function closeFacNoticeGroup(){
+  facNoticeGroup = null;
+  nfCloseMenus();
+  resetFacultyNoticeForm();
+  document.getElementById('facNoticeChatCard').classList.add('hidden');
+  document.getElementById('facNoticeGroupsCard').classList.remove('hidden');
+  renderFacNoticeGroupList();
+}
+
+// Opening a group = the faculty has seen its notices (so the sender's "Seen by" count includes them)
+let facMarkBusy = false;
+async function markFacNoticeGroupRead(key){
+  if(facMarkBusy) return;
+  facMarkBusy = true;
+  try{
+    await apiRequest('/faculty/notices/mark-read', { method: 'POST', body: JSON.stringify({ group: key }) });
+    cachedFacultyNotices.forEach(n => { if(n.group === key) n.is_read = true; });
+    renderFacNoticeGroupList();
+    refreshFacultyNoticeDot();
+  }catch(err){
+    // silent fail
+  }finally{
+    facMarkBusy = false;
+  }
 }
 
 // ---- Notice "seen by" modal (same as the admin panel) ----
@@ -1114,6 +1364,88 @@ function timeAgo(dateStr){
   if(hrs < 24) return `${hrs} hr${hrs > 1 ? 's' : ''} ago`;
   const days = Math.floor(hrs / 24);
   return `${days} day${days > 1 ? 's' : ''} ago`;
+}
+
+// ---- Add student (same form and rules as Admin > Student management) ----
+const FAC_STU_FIELDS = ['facStuName','facStuEnrollment','facStuEmail','facStuMobile','facStuWhatsapp','facStuSem','facStuDiv','facStuBatch',
+                        'facStuFatherName','facStuFatherMobile','facStuMotherName','facStuMotherMobile','facStuParentEmail','facStuParentAddress'];
+
+function resetFacultyAddStudentForm(){
+  FAC_STU_FIELDS.forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });   // selects go back to the placeholder
+}
+
+function openFacultyAddStudent(){
+  resetFacultyAddStudentForm();
+  const form = document.getElementById('facAddStudentForm');
+  form.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.getElementById('facStuName').focus({ preventScroll: true });
+  });
+}
+
+function closeFacultyAddStudent(){
+  document.getElementById('facAddStudentForm').classList.add('hidden');
+}
+
+async function saveFacultyStudent(){
+  const val = id => document.getElementById(id).value.trim();
+  const payload = {
+    name: val('facStuName'),
+    enrollment: val('facStuEnrollment'),
+    email: val('facStuEmail'),
+    mobile: val('facStuMobile'),
+    whatsapp_number: val('facStuWhatsapp'),
+    department: val('facStuDept'),
+    semester: val('facStuSem'),
+    division: val('facStuDiv'),
+    academic_year: val('facStuBatch'),
+    father_name: val('facStuFatherName'),
+    father_mobile: val('facStuFatherMobile'),
+    mother_name: val('facStuMotherName'),
+    mother_mobile: val('facStuMotherMobile'),
+    parent_email: val('facStuParentEmail'),
+    parent_address: val('facStuParentAddress')
+  };
+
+  if(!payload.name || !payload.enrollment){
+    alert('Full name and enrollment number are required');
+    return;
+  }
+  if(!payload.semester || !payload.division || !payload.academic_year){
+    alert('Please select semester, division and batch');
+    return;
+  }
+  if(payload.mobile && !/^\d{10}$/.test(payload.mobile)){
+    alert('Mobile number must be 10 digits');
+    return;
+  }
+  if(payload.father_mobile && !/^\d{10}$/.test(payload.father_mobile)){
+    alert("Father's mobile number must be 10 digits");
+    return;
+  }
+  if(payload.mother_mobile && !/^\d{10}$/.test(payload.mother_mobile)){
+    alert("Mother's mobile number must be 10 digits");
+    return;
+  }
+  if(payload.whatsapp_number && !/^\d{10,15}$/.test(payload.whatsapp_number)){
+    alert('WhatsApp number must be 10-15 digits (with country code if needed)');
+    return;
+  }
+
+  const btn = document.getElementById('facStuSaveBtn');
+  btn.disabled = true;   // double click par ek hi student bane
+  try{
+    const res = await apiRequest('/faculty/students', { method: 'POST', body: JSON.stringify(payload) });
+    alert(`Student added. Default password: ${res.default_password}`);
+    closeFacultyAddStudent();
+    resetFacultyAddStudentForm();
+    loadFacultyStudents();   // refresh the class list so the new student shows up
+  }catch(err){
+    alert('Error: ' + err.message);
+  }finally{
+    btn.disabled = false;
+  }
 }
 
 // ---- Students (class list for one assigned subject) ----
@@ -1272,7 +1604,7 @@ function renderFacultyStudentsRows(){
       <td>${s.semester ?? '-'}</td>
       <td>${s.division || '-'}</td>
       <td>${s.academic_year || '-'}</td>
-      <td><span class="pill ${attendancePillClass(s.attendance_pct)}">${s.attendance_pct}%</span></td>
+      <td><span class="pill ${attendancePillClass(s.attendance_pct)}">${s.attendance_pct}%</span>${s.attendance_need_more > 0 ? `<div style="font-size:11px;color:var(--muted,#5b6b66);margin-top:3px;">needs ${s.attendance_need_more} more</div>` : ''}</td>
       <td>${s.avg_marks}</td>
       <td><button type="button" class="stu-att-nav-btn" onclick="openStudentAttendance(${Number(s.student_id)})" title="See which days this student was present / absent">📅 View</button></td>
     `;
@@ -2158,6 +2490,7 @@ let openFeeFolderKey = null;
 let openFeeTitleKey = null;
 let cachedFeesContext = null;     // { semester, academic_year, division } of the opened title-folder — this is what we send when saving
 let feesLoadSeq = 0;              // so that an older, slower response never overwrites a newer one
+let feesYearDefaulted = false;     // the Batch filter starts on the newest batch (once); after that the faculty's own choice - even "All batches" - is kept
 
 function feeFolderKey(f){
   return `${f.semester ?? '-'}|${f.division || '-'}|${f.academic_year || '-'}`;
@@ -2186,6 +2519,13 @@ function populateFeesFilters(){
   if(years.includes(prevYear)) yearSelect.value = prevYear;
   if(sems.map(String).includes(prevSem)) semSelect.value = prevSem;
   if(divs.includes(prevDiv)) divSelect.value = prevDiv;
+
+  // First time the batches are known: show only the newest batch, so the screen does not load the fee records of every
+  // old batch the faculty ever taught (that list grows every year). Older batches are one click away in the Batch filter.
+  if(!feesYearDefaulted && years.length){
+    feesYearDefaulted = true;
+    yearSelect.value = years[years.length - 1];   // uniqueSorted() sorts ascending, so the last one is the newest
+  }
 
   // The folders are built from the same subject list — load them as soon as it is available
   // (if the Fees view is open, or the folders were never loaded yet)
@@ -3484,10 +3824,20 @@ function renderFacultyCombinedDivisionGrid(table, slots){
 function populateFacultyNoticeSubjectSelect(){
   const select = document.getElementById('facNoticeSubject');
   if(!select) return;
+  if(document.getElementById('facNoticeEditId').value) return;   // while editing, the class is fixed — don't rebuild it in a background refresh
+  const prevClass = select.value;
+  const prevDivision = document.getElementById('facNoticeDivision').value;
   select.innerHTML = cachedSubjects.map(sub =>
     `<option value="${sub.assignment_id}">${escapeHtml(sub.subject_name)} · Sem ${sub.semester} · Division ${sub.division || 'All'} · ${sub.academic_year}</option>`
   ).join('') || '<option value="">No subject assigned</option>';
+  // keep the class they had chosen while typing (a refresh must not reset it)
+  if(prevClass && [...select.options].some(o => o.value === prevClass)) select.value = prevClass;
   onFacNoticeSubjectChange();
+  const divSelect = document.getElementById('facNoticeDivision');
+  if(prevDivision && [...divSelect.options].some(o => o.value === prevDivision)){
+    divSelect.value = prevDivision;
+    updateFacNoticeScopeLine();
+  }
 }
 
 function onFacNoticeSubjectChange(){
@@ -3496,6 +3846,7 @@ function onFacNoticeSubjectChange(){
   const divSelect = document.getElementById('facNoticeDivision');
   if(!select || !select.value){
     divField.style.display = 'none';
+    updateFacNoticeScopeLine();
     return;
   }
   const sub = cachedSubjects.find(s => String(s.assignment_id) === select.value);
@@ -3507,98 +3858,208 @@ function onFacNoticeSubjectChange(){
     divField.style.display = 'none';
     divSelect.value = '';
   }
+  updateFacNoticeScopeLine();
 }
 
-// The form opens only when "+ Post notice" is pressed
-function openFacultyNoticeForm(){
-  resetFacultyNoticeForm();
-  const card = document.getElementById('facNoticeFormCard');
-  card.classList.remove('hidden');
-  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+// "To: Maths · Sem 3 · Division A · 2025-26 · Academic" — always visible above the bar
+function updateFacNoticeScopeLine(){
+  const parts = [];
+  if(facNoticeGroup === 'staff'){
+    parts.push('Admin & Faculty');
+  }else{
+    const select = document.getElementById('facNoticeSubject');
+    const opt = select.options[select.selectedIndex];
+    parts.push(opt ? opt.text : 'your class');
+    const div = document.getElementById('facNoticeDivision').value;
+    if(div && document.getElementById('facNoticeDivisionField').style.display !== 'none') parts.push('Div ' + div);
+  }
+  parts.push(document.getElementById('facNoticeCategory').value);
+  document.getElementById('facNoticeScopeText').textContent = 'To: ' + parts.join(' · ');
 }
 
-function closeFacultyNoticeForm(){
-  resetFacultyNoticeForm();
-  document.getElementById('facNoticeFormCard').classList.add('hidden');
+function toggleFacNoticeOptions(){
+  const box = document.getElementById('facNoticeOptions');
+  box.classList.toggle('hidden');
+  document.getElementById('facNoticeScopeLine').classList.toggle('open', !box.classList.contains('hidden'));
 }
 
+// ---- message-bar helpers (same as the admin panel) ----
+const NFC_MAX_TITLE = 150;   // notices.title is VARCHAR(150)
+
+function nfcAutoGrow(el){
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+
+// Enter = send, Shift+Enter = new line (on phones Enter stays a new line, the ➤ button sends)
+function nfcKeyDown(e){
+  if(e.key === 'Enter' && !e.shiftKey && !e.isComposing && window.innerWidth > 860){
+    e.preventDefault();
+    saveFacultyNotice();
+  }
+}
+
+// First line = title, the rest = body
+function nfcSplitMessage(text){
+  const lines = text.split('\n');
+  const first = lines[0].trim();
+  const rest = lines.slice(1).join('\n').trim();
+  if(first.length <= NFC_MAX_TITLE) return { title: first, content: rest };
+  return { title: first.slice(0, NFC_MAX_TITLE - 1).trimEnd() + '…', content: text };
+}
+
+let nfcThumbUrl = null;
+function nfcRenderFilePreview(){
+  const box = document.getElementById('facNoticeAttachPreview');
+  const file = document.getElementById('facNoticeFile').files[0];
+  if(nfcThumbUrl){ URL.revokeObjectURL(nfcThumbUrl); nfcThumbUrl = null; }
+  if(!file){
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  let thumb;
+  if(nfFileKind(file.name) === 'image'){
+    nfcThumbUrl = URL.createObjectURL(file);
+    thumb = `<img src="${nfcThumbUrl}" alt="">`;
+  }else{
+    thumb = `<div class="nf-attach-ic">${nfFileIcon(file.name)}</div>`;
+  }
+  box.innerHTML = `${thumb}
+    <div class="nf-attach-info"><div class="nf-attach-name">${nfEsc(file.name)}</div><span>${nfEsc(nfFileSize(file.size))}</span></div>
+    <button type="button" class="nf-attach-x" onclick="nfcClearFile()" title="Remove attachment">✕</button>`;
+  box.classList.remove('hidden');
+}
+
+function nfcOnFilePicked(){
+  const input = document.getElementById('facNoticeFile');
+  const file = input.files[0];
+  if(file && file.size > 10 * 1024 * 1024){
+    alert('File is larger than 10MB, upload a smaller file');
+    input.value = '';
+  }
+  nfcRenderFilePreview();
+  document.getElementById('facNoticeMessage').focus();
+}
+
+function nfcClearFile(){
+  document.getElementById('facNoticeFile').value = '';
+  nfcRenderFilePreview();
+}
+
+// Bar back to its defaults after send / cancel edit (the chosen class stays, so they can post again to the same class)
 function resetFacultyNoticeForm(){
   document.getElementById('facNoticeEditId').value = '';
-  document.getElementById('facNoticeTitle').value = '';
-  document.getElementById('facNoticeMessage').value = '';
+  const box = document.getElementById('facNoticeMessage');
+  box.value = '';
+  nfcAutoGrow(box);
   document.getElementById('facNoticeCategory').value = 'Academic';
-  const fileInput = document.getElementById('facNoticeFile');
-  if(fileInput) fileInput.value = '';
-  document.getElementById('facNoticeFormTitle').textContent = 'Post a notice to your class';
-  document.getElementById('facNoticeSaveBtn').textContent = 'Post notice';
+  document.getElementById('facNoticeDivision').value = '';
+  document.getElementById('facNoticeFile').value = '';
+  document.getElementById('facNoticeEditBanner').classList.add('hidden');
+  document.getElementById('facNoticeAttachBtn').classList.remove('hidden');
   document.getElementById('facNoticeSubject').disabled = false;
-  document.getElementById('facNoticeFileField').style.display = '';
+  const send = document.getElementById('facNoticeSaveBtn');
+  send.textContent = '➤';
+  send.title = 'Send notice';
+  nfcRenderFilePreview();
   populateFacultyNoticeSubjectSelect();
 }
 
+function cancelFacultyNoticeEdit(){
+  resetFacultyNoticeForm();
+}
+
+// Edit = the message goes back into the bar (title on the first line, body below it)
 function editFacultyNotice(n){
   document.getElementById('facNoticeEditId').value = n.id;
-  document.getElementById('facNoticeTitle').value = n.title;
-  document.getElementById('facNoticeMessage').value = n.content || '';
+  const box = document.getElementById('facNoticeMessage');
+  box.value = n.content ? n.title + '\n' + n.content : n.title;
   document.getElementById('facNoticeCategory').value = n.category || 'Academic';
-  document.getElementById('facNoticeFormTitle').textContent = 'Edit notice';
-  document.getElementById('facNoticeSaveBtn').textContent = 'Save changes';
-  document.getElementById('facNoticeFileField').style.display = 'none';   // the attachment is not changed on edit
+  document.getElementById('facNoticeFile').value = '';
+  nfcRenderFilePreview();
+  document.getElementById('facNoticeAttachBtn').classList.add('hidden');   // the attachment is not changed on edit
+  document.getElementById('facNoticeEditText').textContent = '✎ Editing notice' + (n.file_name ? ' · attachment can’t be changed' : '');
+  document.getElementById('facNoticeEditBanner').classList.remove('hidden');
 
   const select = document.getElementById('facNoticeSubject');
   select.innerHTML = `<option value="">Sem ${n.semester} · Division ${n.division || 'All'}</option>`;
   select.disabled = true;
   document.getElementById('facNoticeDivisionField').style.display = 'none';
 
-  const card = document.getElementById('facNoticeFormCard');
-  card.classList.remove('hidden');
-  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const send = document.getElementById('facNoticeSaveBtn');
+  send.textContent = '✓';
+  send.title = 'Save changes';
+  updateFacNoticeScopeLine();
+  nfcAutoGrow(box);
+  box.focus();
 }
 
+let nfcSending = false;
 async function saveFacultyNotice(){
+  if(nfcSending) return;
+  if(facNoticeGroup !== 'staff' && facNoticeGroup !== 'class') return;   // the "all" group is read-only for faculty
+  const isStaff = facNoticeGroup === 'staff';
   const editId = document.getElementById('facNoticeEditId').value;
-  const title = document.getElementById('facNoticeTitle').value.trim();
-  const content = document.getElementById('facNoticeMessage').value.trim();
+  const box = document.getElementById('facNoticeMessage');
+  const text = box.value.trim();
   const category = document.getElementById('facNoticeCategory').value;
+  const file = document.getElementById('facNoticeFile').files[0];
 
+  let { title, content } = nfcSplitMessage(text);
+  // Only a file, no text -> the file name becomes the title
+  if(!editId && !title && file){
+    title = file.name.length > NFC_MAX_TITLE ? file.name.slice(0, NFC_MAX_TITLE - 1) + '…' : file.name;
+    content = '';
+  }
   if(!title){
-    alert('Title is required');
+    alert('Type a notice first');
+    box.focus();
     return;
   }
 
+  const send = document.getElementById('facNoticeSaveBtn');
   try{
     if(editId){
+      nfcSending = true;
+      send.disabled = true;
       await apiRequest(`/faculty/notices/${editId}`, {
         method: 'PUT',
         body: JSON.stringify({ title, content, category })
       });
     }else{
       const assignmentId = document.getElementById('facNoticeSubject').value;
-      if(!assignmentId){
+      if(!isStaff && !assignmentId){
         alert('Select a class');
         return;
       }
-      const division = document.getElementById('facNoticeDivision').value;
-      const fileInput = document.getElementById('facNoticeFile');
-      const file = fileInput.files[0];
       if(file && file.size > 10 * 1024 * 1024){
         alert('File is larger than 10MB, upload a smaller file');
         return;
       }
+      nfcSending = true;
+      send.disabled = true;
       const formData = new FormData();
-      formData.append('assignment_id', assignmentId);
+      formData.append('group', facNoticeGroup);   // 'staff' or 'class' — the server decides who can see it
       formData.append('title', title);
       formData.append('content', content);
       formData.append('category', category);
-      if(division) formData.append('division', division);
+      if(!isStaff){
+        formData.append('assignment_id', assignmentId);
+        const division = document.getElementById('facNoticeDivision').value;
+        if(division) formData.append('division', division);
+      }
       if(file) formData.append('file', file);
       await apiUpload('/faculty/notices', formData);
     }
-    closeFacultyNoticeForm();
+    resetFacultyNoticeForm();
     await loadFacultyNotices();
-    if(!editId) nfScrollToBottom('facultyPostedNoticesList');   // their own new notice should show at the bottom
+    if(!editId) nfScrollToBottom('facultyNoticesList');   // their own new notice should show at the bottom
   }catch(err){
-    alert('Error: ' + err.message);
+    alert('Error: ' + err.message);   // the typed message stays in the box so nothing is lost
+  }finally{
+    nfcSending = false;
+    send.disabled = false;
   }
 }
 
@@ -3621,6 +4082,204 @@ async function toggleFacultyNoticePin(id, pin){
     loadFacultyNotices();
   }catch(err){
     alert('Error: ' + err.message);
+  }
+}
+
+// ============================================================
+// NOTICE ATTACHMENT PREVIEW (WhatsApp-style)
+// Image (jpg/png) -> shown inline in the notice card, click = full-screen view
+// PDF             -> card with a Preview button (opens in a viewer popup) + Download
+// Word / PowerPoint -> a browser cannot display these, so they stay download-only
+// Files are fetched with the login token and shown through blob URLs (an <img src>
+// cannot send the Authorization header). Images load lazily when the card scrolls
+// into view, and every loaded image is cached so the 5-sec refresh doesn't reload it.
+// ============================================================
+const NF_TOKEN_KEY = 'token_faculty';
+const NF_ENDPOINT = '/faculty/notices';
+const NF_ESC = s => nfEsc(s);
+const nfMediaUrls = new Map();       // notice id -> blob URL (loaded image)
+const nfMediaPromises = new Map();   // notice id -> in-flight fetch (so it's never fetched twice)
+let nfViewerUrl = null;
+
+function nfFileExt(name){
+  return (name || '').split('.').pop().toLowerCase();
+}
+
+function nfFileKind(name){
+  const ext = nfFileExt(name);
+  if(['jpg', 'jpeg', 'png'].includes(ext)) return 'image';
+  if(ext === 'pdf') return 'pdf';
+  return 'file';
+}
+
+function nfFileIcon(name){
+  const ext = nfFileExt(name);
+  if(ext === 'pdf') return '📕';
+  if(ext === 'doc' || ext === 'docx') return '📝';
+  if(ext === 'ppt' || ext === 'pptx') return '📊';
+  return '📎';
+}
+
+async function nfFetchFile(id){
+  const res = await fetch(`${API_BASE}${NF_ENDPOINT}/${id}/download?inline=1`, {
+    headers: { 'Authorization': 'Bearer ' + sessionStorage.getItem(NF_TOKEN_KEY) }
+  });
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  return res.blob();
+}
+
+function nfImageUrl(id){
+  if(nfMediaUrls.has(id)) return Promise.resolve(nfMediaUrls.get(id));
+  if(nfMediaPromises.has(id)) return nfMediaPromises.get(id);
+  const p = nfFetchFile(id).then(blob => {
+    const url = URL.createObjectURL(blob);
+    nfMediaUrls.set(id, url);
+    nfMediaPromises.delete(id);
+    return url;
+  }).catch(err => {
+    nfMediaPromises.delete(id);
+    throw err;
+  });
+  nfMediaPromises.set(id, p);
+  return p;
+}
+
+// What a notice's attachment looks like inside the card
+function nfAttachmentHtml(n, previewCode, downloadCode){
+  const name = n.file_name || 'attachment';
+  const kind = nfFileKind(name);
+  const size = n.file_size ? nfFileSize(n.file_size) : '';
+
+  if(kind === 'image'){
+    const cached = nfMediaUrls.get(n.id);
+    return `
+      <div class="nf-media${cached ? ' loaded' : ''}" data-nf-id="${n.id}" onclick="${previewCode}" title="Click to view">
+        <img alt="${NF_ESC(name)}"${cached ? ` src="${cached}"` : ''}>
+        <span class="nf-media-state">Loading image…</span>
+      </div>
+      <div class="nf-media-cap">
+        <span class="nf-file-name">${NF_ESC(name)}</span>${size ? `<small>${size}</small>` : ''}
+        <button type="button" class="nf-doc-dl" onclick="${downloadCode}" title="Download">⬇</button>
+      </div>`;
+  }
+
+  const isPdf = kind === 'pdf';
+  const typeLabel = isPdf ? 'PDF' : (nfFileExt(name) || 'file').toUpperCase();
+  return `
+    <div class="nf-doc">
+      <div class="nf-doc-main" onclick="${isPdf ? previewCode : downloadCode}" title="${isPdf ? 'Preview' : 'Download'}">
+        <span class="nf-doc-ico">${nfFileIcon(name)}</span>
+        <span class="nf-doc-info">
+          <span class="nf-file-name">${NF_ESC(name)}</span>
+          <small>${typeLabel}${size ? ' · ' + size : ''}${isPdf ? ' · tap to preview' : ''}</small>
+        </span>
+      </div>
+      <button type="button" class="nf-doc-dl" onclick="${downloadCode}" title="Download">⬇</button>
+    </div>`;
+}
+
+// ---- lazy-load the inline images ----
+async function nfLoadMedia(el){
+  if(el.dataset.state === 'loading' || el.dataset.state === 'done') return;
+  el.dataset.state = 'loading';
+  try{
+    const url = await nfImageUrl(Number(el.dataset.nfId));
+    const img = el.querySelector('img');
+    if(img) img.src = url;
+    el.dataset.state = 'done';
+    el.classList.add('loaded');
+  }catch(err){
+    el.dataset.state = 'error';
+    const msg = el.querySelector('.nf-media-state');
+    if(msg) msg.textContent = 'Image could not be loaded — click to retry';
+  }
+}
+
+const nfMediaObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(entries => {
+      entries.forEach(en => {
+        if(en.isIntersecting){
+          nfMediaObserver.unobserve(en.target);
+          nfLoadMedia(en.target);
+        }
+      });
+    }, { rootMargin: '200px' })
+  : null;
+
+function nfScanMedia(){
+  document.querySelectorAll('.nf-media:not([data-state])').forEach(el => {
+    if(el.classList.contains('loaded')){ el.dataset.state = 'done'; return; }
+    el.dataset.state = 'pending';
+    if(nfMediaObserver) nfMediaObserver.observe(el); else nfLoadMedia(el);
+  });
+}
+
+// The feeds re-render with innerHTML from several places (polling, filters, pin/edit...),
+// so instead of patching every render function we just watch for new .nf-media boxes.
+(function nfWatchMedia(){
+  let queued = false;
+  const start = () => {
+    new MutationObserver(() => {
+      if(queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; nfScanMedia(); });
+    }).observe(document.body, { childList: true, subtree: true });
+    nfScanMedia();
+  };
+  if(document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+})();
+
+// ---- full-screen viewer (image) / popup viewer (PDF) ----
+function nfCloseViewer(){
+  const v = document.getElementById('nfViewer');
+  if(v) v.remove();
+  if(nfViewerUrl){ URL.revokeObjectURL(nfViewerUrl); nfViewerUrl = null; }
+  document.removeEventListener('keydown', nfViewerKey);
+}
+
+function nfViewerKey(e){
+  if(e.key === 'Escape') nfCloseViewer();
+}
+
+async function nfOpenPreview(id, fileName){
+  const kind = nfFileKind(fileName);
+  if(kind === 'file'){ downloadFacultyNotice(id, fileName); return; }
+
+  nfCloseViewer();
+  const v = document.createElement('div');
+  v.id = 'nfViewer';
+  v.className = 'nf-viewer';
+  v.innerHTML = `
+    <div class="nf-viewer-bar">
+      <span class="nf-viewer-title">${NF_ESC(fileName)}</span>
+      <button type="button" class="nf-viewer-btn" id="nfViewerDl">⬇ Download</button>
+      <button type="button" class="nf-viewer-btn" id="nfViewerClose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="nf-viewer-body" id="nfViewerBody"><div class="nf-viewer-msg">Loading…</div></div>`;
+  v.addEventListener('click', e => { if(e.target === v || e.target.id === 'nfViewerBody') nfCloseViewer(); });
+  document.body.appendChild(v);
+  document.addEventListener('keydown', nfViewerKey);
+  document.getElementById('nfViewerClose').onclick = nfCloseViewer;
+  document.getElementById('nfViewerDl').onclick = () => downloadFacultyNotice(id, fileName);
+
+  try{
+    let url;
+    if(kind === 'image'){
+      url = await nfImageUrl(id);
+    }else{
+      const blob = await nfFetchFile(id);
+      url = URL.createObjectURL(blob);
+      if(!document.getElementById('nfViewer')){ URL.revokeObjectURL(url); return; }   // closed while loading
+      nfViewerUrl = url;
+    }
+    const body = document.getElementById('nfViewerBody');
+    if(!body) return;
+    body.innerHTML = kind === 'image'
+      ? `<img src="${url}" alt="${NF_ESC(fileName)}">`
+      : `<iframe src="${url}" title="${NF_ESC(fileName)}"></iframe>`;
+  }catch(err){
+    const body = document.getElementById('nfViewerBody');
+    if(body) body.innerHTML = '<div class="nf-viewer-msg">Preview is not available — please use Download.</div>';
   }
 }
 
@@ -3666,18 +4325,6 @@ async function refreshFacultyNoticeDot(){
     }
   }catch(err){
     // silent fail — just let the dot stay in its old state
-  }
-}
-
-async function markFacultyNoticesRead(){
-  const dot = document.getElementById('facultyNoticeDot');
-  const topbarDot = document.getElementById('facTopbarNoticeDot');
-  if(dot) dot.classList.remove('show');   // remove it right away; if it needs to show again, refreshFacultyNoticeDot will set it itself
-  if(topbarDot) topbarDot.classList.remove('show');
-  try{
-    await apiRequest('/faculty/notices/mark-read', { method: 'POST' });
-  }catch(err){
-    // silent fail
   }
 }
 
@@ -3884,6 +4531,33 @@ function renderDashboardNextLecture(lectures){
   if(ongoing) el.textContent = `Now: ${where(ongoing)} (till ${formatFacultyTime12(ongoing.end_time)})`;
   else if(next) el.textContent = `Next lecture: ${where(next)} at ${formatFacultyTime12(next.start_time)}`;
   else el.textContent = 'All lectures are done for today.';
+}
+
+// Dashboard charts: attendance % per assigned class + assignment submissions checked vs to check (shared/charts.js)
+async function loadFacultyDashboardCharts(){
+  const attEl = document.getElementById('facAttendanceChart');
+  const subEl = document.getElementById('facSubmissionChart');
+  if(!attEl || !subEl || !window.SHCharts) return;
+  try{
+    const data = await apiRequest('/faculty/dashboard-charts');
+
+    SHCharts.columns(attEl, (data.attendance_by_class || []).map(c => ({
+      label: `${c.subject_code || c.subject_name} · S${c.semester}${c.division ? c.division : ''}`,
+      title: `${c.subject_name} — Sem ${c.semester}${c.division ? ' Div ' + c.division : ''} (${c.total} records)`,
+      value: c.percentage
+    })), { max: 100, unit: '%', threshold: 75, label: 'Attendance percentage by class', empty: 'Attendance has not been marked yet.' });
+
+    const s = data.submissions || { to_check: 0, checked: 0 };
+    const all = (s.to_check || 0) + (s.checked || 0);
+    SHCharts.donut(subEl, [
+      { label: 'Checked',  value: s.checked || 0,  color: SHCharts.colors.good },
+      { label: 'To check', value: s.to_check || 0, color: SHCharts.colors.warn }
+    ], { center: all ? Math.round((s.checked || 0) * 100 / all) + '%' : '', sub: 'checked', label: 'Assignment submissions checked versus to check', empty: 'No submissions received yet.' });
+  }catch(err){
+    // a failed background refresh must not wipe a chart that is already drawn
+    if(!attEl.dataset.shSig) SHCharts.message(attEl, 'Chart could not be loaded.');
+    if(!subEl.dataset.shSig) SHCharts.message(subEl, 'Chart could not be loaded.');
+  }
 }
 
 async function loadFacultyDashboardSummary(){
@@ -4140,6 +4814,7 @@ function refreshAfterSessionChange(){
   loadAttendancePendingDays();
   loadCancelledLectures();
   if(typeof loadFacultyDashboardSummary === 'function') loadFacultyDashboardSummary();
+  if(typeof loadFacultyDashboardCharts === 'function') loadFacultyDashboardCharts();
 }
 
 async function openSubstituteDialog(timetableId, date){

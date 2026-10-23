@@ -9,9 +9,9 @@ from werkzeug.utils import secure_filename
 
 from app import app
 from auth_middleware import faculty_required, is_default_password
-from session_routes import DAY_ABBR, split_divisions, get_holiday, get_holiday_for_slot, get_cancelled_override, get_session_block_reason, has_scheduled_slot, get_extra_session, record_extra_session, get_substitute_override, get_substitute_target, get_substitute_slots_between
+from session_routes import DAY_ABBR, split_divisions, get_holiday, get_holiday_for_slot, get_cancelled_override, get_session_block_reason, has_scheduled_slot, get_extra_session, record_extra_session, get_substitute_override, get_substitute_target, get_substitute_slots_between, SessionCalendar
 from chatbot_helper import find_faq_answer, get_fallback_reply, log_chat, logged_assistant, get_user_chat_history
-from admin_routes import NOTES_UPLOAD_FOLDER, _allowed_note_file, ASSIGNMENT_UPLOAD_FOLDER, _allowed_assignment_file, NOTICE_UPLOAD_FOLDER, _allowed_notice_file, _get_academic_year_for_date_semester
+from admin_routes import get_attendance_min, attendance_need_more, trigger_attendance_shortage_alerts, _chunks, _norm_id, NOTES_UPLOAD_FOLDER, _allowed_note_file, ASSIGNMENT_UPLOAD_FOLDER, _allowed_assignment_file, NOTICE_UPLOAD_FOLDER, _allowed_notice_file, _get_academic_year_for_date_semester, fee_report_params_error, build_fee_report
 
 
 def _get_faculty_id(cursor, user_id):
@@ -176,11 +176,13 @@ def get_faculty_dashboard_summary():
         """, (faculty_id, faculty_id, today_day))
         lectures_today = cursor.fetchall()
         today_date = datetime.now().date()
+        # today's holidays + cancellations/substitutions: 2 queries (instead of up to 3 per lecture)
+        cal = SessionCalendar(cursor, today_date, today_date, [l['id'] for l in lectures_today])
         for l in lectures_today:
             l['attendance_marked'] = bool(l['attendance_marked'])
-            holiday = get_holiday_for_slot(cursor, today_date, l['semester'], l['division'])
-            cancelled = None if holiday else get_cancelled_override(cursor, l['id'], today_date)
-            substituted = None if (holiday or cancelled) else get_substitute_override(cursor, l['id'], today_date)
+            holiday = cal.holiday_for_slot(today_date, l['semester'], l['division'])
+            cancelled = None if holiday else cal.cancelled(l['id'], today_date)
+            substituted = None if (holiday or cancelled) else cal.substitute(l['id'], today_date)
             l['session_status'] = ('holiday' if holiday else ('cancelled' if cancelled
                                    else ('substituted' if substituted else 'held')))
             l['status_note'] = (holiday['name'] if holiday else (cancelled['reason'] if cancelled
@@ -196,7 +198,7 @@ def get_faculty_dashboard_summary():
             """, (faculty_id,))
             marked_today = {(r['subject_id'], r['session_type']) for r in cursor.fetchall()}
             for sl in sub_slots:
-                holiday = get_holiday_for_slot(cursor, today_date, sl['semester'], sl['division'])
+                holiday = cal.holiday_for_slot(today_date, sl['semester'], sl['division'])
                 lectures_today.append({
                     "id": sl['timetable_id'], "semester": sl['semester'], "division": sl['division'],
                     "room_no": sl['room_no'], "session_type": sl['session_type'],
@@ -231,6 +233,72 @@ def get_faculty_dashboard_summary():
         }), 200
     except Exception as e:
         return jsonify({"message": "Dashboard summary could not be loaded", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============================================================
+# DASHBOARD CHARTS — (1) attendance % per assigned class, (2) assignment submissions checked vs still to check
+# ============================================================
+@app.route('/api/faculty/dashboard-charts', methods=['GET'])
+@faculty_required
+def get_faculty_dashboard_charts():
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        # Same class rule as /my-subjects: students of that semester + batch (+ division if the assignment has one)
+        cursor.execute("""
+            SELECT fs.id AS assignment_id, sub.subject_name, sub.subject_code, fs.semester, fs.division,
+                   COUNT(a.id) AS total,
+                   SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present
+            FROM faculty_subjects fs
+            JOIN subjects sub ON sub.id = fs.subject_id
+            LEFT JOIN students st ON st.semester = fs.semester
+                 AND st.academic_year = fs.academic_year
+                 AND (fs.division IS NULL OR st.division = fs.division)
+            LEFT JOIN attendance a ON a.student_id = st.id AND a.subject_id = fs.subject_id
+            WHERE fs.faculty_id = %s
+            GROUP BY fs.id, sub.subject_name, sub.subject_code, fs.semester, fs.division
+            ORDER BY fs.semester, fs.division, sub.subject_name
+        """, (faculty_id,))
+        attendance_by_class = []
+        for r in cursor.fetchall():
+            if not r['total']:
+                continue   # attendance not marked yet for this class -> no bar (a 0% bar would be misleading)
+            attendance_by_class.append({
+                "assignment_id": r['assignment_id'],
+                "subject_name": r['subject_name'],
+                "subject_code": r['subject_code'],
+                "semester": r['semester'],
+                "division": r['division'],
+                "total": r['total'],
+                "percentage": round(float(r['present'] or 0) * 100 / r['total'])
+            })
+
+        cursor.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN asub.marks_obtained IS NULL THEN 1 ELSE 0 END), 0) AS to_check,
+                COALESCE(SUM(CASE WHEN asub.marks_obtained IS NOT NULL THEN 1 ELSE 0 END), 0) AS checked
+            FROM assignment_submissions asub
+            JOIN assignments a ON a.id = asub.assignment_id
+            WHERE a.faculty_id = %s
+        """, (faculty_id,))
+        sub_row = cursor.fetchone() or {}
+
+        return jsonify({
+            "attendance_by_class": attendance_by_class,
+            "submissions": {
+                "to_check": int(sub_row.get('to_check') or 0),
+                "checked": int(sub_row.get('checked') or 0)
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({"message": "Dashboard charts could not be loaded", "error": str(e)}), 500
     finally:
         cursor.close()
         conn.close()
@@ -285,6 +353,9 @@ def get_faculty_attendance_pending_days():
             for r in cursor.fetchall()
         }
 
+        # holidays + cancellations/substitutions of the whole window: 2 queries (instead of up to 3 per lecture per day)
+        cal = SessionCalendar(cursor, start_date, today, [r['timetable_id'] for r in timetable_rows])
+
         for offset in range(ATTENDANCE_PENDING_WINDOW_DAYS - 1, -1, -1):
             d = today - timedelta(days=offset)
             d_str = d.isoformat()
@@ -297,11 +368,11 @@ def get_faculty_attendance_pending_days():
                 if d == today and row['start_time'] > now_time:
                     continue  # today's lecture hasn't happened yet
                 # Holiday / cancelled slots were never held -> never "pending"
-                if get_holiday_for_slot(cursor, d, row['semester'], row['division']):
+                if cal.holiday_for_slot(d, row['semester'], row['division']):
                     continue
-                if get_cancelled_override(cursor, row['timetable_id'], d):
+                if cal.cancelled(row['timetable_id'], d):
                     continue
-                if get_substitute_override(cursor, row['timetable_id'], d):
+                if cal.substitute(row['timetable_id'], d):
                     continue   # someone else takes this lecture - it is his/her attendance to mark
                 if (row['subject_id'], d_str, row['session_type']) not in marked_attendance_set:
                     day_pending.append({
@@ -331,7 +402,7 @@ def get_faculty_attendance_pending_days():
             d = datetime.strptime(sl['session_date'], '%Y-%m-%d').date()
             if d == today and sl['start_time'] > now_time:
                 continue
-            if get_holiday_for_slot(cursor, d, sl['semester'], sl['division']):
+            if cal.holiday_for_slot(d, sl['semester'], sl['division']):
                 continue
             if (sl['subject_id'], sl['session_date'], sl['session_type']) in marked_attendance_set:
                 continue
@@ -416,6 +487,10 @@ def get_faculty_students():
                     FROM attendance att
                     WHERE att.student_id = st.id AND att.subject_id = %s
                 ) AS attendance_pct,
+                (SELECT COUNT(*) FROM attendance att
+                 WHERE att.student_id = st.id AND att.subject_id = %s) AS att_total,
+                (SELECT COUNT(*) FROM attendance att
+                 WHERE att.student_id = st.id AND att.subject_id = %s AND att.status = 'present') AS att_present,
                 (
                     SELECT ROUND(AVG(m.marks_obtained / m.max_marks * 100))
                     FROM marks m
@@ -425,17 +500,91 @@ def get_faculty_students():
             JOIN users u ON u.id = st.user_id
             WHERE st.semester = %s AND st.academic_year = %s {division_clause}
             ORDER BY u.login_id
-        """, (assignment['subject_id'], assignment['subject_id'],
+        """, (assignment['subject_id'], assignment['subject_id'], assignment['subject_id'],
+              assignment['subject_id'],
               assignment['semester'], assignment['academic_year']) + division_param)
         students = cursor.fetchall()
 
+        min_pct = get_attendance_min(cursor)
         for row in students:
             row['attendance_pct'] = row['attendance_pct'] if row['attendance_pct'] is not None else 0
             row['avg_marks'] = row['avg_marks'] if row['avg_marks'] is not None else 0
+            # how many more lectures this student must attend to reach the minimum % (0 if not short)
+            row['attendance_need_more'] = attendance_need_more(int(row.pop('att_present') or 0), int(row.pop('att_total') or 0), min_pct)
 
         return jsonify({"students": students}), 200
     except Exception as e:
         return jsonify({"message": "Students could not be loaded", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/faculty/students', methods=['POST'])
+@faculty_required
+def faculty_add_student():
+    """Faculty adds a new student — same fields and rules as Admin > Add student.
+    Login ID = enrollment number. Default password = enrollment number; the student must change it on first login."""
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    enrollment = (data.get('enrollment') or '').strip()
+    email = (data.get('email') or '').strip() or None
+    mobile = (data.get('mobile') or '').strip() or None
+    whatsapp_number = (data.get('whatsapp_number') or '').strip() or None   # optional
+    department = (data.get('department') or '').strip()
+    semester = data.get('semester')
+    division = (data.get('division') or '').strip()
+    academic_year = (data.get('academic_year') or '').strip()
+    gender = (data.get('gender') or '').strip() or None
+    father_name = (data.get('father_name') or '').strip() or None          # optional
+    father_mobile = (data.get('father_mobile') or '').strip() or None      # optional
+    mother_name = (data.get('mother_name') or '').strip() or None          # optional
+    mother_mobile = (data.get('mother_mobile') or '').strip() or None      # optional
+    parent_email = (data.get('parent_email') or '').strip() or None        # optional
+    parent_address = (data.get('parent_address') or '').strip() or None    # optional
+
+    if not all([name, enrollment, department, semester, division, academic_year]):
+        return jsonify({"message": "Name, enrollment number, department, semester, division and batch are required"}), 400
+    try:
+        semester = int(semester)
+    except (TypeError, ValueError):
+        return jsonify({"message": "Semester must be a number"}), 400
+    if semester < 1 or semester > 6:
+        return jsonify({"message": "Semester must be between 1 and 6"}), 400
+    if whatsapp_number and (not whatsapp_number.isdigit() or not (10 <= len(whatsapp_number) <= 15)):
+        return jsonify({"message": "WhatsApp number must be 10-15 digits (with country code if needed)"}), 400
+    for label, number in (("Mobile number", mobile), ("Father's mobile number", father_mobile), ("Mother's mobile number", mother_mobile)):
+        if number and (not number.isdigit() or len(number) != 10):
+            return jsonify({"message": f"{label} must be 10 digits"}), 400
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT id FROM users WHERE login_id = %s", (enrollment,))
+        if cursor.fetchone():
+            return jsonify({"message": "Enrollment number already exists"}), 409
+
+        default_password = enrollment
+        hashed_pw = bcrypt.hashpw(default_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        cursor.execute(
+            "INSERT INTO users (login_id, password_hash, role, name, status, must_change_password) VALUES (%s, %s, 'student', %s, 'active', TRUE)",
+            (enrollment, hashed_pw, name)
+        )
+        user_id = cursor.lastrowid
+        cursor.execute(
+            """INSERT INTO students (user_id, email, mobile, whatsapp_number, department, semester, division, academic_year, gender,
+                                      father_name, father_mobile, mother_name, mother_mobile, parent_email, parent_address)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (user_id, email, mobile, whatsapp_number, department, semester, division, academic_year, gender,
+             father_name, father_mobile, mother_name, mother_mobile, parent_email, parent_address)
+        )
+        conn.commit()
+        return jsonify({"message": "Student added", "default_password": default_password}), 201
+    except Exception as e:
+        conn.rollback()
+        app.logger.error("Faculty failed to add student: %s", repr(e))
+        return jsonify({"message": "Failed to add student"}), 500
     finally:
         cursor.close()
         conn.close()
@@ -891,16 +1040,16 @@ def save_faculty_attendance():
                     }), 409
                 is_extra = True
 
-        for r in records:
-            student_id = r.get('student_id')
-            status = r.get('status')
-            if not student_id or status not in ('present', 'absent'):
-                continue
-            cursor.execute("""
+        attendance_rows = [(r.get('student_id'), subject_id, faculty_id, date, session_type, r.get('status'))
+                           for r in records
+                           if r.get('student_id') and r.get('status') in ('present', 'absent')]
+        if attendance_rows:
+            # all students in one statement (instead of one INSERT per student)
+            cursor.executemany("""
                 INSERT INTO attendance (student_id, subject_id, faculty_id, attendance_date, session_type, status)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status), faculty_id = VALUES(faculty_id)
-            """, (student_id, subject_id, faculty_id, date, session_type, status))
+            """, attendance_rows)
         if is_extra:
             record_extra_session(cursor, faculty_id, subject_id, assignment['semester'], eff_div, session_type, date_obj)
         conn.commit()
@@ -912,6 +1061,7 @@ def save_faculty_attendance():
 
     cursor.close()
     conn.close()
+    trigger_attendance_shortage_alerts([r.get('student_id') for r in records if r.get('status') in ('present', 'absent')])
     return jsonify({"message": "Attendance saved"}), 200
 
 
@@ -1097,6 +1247,7 @@ def save_faculty_marks():
         """, (faculty_id, subject_id, exam_type, semester, division, academic_year, max_marks))
         new_request_id = cursor.lastrowid
 
+        marks_rows = []
         for r in records:
             student_id = r.get('student_id')
             marks_obtained = r.get('marks_obtained')
@@ -1107,11 +1258,14 @@ def save_faculty_marks():
                     continue   # ignore marks above the max marks
             except (TypeError, ValueError):
                 continue
+            marks_rows.append((student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year, new_request_id))
 
-            cursor.execute(
+        if marks_rows:
+            # the whole class in one INSERT (instead of one INSERT per student)
+            cursor.executemany(
                 "INSERT INTO marks (student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year, published, request_id) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s, FALSE, %s)",
-                (student_id, subject_id, exam_type, marks_obtained, max_marks, semester, academic_year, new_request_id)
+                marks_rows
             )
         conn.commit()
     except Exception as e:
@@ -1214,21 +1368,30 @@ def save_faculty_fees():
         if not allowed:
             return jsonify({"message": "This class is not assigned to you"}), 403
 
-        updated = 0
+        # The last status sent for a fee wins (same result as applying the updates one after another)
+        wanted = {}
         for u in updates:
             fee_id = u.get('fee_id')
             status = u.get('status')
             if not fee_id or status not in ('paid', 'unpaid'):
                 continue
-            # fee_id must belong to a student of this semester+batch(+division) only — verified with this join
-            cursor.execute(f"""
-                UPDATE fees f
-                JOIN students st ON st.id = f.student_id
-                SET f.status = %s,
-                    f.paid_at = CASE WHEN %s = 'paid' THEN CURRENT_TIMESTAMP ELSE NULL END
-                WHERE f.id = %s AND st.semester = %s AND st.academic_year = %s {division_clause}
-            """, (status, status, fee_id, semester, academic_year) + division_param)
-            updated += cursor.rowcount
+            wanted[_norm_id(fee_id)] = status
+
+        updated = 0
+        for status in ('paid', 'unpaid'):
+            fee_ids = [fid for fid, st in wanted.items() if st == status]
+            # one UPDATE per status (instead of one per fee); the fee must belong to a student of this
+            # semester+batch(+division) only — verified with this join
+            for chunk in _chunks(fee_ids):
+                ph = ','.join(['%s'] * len(chunk))
+                cursor.execute(f"""
+                    UPDATE fees f
+                    JOIN students st ON st.id = f.student_id
+                    SET f.status = %s,
+                        f.paid_at = CASE WHEN %s = 'paid' THEN CURRENT_TIMESTAMP ELSE NULL END
+                    WHERE f.id IN ({ph}) AND st.semester = %s AND st.academic_year = %s {division_clause}
+                """, (status, status) + tuple(chunk) + (semester, academic_year) + division_param)
+                updated += cursor.rowcount
         conn.commit()
         return jsonify({"message": f"{updated} fee record(s) updated"}), 200
     except Exception as e:
@@ -1990,6 +2153,50 @@ def get_faculty_exam_timetable():
 # post notices to their own assigned class. Edit/Delete/Pin is allowed only on notices they posted
 # themselves; class/subject cannot be changed on edit, only when posting a new one.)
 # ============================================================
+# ---- Notice chat groups (faculty panel) ----
+#   staff : "Admin & Faculty"            -> target_role = 'faculty'            (faculty + admin can post; students never see it)
+#   all   : "Students, Faculty & Admin"  -> admin broadcasts (target_role = 'all') + other faculty's class notices; READ ONLY for faculty
+#   class : "My classes"                 -> notices this faculty sent to their own students
+# The group is decided only here on the server (one place for list + mark-read), never taken from the client.
+FACULTY_NOTICE_GROUPS = ('staff', 'all', 'class')
+NOTICE_TITLE_MAX = 150
+NOTICE_CONTENT_MAX = 5000
+NOTICE_CATEGORIES = ('Academic', 'Event', 'Important')
+NOTICE_FILE_MAX_BYTES = 10 * 1024 * 1024
+
+_FAC_NOTICE_VISIBLE_SQL = """
+    ((n.target_role IN ('all','faculty') AND n.target_user_id IS NULL)
+     OR n.target_user_id = %s
+     OR n.posted_by = %s
+     OR (n.target_user_id IS NULL
+         AND n.posted_by IN (SELECT id FROM users WHERE role = 'faculty')))
+"""
+
+
+def _fac_notice_group(notice, user_id):
+    if notice['target_role'] == 'faculty':
+        return 'staff'
+    if notice['target_role'] == 'student' and notice['posted_by'] == user_id:
+        return 'class'
+    return 'all'
+
+
+def _clean_notice_text(title, content, category):
+    """Returns (title, content, category, error). Used by every faculty notice write."""
+    title = (title or '').strip()
+    content = (content or '').strip() or None
+    category = (category or 'Academic').strip()
+    if not title:
+        return None, None, None, "Title is required"
+    if len(title) > NOTICE_TITLE_MAX:
+        return None, None, None, f"Title can be at most {NOTICE_TITLE_MAX} characters"
+    if content and len(content) > NOTICE_CONTENT_MAX:
+        return None, None, None, f"Message can be at most {NOTICE_CONTENT_MAX} characters"
+    if category not in NOTICE_CATEGORIES:
+        return None, None, None, "Invalid category"
+    return title, content, category, None
+
+
 @app.route('/api/faculty/notices', methods=['GET'])
 @faculty_required
 def get_faculty_notices():
@@ -1998,8 +2205,9 @@ def get_faculty_notices():
     try:
         user_id = request.user['user_id']
         cursor.execute("""
-            SELECT id, title, content, category, is_pinned, created_at, target_user_id,
+            SELECT id, title, content, category, is_pinned, created_at, target_user_id, target_role,
                    semester, division, posted_by, file_name, file_size, file_type,
+                   EXISTS(SELECT 1 FROM notice_reads r WHERE r.notice_id = notices.id AND r.user_id = %s) AS is_read,
                    (SELECT u.name FROM users u WHERE u.id = notices.posted_by) AS posted_by_name,
                    (SELECT u.role FROM users u WHERE u.id = notices.posted_by) AS posted_by_role,
                    (SELECT COUNT(*) FROM notice_reads nr
@@ -2014,12 +2222,15 @@ def get_faculty_notices():
                OR (target_user_id IS NULL
                    AND posted_by IN (SELECT id FROM users WHERE role = 'faculty'))   -- notices from other faculty are visible to all faculty
             ORDER BY is_pinned DESC, created_at DESC
-            LIMIT 50
-        """, (user_id, user_id))
+            LIMIT 200
+        """, (user_id, user_id, user_id))
         notices = cursor.fetchall()
         for n in notices:
             n['is_personal'] = n['target_user_id'] is not None
             n['can_manage'] = (n['posted_by'] == user_id)
+            n['is_read'] = bool(n['is_read'])
+            n['group'] = _fac_notice_group(n, user_id)
+            del n['target_role']
             if n['can_manage']:
                 n['admin_seen'] = n['admin_seen_at'] is not None
                 n['admin_seen_at'] = n['admin_seen_at'].isoformat() if n['admin_seen_at'] else None
@@ -2070,27 +2281,33 @@ def get_faculty_notices_unread_count():
 @app.route('/api/faculty/notices/mark-read', methods=['POST'])
 @faculty_required
 def mark_faculty_notices_read():
-    """Called as soon as the Notices tab opens — marks every notice visible to this faculty
-    as 'seen', so the sidebar dot disappears."""
+    """Marks notices this faculty can see as 'seen'. With {"group": "staff|all|class"} only that chat
+    group is marked (called when the group is opened); without it everything is marked."""
+    data = request.get_json(silent=True) or {}
+    group = data.get('group')
+    if group is not None and group not in FACULTY_NOTICE_GROUPS:
+        return jsonify({"message": "Invalid group"}), 400
+
     conn = get_db()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
     try:
         user_id = request.user['user_id']
-        cursor.execute("""
-            INSERT IGNORE INTO notice_reads (notice_id, user_id)
-            SELECT n.id, %s
-            FROM notices n
-            WHERE (n.target_role IN ('all','faculty') AND n.target_user_id IS NULL)
-               OR n.target_user_id = %s
-               OR n.posted_by = %s
-               OR (n.target_user_id IS NULL
-                   AND n.posted_by IN (SELECT id FROM users WHERE role = 'faculty'))
-        """, (user_id, user_id, user_id))
+        cursor.execute(
+            "SELECT n.id, n.target_role, n.posted_by FROM notices n WHERE " + _FAC_NOTICE_VISIBLE_SQL,
+            (user_id, user_id)
+        )
+        rows = cursor.fetchall()
+        ids = [r['id'] for r in rows if group is None or _fac_notice_group(r, user_id) == group]
+        if ids:
+            cursor.executemany(
+                "INSERT IGNORE INTO notice_reads (notice_id, user_id) VALUES (%s, %s)",
+                [(i, user_id) for i in ids]
+            )
         conn.commit()
         return jsonify({"message": "Marked as read"}), 200
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return jsonify({"message": "Failed to mark as read", "error": str(e)}), 500
+        return jsonify({"message": "Failed to mark as read"}), 500
     finally:
         cursor.close()
         conn.close()
@@ -2099,45 +2316,64 @@ def mark_faculty_notices_read():
 @app.route('/api/faculty/notices', methods=['POST'])
 @faculty_required
 def add_faculty_notice():
-    """multipart/form-data: assignment_id (faculty_subjects.id — the class the notice is being sent to),
-    title, content (optional), category (optional), division (optional — only when the assignment is
-    "All divisions"), file (optional, PDF/DOC/DOCX/PPT/PPTX/JPG/PNG). Always goes to students."""
+    """multipart/form-data: group ('class' = default, or 'staff'), title, content (optional), category (optional),
+    file (optional, PDF/DOC/DOCX/PPT/PPTX/JPG/PNG, max 10MB).
+      group = 'class' -> also needs assignment_id (faculty_subjects.id) and optional division; goes to that class's students.
+      group = 'staff' -> "Admin & Faculty": stored with target_role = 'faculty' (fixed here, never from the client),
+                         so students can never see it.
+    Faculty cannot post in the 'all' (Students, Faculty & Admin) group — that is admin only."""
+    group = (request.form.get('group') or 'class').strip()
+    if group not in ('class', 'staff'):
+        return jsonify({"message": "Faculty can post only to 'Admin & Faculty' or to their own class"}), 403
+
     assignment_id = request.form.get('assignment_id')
-    title = request.form.get('title')
-    content = request.form.get('content') or None
-    category = request.form.get('category') or 'Academic'
     chosen_division = request.form.get('division') or None
     file = request.files.get('file')
 
-    if not assignment_id or not title:
+    title, content, category, text_error = _clean_notice_text(
+        request.form.get('title'), request.form.get('content'), request.form.get('category'))
+    if text_error:
+        return jsonify({"message": text_error}), 400
+    if group == 'class' and not assignment_id:
         return jsonify({"message": "Class and title are required"}), 400
+
+    # validate the attachment before touching the DB
+    if file and file.filename:
+        if not _allowed_notice_file(file):
+            return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
+        file.seek(0, os.SEEK_END)
+        too_big = file.tell() > NOTICE_FILE_MAX_BYTES
+        file.seek(0)
+        if too_big:
+            return jsonify({"message": "File is larger than 10MB, upload a smaller file"}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    faculty_id = _get_faculty_id(cursor, request.user['user_id'])
-    if not faculty_id:
-        cursor.close()
-        conn.close()
-        return jsonify({"message": "Faculty record not found"}), 404
 
-    assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
-    if not assignment:
-        cursor.close()
-        conn.close()
-        return jsonify({"message": "This subject is not assigned to you"}), 403
+    if group == 'staff':
+        target_role, semester, division, academic_year = 'faculty', None, None, None
+    else:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Faculty record not found"}), 404
 
-    division, division_error = _resolve_division(cursor, assignment, chosen_division)
-    if division_error:
-        cursor.close()
-        conn.close()
-        return jsonify({"message": division_error}), 400
+        assignment = _get_faculty_assignment(cursor, faculty_id, assignment_id)
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This subject is not assigned to you"}), 403
+
+        division, division_error = _resolve_division(cursor, assignment, chosen_division)
+        if division_error:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": division_error}), 400
+        target_role, semester, academic_year = 'student', assignment['semester'], assignment['academic_year']
 
     file_path = file_name = file_size = file_type = None
     if file and file.filename:
-        if not _allowed_notice_file(file):
-            cursor.close()
-            conn.close()
-            return jsonify({"message": "Invalid file format. Only valid PDF, DOC, DOCX, PPT, PPTX, JPG, PNG files are allowed"}), 400
         original_name = secure_filename(file.filename)
         file_ext = original_name.rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{file_ext}"
@@ -2151,10 +2387,10 @@ def add_faculty_notice():
     try:
         cursor.execute("""
             INSERT INTO notices (title, content, category, target_role, semester, division, academic_year, posted_by, is_pinned, file_path, file_name, file_size, file_type)
-            VALUES (%s,%s,%s,'student',%s,%s,%s,%s,FALSE,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,%s,%s,%s)
         """, (
-            title, content, category,
-            assignment['semester'], division, assignment['academic_year'],
+            title, content, category, target_role,
+            semester, division, academic_year,
             request.user['user_id'], file_path, file_name, file_size, file_type
         ))
         new_notice_id = cursor.lastrowid
@@ -2165,13 +2401,13 @@ def add_faculty_notice():
             (new_notice_id, request.user['user_id'])
         )
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         cursor.close()
         conn.close()
         if file_path and os.path.exists(os.path.join(NOTICE_UPLOAD_FOLDER, file_path)):
             os.remove(os.path.join(NOTICE_UPLOAD_FOLDER, file_path))
-        return jsonify({"message": "Notice could not be saved", "error": str(e)}), 500
+        return jsonify({"message": "Notice could not be saved"}), 500
 
     cursor.close()
     conn.close()
@@ -2183,13 +2419,11 @@ def add_faculty_notice():
 def update_faculty_notice(notice_id):
     """Only title/content/category can be edited (not class/division/attachment) —
     and only when this faculty posted the notice themselves."""
-    data = request.get_json() or {}
-    title = data.get('title')
-    content = data.get('content') or None
-    category = data.get('category') or 'Academic'
-
-    if not title:
-        return jsonify({"message": "Title is required"}), 400
+    data = request.get_json(silent=True) or {}
+    title, content, category, text_error = _clean_notice_text(
+        data.get('title'), data.get('content'), data.get('category'))
+    if text_error:
+        return jsonify({"message": text_error}), 400
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -2205,9 +2439,9 @@ def update_faculty_notice(notice_id):
                         (title, content, category, notice_id))
         conn.commit()
         return jsonify({"message": "Notice updated"}), 200
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return jsonify({"message": "Notice could not be updated", "error": str(e)}), 500
+        return jsonify({"message": "Notice could not be updated"}), 500
     finally:
         cursor.close()
         conn.close()
@@ -2240,19 +2474,22 @@ def get_faculty_notice_reads(notice_id):
             if r['seen_at']:
                 r['seen_at'] = r['seen_at'].isoformat()
 
-        q = "SELECT COUNT(*) AS c FROM students WHERE 1=1"
-        p = []
-        if notice['semester'] is not None:
-            q += " AND semester = %s"
-            p.append(notice['semester'])
-        if notice['division']:
-            q += " AND division = %s"
-            p.append(notice['division'])
-        if notice['academic_year']:
-            q += " AND academic_year = %s"
-            p.append(notice['academic_year'])
-        cursor.execute(q, tuple(p))
-        target_total = cursor.fetchone()['c']
+        target_total = 0
+        if notice['target_role'] != 'faculty':
+            # class notice: the students of that class (a staff notice never goes to students)
+            q = "SELECT COUNT(*) AS c FROM students WHERE 1=1"
+            p = []
+            if notice['semester'] is not None:
+                q += " AND semester = %s"
+                p.append(notice['semester'])
+            if notice['division']:
+                q += " AND division = %s"
+                p.append(notice['division'])
+            if notice['academic_year']:
+                q += " AND academic_year = %s"
+                p.append(notice['academic_year'])
+            cursor.execute(q, tuple(p))
+            target_total = cursor.fetchone()['c']
         cursor.execute("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'")
         target_total += cursor.fetchone()['c']   # admin shows up in the seen list too
         cursor.execute("SELECT COUNT(*) AS c FROM users WHERE role = 'faculty' AND id <> %s", (user_id,))
@@ -2361,10 +2598,14 @@ def download_faculty_notice(notice_id):
     if not notice or not notice['file_path']:
         return jsonify({"message": "Attachment not found"}), 404
 
+    # ?inline=1 -> sent for direct viewing (image / PDF preview inside the notice feed).
+    # Any other file type is always sent as a normal download.
+    ext = (notice['file_name'] or '').rsplit('.', 1)[-1].lower()
+    inline = request.args.get('inline') == '1' and ext in ('jpg', 'jpeg', 'png', 'pdf')
     return send_from_directory(
         NOTICE_UPLOAD_FOLDER,
         notice['file_path'],
-        as_attachment=True,
+        as_attachment=not inline,
         download_name=notice['file_name']
     )
 
@@ -2544,6 +2785,7 @@ def faculty_assistant():
                     LEFT JOIN assignment_submissions asub
                         ON asub.student_id = st.id AND asub.assignment_id = %s
                     WHERE st.semester = %s {div_clause} AND asub.id IS NULL
+                    ORDER BY u.login_id
                 """, tuple(params))
                 missing = cursor.fetchall()
                 if missing:
@@ -2807,7 +3049,7 @@ def faculty_attendance_report():
             LEFT JOIN attendance a ON a.student_id = st.id AND a.subject_id = %s
             WHERE st.semester = %s AND st.academic_year = %s {div_clause}
             GROUP BY st.id, u.login_id, u.name, st.division
-            ORDER BY st.division, u.login_id
+            ORDER BY u.login_id
         """, (subject_id, semester, academic_year) + tuple(div_params))
         students = cursor.fetchall()
     except Exception as e:
@@ -3153,7 +3395,7 @@ def faculty_assignment_report():
                 JOIN users u ON u.id = st.user_id
                 LEFT JOIN {subs} asub ON asub.student_id = st.id AND asub.assignment_id = %s
                 WHERE st.semester = %s AND st.academic_year = %s {div_clause} {extra}
-                ORDER BY st.division, u.login_id
+                ORDER BY u.login_id
             """, (assignment_id, semester, academic_year) + tuple(div_params) + extra_params)
             students = cursor.fetchall()
         else:
@@ -3175,7 +3417,7 @@ def faculty_assignment_report():
                 LEFT JOIN {subs} asub ON asub.assignment_id = a.id AND asub.student_id = st.id
                 WHERE st.semester = %s AND st.academic_year = %s {div_clause}
                 GROUP BY st.id, u.login_id, u.name, st.division
-                ORDER BY st.division, u.login_id
+                ORDER BY u.login_id
             """, (subject_id,) + asg_params + (semester, academic_year) + tuple(div_params))
             students = cursor.fetchall()
     except Exception as e:
@@ -3657,7 +3899,7 @@ def faculty_student_report():
             FROM students st
             JOIN users u ON u.id = st.user_id
             WHERE st.semester = %s AND st.academic_year = %s {div_clause} {stu_clause}
-            ORDER BY st.division, u.login_id
+            ORDER BY u.login_id
         """, (semester, academic_year) + tuple(div_params) + stu_params)
         students = cursor.fetchall()
         if student_id and not students:
@@ -4046,7 +4288,7 @@ def faculty_marks_report():
             FROM students st
             JOIN users u ON u.id = st.user_id
             WHERE st.semester = %s AND st.academic_year = %s {div_clause}
-            ORDER BY st.division, u.login_id
+            ORDER BY u.login_id
         """, (semester, academic_year) + tuple(div_params))
         students = cursor.fetchall()
 
@@ -4108,3 +4350,64 @@ def faculty_marks_report():
     buffer = _build_marks_xlsx(meta, rows, line, passing, exam)
     return send_file(buffer, as_attachment=True, download_name=base + ".xlsx",
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+# ============================================================
+# FEE REPORT (class-level: Batch -> Semester -> Division, same scope rules as the Fees screen)
+# The report itself (filters, overdue rule, totals, Excel / PDF) lives in admin_routes.py,
+# which the Admin panel uses too.
+# ============================================================
+@app.route('/api/faculty/reports/fees', methods=['GET'])
+@faculty_required
+def faculty_fees_report():
+    """Query params: semester, academic_year (required), division (optional),
+    fee_title (optional; empty = all fee items),
+    status ('all' default | 'paid' | 'unpaid' | 'overdue'),
+    report ('summary' default | 'detail' | 'defaulters'), format ('xlsx' default | 'pdf').
+    View-only: it never changes any fee record."""
+    semester = request.args.get('semester', type=int)
+    academic_year = (request.args.get('academic_year') or '').strip()
+    division = (request.args.get('division') or '').strip()
+    fee_title = (request.args.get('fee_title') or '').strip()
+    status = (request.args.get('status') or 'all').strip().lower()
+    report = (request.args.get('report') or 'summary').strip().lower()
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+
+    err = fee_report_params_error(semester, academic_year, report, status, fmt)
+    if err:
+        return jsonify({"message": err[0]}), err[1]
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        faculty_id = _get_faculty_id(cursor, request.user['user_id'])
+        if not faculty_id:
+            return jsonify({"message": "Faculty record not found"}), 404
+
+        # Same class check as the Fees screen: faculty only sees the semester + batch (+ divisions) they teach
+        allowed, div_clause, div_params = _class_division_scope(
+            cursor, faculty_id, semester, academic_year, division or None)
+        if not allowed:
+            return jsonify({"message": "This class is not assigned to you"}), 403
+
+        cursor.execute(f"""
+            SELECT f.id AS fee_id, st.id AS student_id, u.login_id AS enrollment, u.name, st.division,
+                   f.fee_title, f.amount, f.due_date, f.status, f.paid_at
+            FROM students st
+            JOIN users u ON u.id = st.user_id
+            JOIN fees f ON f.student_id = st.id AND f.semester = %s AND f.academic_year = %s
+            WHERE st.semester = %s AND st.academic_year = %s {div_clause}
+            ORDER BY u.login_id, f.due_date, f.fee_title
+        """, (semester, academic_year, semester, academic_year) + tuple(div_params))
+        all_rows = cursor.fetchall()
+    except Exception as e:
+        return jsonify({"message": "Report could not be generated", "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    ok, out = build_fee_report(all_rows, semester, academic_year, division, fee_title, status, report, fmt)
+    if not ok:
+        return jsonify({"message": out[0]}), out[1]
+    buffer, filename, mimetype = out
+    return send_file(buffer, as_attachment=True, download_name=filename, mimetype=mimetype)

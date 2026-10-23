@@ -2657,3 +2657,252 @@ body.dark .nf-sender {
   #view-chat .chat-shell { height: calc(100vh - 130px); }
   #view-chat .msg.user { max-width: 88%; }
 }
+
+
+/* ============================================================
+   NOTICE ATTACHMENT PREVIEW (WhatsApp-style): inline image,
+   PDF / document card, full-screen viewer
+   ============================================================ */
+.nf-media {
+  position: relative;
+  display: block;
+  width: min(100%, 320px);
+  height: 200px;               /* fixed, so the feed never jumps when the image finishes loading */
+  margin-top: 8px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  cursor: zoom-in;
+}
+
+.nf-media img {
+  display: none;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.nf-media.loaded img { display: block; }
+
+.nf-media-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nf-media.loaded .nf-media-state { display: none; }
+
+.nf-media-cap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(100%, 320px);
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nf-media-cap .nf-file-name { min-width: 0; }
+.nf-media-cap small { flex-shrink: 0; }
+
+.nf-doc {
+  display: flex;
+  align-items: stretch;
+  max-width: min(100%, 340px);
+  margin-top: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.nf-doc:hover { border-color: var(--teal-500); }
+
+.nf-doc-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.nf-doc-ico {
+  flex-shrink: 0;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.nf-doc-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.nf-doc-info small {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.nf-doc-dl {
+  flex-shrink: 0;
+  padding: 0 12px;
+  background: none;
+  border: 0;
+  border-left: 1px solid var(--line);
+  font-size: 14px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.nf-doc-dl:hover { color: var(--teal-500); }
+
+.nf-media-cap .nf-doc-dl {
+  padding: 0 4px;
+  border: 0;
+}
+
+.nf-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  display: flex;
+  flex-direction: column;
+  background: rgba(8, 16, 14, 0.9);
+}
+
+.nf-viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  color: #fff;
+}
+
+.nf-viewer-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.nf-viewer-btn {
+  padding: 7px 12px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 0;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  cursor: pointer;
+}
+
+.nf-viewer-btn:hover { background: rgba(255, 255, 255, 0.26); }
+
+.nf-viewer-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 14px 14px;
+}
+
+.nf-viewer-body img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+.nf-viewer-body iframe {
+  width: min(100%, 960px);
+  height: 100%;
+  border: 0;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.nf-viewer-msg {
+  font-size: 14px;
+  color: #fff;
+}
+
+@media (max-width: 600px) {
+  .nf-media { height: 170px; }
+  .nf-viewer-bar { padding: 8px 10px; }
+  .nf-viewer-body { padding: 0 6px 8px; }
+}
+
+
+/* ---- Attendance shortage alert (dashboard + attendance page) ---- */
+.att-alert{ display:flex; gap:12px; align-items:flex-start; padding:14px 16px; margin-bottom:16px; background:var(--danger-bg); border:1px solid #f3c6c1; border-left:4px solid var(--danger); border-radius:12px; color:var(--ink); }
+.att-alert-ic{ font-size:20px; line-height:1.2; flex-shrink:0; }
+.att-alert-title{ font-weight:700; margin-bottom:2px; }
+.att-alert-sub{ font-size:13px; color:var(--muted); }
+.att-alert ul{ margin:8px 0 0; padding-left:18px; font-size:13px; }
+.att-alert li{ margin:3px 0; }
+.att-alert-link{ display:inline-block; margin-top:8px; font-size:13px; font-weight:600; color:var(--danger); cursor:pointer; text-decoration:underline; }
+.att-need{ color:var(--danger); font-weight:600; font-size:13px; }
+.att-ok{ color:var(--muted); font-size:13px; }
+
+
+/* ===== StudentHub Student Panel — final CSS polish ===== */
+:root {
+  --sh-focus-ring: rgba(19, 122, 94, .22);
+  --sh-card-shadow: 0 4px 16px rgba(13, 44, 38, .06);
+}
+html { scroll-behavior: smooth; }
+body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+button, input, select, textarea { font: inherit; }
+:where(button, input, select, textarea, a, [tabindex]):focus-visible {
+  outline: 3px solid var(--sh-focus-ring);
+  outline-offset: 2px;
+}
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  max-width: 100%;
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):focus {
+  border-color: var(--teal-600);
+  box-shadow: 0 0 0 3px var(--sh-focus-ring);
+}
+:where(button, .btn, [class*="btn-"]) { -webkit-tap-highlight-color: transparent; }
+:where(th) { font-weight: 700; }
+:where(td, th) { overflow-wrap: anywhere; }
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.table-scroll table { min-width: 640px; }
+@media (max-width: 600px) {
+  .content { min-width: 0; }
+  .popup { max-width: calc(100vw - 24px); }
+  .settings-form { min-width: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+}
